@@ -31,6 +31,9 @@ class ProjectResult:
     audit: bool = False
     elapsed_seconds: float = 0.0
     output: str | None = None
+    boundary_guards: str = "off"
+    guarded_exports: list[dict] = field(default_factory=list)
+    debug_coverage: list[dict] = field(default_factory=list)
 
     @property
     def status(self) -> int:
@@ -47,12 +50,15 @@ class ProjectResult:
                 "mode": "audit" if self.audit else "strict",
                 "verified": self.verified, "status": self.status,
                 "elapsed_seconds": self.elapsed_seconds, "output": self.output,
+                "boundary_guards": self.boundary_guards, "guarded_exports": self.guarded_exports,
+                "debug_coverage": self.debug_coverage,
                 "tooling": [asdict(d) for d in self.tooling],
                 "files": [r.to_dict() for r in self.results],
                 "coverage": {"eligible_functions": sum(r.eligible_functions for r in self.results),
                              "selected_functions": sum(r.selected_functions for r in self.results),
+                             "selected_records": sum(len(r.records) for r in self.results),
                              "analyzed_call_sites": sum(r.analyzed_call_sites for r in self.results)},
-                "claim_scope": "Selected functions, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
+                "claim_scope": "Selected functions, record declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
 
 
 def runtime_error(target: str = TARGET) -> str | None:
@@ -86,13 +92,25 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
             return {}, "tool.pyalamode must be a table"
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
-                    "require_modules": []}
+                    "require_modules": [], "guarded_exports": []}
         for key, value in policy.items():
             if key == "require_modules":
                 if type(value) is not list or any(type(pattern) is not str or not pattern or pattern.startswith("/") or ".." in Path(pattern).parts or "\\" in pattern for pattern in value):
                     return policy, "require_modules must be a list of nonempty project-relative glob patterns"
+            elif key == "boundary_guards":
+                if type(value) is not str or value not in {"off", "exports", "debug"}:
+                    return policy, "boundary_guards must be off, exports or debug"
+            elif key == "guarded_exports":
+                if type(value) is not list or any(type(selection) is not str or selection.count(":") != 1 or any(not part.isidentifier() for part in selection.split(":", 1)[0].split(".")) or not selection.split(":", 1)[1].isidentifier() or selection.split(":", 1)[1].startswith("_") for selection in value):
+                    return policy, "guarded_exports must list exact public module:function selections"
+                if len(set(value)) != len(value):
+                    return policy, "guarded_exports contains duplicate selections"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; milestone 2 admits only its closed module configuration"
+                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 4 configuration"
+        if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
+            return policy, "guarded_exports conflicts with boundary_guards=off"
+        if policy.get("boundary_guards") == "exports" and not policy.get("guarded_exports"):
+            return policy, "boundary_guards=exports requires explicit guarded_exports selections"
         return policy, None
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         return {}, f"cannot read project policy: {error}"
@@ -134,7 +152,7 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
-                             binding_context=payload.get("binding_context", []))
+                             binding_context=payload.get("binding_context", []), records=payload.get("records", []))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
         if payload["mode"] != result.mode:
             return None
@@ -167,6 +185,7 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     if error:
         result.tooling.append(diagnostic("PAL002", str(project_root), error, origin="runtime target"))
     policy, error = load_policy(project_root)
+    result.boundary_guards = policy.get("boundary_guards", "off")
     if error:
         result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), error, origin="project policy"))
     files, errors = discover_paths(paths or [], project_root)
@@ -206,8 +225,53 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         if cache and path not in cached:
             _cache_write(cache_path, analyzed)
         result.results.append(analyzed)
+    _guard_plan(result, policy, project_root, graph)
     result.elapsed_seconds = time.perf_counter() - started
     return result
+
+
+def _guard_plan(result, policy, root, graph):
+    from .guardgen import record_schemas, supported_schema
+    mode = policy.get("boundary_guards", "off")
+    if mode == "off":
+        return
+    if result.status:
+        return
+    replacements = graph.record_dependency_replacements | graph.collection_dependency_replacements
+    if replacements:
+        result.tooling.append(diagnostic("PAL001", str(root), "guard foundation has analyzed replacements: " + ", ".join(sorted(replacements)), origin="guard dependency"))
+    records = record_schemas(result.results)
+    modules = {_module_name(r.path, root): r for r in result.results}
+    if len(modules) != len(result.results):
+        result.tooling.append(diagnostic("PAL001", str(root), "guard selection has ambiguous duplicate module identities", origin="guard selection"))
+        return
+    if any(module == "pyalamode_exports" or module.startswith("pyalamode_exports.") for module in modules):
+        result.tooling.append(diagnostic("PAL001", str(root), "selected source conflicts with generated pyalamode_exports namespace", origin="guard selection"))
+        return
+    for selection in policy.get("guarded_exports", []):
+        module, name = selection.split(":", 1)
+        file = modules.get(module)
+        contract = next((c for c in file.contracts if c.name == name), None) if file else None
+        if contract is None:
+            result.tooling.append(diagnostic("PAL001", str(root), f"guard selection `{selection}` does not resolve to a selected top-level public function", origin="guard selection"))
+            continue
+        if not all(supported_schema(kind, records) for kind in [*contract.parameters.values(), contract.returns]):
+            result.tooling.append(diagnostic("PAL001", contract.path, f"guard selection `{selection}` requires unsupported schema; M4 guards validate exact data and refuse Callable boundaries", line=contract.line, origin="guard coverage"))
+            continue
+        result.guarded_exports.append({"selection": selection, "public_boundary": "pyalamode_exports." + module + ":" + name,
+                                       "original_boundary": selection, "original_protection": "unguarded" if mode == "exports" else "debug data assertions",
+                                       "coverage": "exact argument and return schemas, recursive nested data; no freezing, effects, callable purity, ownership or dependency tamper detection",
+                                       "parameters": dict(contract.parameters), "returns": contract.returns,
+                                       "generated": False})
+    if mode == "debug":
+        for file in result.results:
+            for contract in file.contracts:
+                result.debug_coverage.append({"path": contract.path, "name": contract.name, "line": contract.line,
+                                              "parameters": {name: kind for name, kind in contract.parameters.items() if supported_schema(kind, records)},
+                                              "returns": contract.returns if supported_schema(contract.returns, records) else None,
+                                              "locals": [item for item in contract.data_assertions if supported_schema(item["schema"], records)],
+                                              "callable_validation": "excluded; caller evidence obligations remain",
+                                              "generated": False})
 
 
 def _source_dependencies(sources: dict[str, str], root: Path) -> dict[str, set[str]]:
@@ -244,8 +308,8 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
     result = check_paths(paths, root=project_root, target=target, cache=False)
     if result.status:
         return result
-    if not any(file.selected_functions or file.module_mode for file in result.results):
-        result.tooling.append(diagnostic("PAL001", str(project_root), "build requires a participating function or functional module; no checked artifact was produced"))
+    if not any(file.selected_functions or file.module_mode or file.records for file in result.results):
+        result.tooling.append(diagnostic("PAL001", str(project_root), "build requires a participating function, record declaration or functional module; no checked artifact was produced"))
         return result
     if destination.exists():
         result.tooling.append(diagnostic("PAL001", str(destination), "output already exists; choose a fresh output directory to preserve prior artifacts"))
@@ -262,6 +326,8 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
         evidence = result.to_dict()
         evidence["artifact_kind"] = "local compatible source tree; package distribution/consumer verification is not implemented"
         evidence["artifact_files"] = {}
+        source_snapshots = {}
+        from .guardgen import debug_source, generate_facades, record_schemas
         for file in result.results:
             source = Path(file.path)
             raw = source.read_bytes()
@@ -274,17 +340,40 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
             relative = source.relative_to(base)
             copied = staging / relative
             copied.parent.mkdir(parents=True, exist_ok=True)
-            copied.write_bytes(raw)
-            evidence["artifact_files"][relative.as_posix()] = hashlib.sha256(raw).hexdigest()
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            source_snapshots[file.path] = raw.decode(encoding)
+            artifact_bytes = debug_source(source_snapshots[file.path], file, record_schemas(result.results)).encode() if result.boundary_guards == "debug" else raw
+            copied.write_bytes(artifact_bytes)
+            if result.boundary_guards == "debug":
+                compile(artifact_bytes, str(copied), "exec")
+            evidence["artifact_files"][relative.as_posix()] = hashlib.sha256(artifact_bytes).hexdigest()
+        for relative, raw in generate_facades(staging, result.results, project_root, policy.get("guarded_exports", []), source_snapshots).items():
+            compile(raw, str(staging / relative), "exec")
+            evidence["artifact_files"][relative] = hashlib.sha256(raw).hexdigest()
+        for boundary in evidence["guarded_exports"]:
+            boundary["generated"] = True
+        for coverage in evidence["debug_coverage"]:
+            coverage["generated"] = True
         evidence["output"] = str(destination)
         (staging / "pyalamode-evidence.json").write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
         # Re-read policy before publishing: policy edits are also freshness changes.
         current_policy, current_error = load_policy(project_root)
         if current_error or current_policy != policy:
             raise OSError("project policy changed after checking")
+        if foundation_identities() != evidence["product_artifacts"]:
+            raise OSError("product runtime/checker bytes changed after checking")
+        for file in result.results:
+            raw = Path(file.path).read_bytes()
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            if raw.decode(encoding) != source_snapshots[file.path]:
+                raise OSError("source changed during guard generation: " + file.path)
         staging.rename(destination)
         result.output = str(destination)
-    except (OSError, ValueError) as error:
+        for boundary in result.guarded_exports:
+            boundary["generated"] = True
+        for coverage in result.debug_coverage:
+            coverage["generated"] = True
+    except (OSError, ValueError, SyntaxError, TypeError, StopIteration, KeyError, RecursionError) as error:
         if staging and staging.exists():
             shutil.rmtree(staging)
         result.tooling.append(diagnostic("PAL001", str(destination), f"build stopped without publishing an artifact: {error}", origin="build output"))

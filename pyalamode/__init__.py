@@ -2,6 +2,8 @@
 
 from typing import Callable, TypeVar
 from .collections import Map, OrderedMap, Set, Vector
+from .records import record, replace
+from .boundaries import dataclass_adapter, freeze, namedtuple_adapter, thaw
 
 __version__ = "0.1.0"
 _F = TypeVar("_F", bound=Callable[..., object])
@@ -12,4 +14,4 @@ def fun(function: _F) -> _F:
     return function
 
 
-__all__ = ["fun", "Vector", "OrderedMap", "Map", "Set"]
+__all__ = ["fun", "Vector", "OrderedMap", "Map", "Set", "record", "replace", "freeze", "thaw", "dataclass_adapter", "namedtuple_adapter"]

@@ -5,10 +5,10 @@ from typing import Any
 import hashlib
 from pathlib import Path
 
-CHECKER_VERSION = "collections-3.0"
+CHECKER_VERSION = "records-boundaries-4.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-ops-3"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-ops-4"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -16,7 +16,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "collections.py", "model.py", "checker.py", "project.py", "cli.py")}
+            for name in ("__init__.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -26,15 +26,15 @@ RULES = {
     "PAL110": ("unsupported statement or binding", "Extract scalar decision logic using simple assignments, if, return, and pass."),
     "PAL120": ("unsupported declaration", "Use module mode or a resolved @fun, checked nested functions, and stable supported defaults."),
     "PAL121": ("misplaced module directive", "Place # mode: fun after the optional shebang, encoding declaration and docstring, before executable statements."),
-    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
-    "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
+    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
+    "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection, record and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
     "PAL210": ("operation operand contract not established", "Supply the exact operand types in the published operation contract; no coercion is implicit."),
     "PAL211": ("return contract not established", "Return the declared recursively exact admitted data or checked callable contract on every completing path."),
     "PAL221": ("input contract not established", "Supply values with established recursively exact data schemas and actual checked callable/capture evidence; ordinary unknown inputs remain caller obligations."),
     "PAL230": ("call target unknown or unsupported", "Use a resolved checked callable or an unchanged approved builtin with its supported signature."),
     "PAL240": ("dependency binding is not approved", "Use statically established stable values/callables and leave dependency bindings unchanged."),
     "PAL241": ("module initialization is not characterized", "Use supported stable initialization and import only characterized foundations or checked functional modules."),
-    "PAL250": ("persistent update result ignored", "Bind or return the new collection value; persistent updates preserve the receiver."),
+    "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
 }
 
 
@@ -80,6 +80,7 @@ class FunctionContract:
     return_callable_targets: list[str] = field(default_factory=list)
     definition_failures: list[str] = field(default_factory=list)
     operations: list[str] = field(default_factory=list)
+    data_assertions: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -98,6 +99,7 @@ class CheckResult:
     dependencies: dict[str, str] = field(default_factory=dict)
     initialization_failures: list[str] = field(default_factory=list)
     binding_context: list[str] = field(default_factory=list)
+    records: list[dict] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:

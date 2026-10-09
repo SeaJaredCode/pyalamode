@@ -7,6 +7,7 @@ caller's obligation, rather than a runtime registry or per-call purity guard.
 """
 
 from types import FunctionType, GenericAlias
+from . import records as _records
 
 __all__ = ["Vector", "OrderedMap", "Map", "Set"]
 
@@ -41,7 +42,8 @@ def _validate(value, path="value", active=None):
     kind = type(value)
     if _scalar_type(kind):
         return
-    if kind is not tuple and not _collection_type(kind):
+    record_info = _records._record_info(kind)
+    if kind is not tuple and not _collection_type(kind) and record_info is None:
         _invalid(path)
     active = set() if active is None else active
     identity = id(value)
@@ -49,7 +51,9 @@ def _validate(value, path="value", active=None):
         _invalid(path, "cyclic data is unsupported")
     active.add(identity)
     try:
-        if kind is tuple:
+        if record_info is not None:
+            _records._validate_record(value, record_info, path, active)
+        elif kind is tuple:
             for index, item in enumerate(value):
                 _validate(item, f"{path}[{index}]", active)
         elif kind is Vector:
@@ -122,6 +126,9 @@ def _equal(left, right):
         return _sequence_equal(_storage(left, "_items", "left"), _storage(right, "_items", "right"))
     if kind is OrderedMap or kind is Map:
         return _sequence_equal(_storage(left, "_entries", "left"), _storage(right, "_entries", "right"))
+    record_info = _records._record_info(kind)
+    if record_info is not None:
+        return _records._record_equal(left, right, record_info)
     return False
 
 
@@ -138,6 +145,9 @@ def _data_repr(value):
         return "(" + body + ("," if len(value) == 1 else "") + ")"
     if _collection_type(kind):
         return kind.__repr__(value)
+    record_info = _records._record_info(kind)
+    if record_info is not None:
+        return _records._record_repr(value, record_info)
     _invalid("representation")
 
 

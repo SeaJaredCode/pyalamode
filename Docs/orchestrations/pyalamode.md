@@ -33,13 +33,13 @@
   - Task: /root/m03_collections
   - Depends on: 2
   - Acceptance: A11–A13; nested invariants, retained versions, traversal/callback safety, published costs/trust.
-  - Evidence: Frozen93-test suite passesmacOS1.508s/Linux3.646s; independent113sourcecases,11projectlayouts,namespace/cache/backendbytefreshness and262runtimeassertions×3seeds clean; hugeint43focusedchecks/hookzero and8foundationwritergates clean. Ordinaryunchangedbuild/run and3negativebuildnooutputgates verified.36runtimeconditions/108intervals perplatform at100/1000/10000, actualretention/updatecosts andmatchingfinalsourceidentities published. Commitpending.
-- [ ] 4. Records and boundaries
-  - State: queued
-  - Task: not started
+  - Evidence: Frozen93-test suite passesmacOS1.508s/Linux3.646s; independent113sourcecases,11projectlayouts,namespace/cache/backendbytefreshness and262runtimeassertions×3seeds clean; hugeint43focusedchecks/hookzero and8foundationwritergates clean. Ordinaryunchangedbuild/run and3negativebuildnooutputgates verified.36runtimeconditions/108intervals perplatform at100/1000/10000, actualretention/updatecosts andmatchingfinalsourceidentities published. Commit1675e94.
+- [x] 4. Records and boundaries
+  - State: complete
+  - Task: /root/m04_records; runtime helper /root/m04_runtime; independent reviewer /root/m04_review
   - Depends on: 3
   - Acceptance: A14–A16, A34–A35; independent snapshots/exports and selected guard coverage.
-  - Evidence: pending
+  - Evidence: Frozen149-test suite passes macOS2.491s/Linux7.591s; root39 CLI/ordinary execution/failed-build gates and3 shipped negative fixture no-output builds clean. Independent93 literal sources,99 runtime assertions,49 guard assertions and42 project layouts/168 assertions pass on both actual platforms with unchanged/cross-platform source maps. Actual generated guard counts0/2/28 over8 direct internal leaf calls;10 runtime conditions/30 intervals/750 calls per platform and all9 current product digests independently inspected. Final conformance/handoff/cost documentation inspected. Commitpending.
 - [ ] 5. Checked effectful shells
   - State: queued
   - Task: not started
@@ -114,6 +114,8 @@
 
 - A24’s translated-source requirement cannot be observed before milestone 14 supplies translation. Verify compatible-source/editor/guard coverage at milestone 9 and retain the translated-source portion as an outstanding gate until milestone 14. This changes verification timing, not product scope.
 - Strict dependency milestones start only after prerequisite verification. Independent conformance/review/documentation work may proceed in parallel; concurrent writers have disjoint file ownership.
+- M4 plan reviewed: exact fixed-field product records; named qualifying dataclass/namedtuple snapshot adapters to concrete record schemas; explicit exclusive-access assertion for mutable snapshots; fresh exports; optional selected `pyalamode_exports` facades and documented debug assertions. Guard selection must fail on unknown/duplicate targets. Ordinary original-module and checked internal calls retain their unguarded contracts. Runtime helper owns records/boundaries/collection hooks; checker/build worker owns remaining product files; reviewer owns conformance documentation only.
+- M4 review corrections include annotation/default availability, resolved setter aliases, the new runtime dependency inventory, and exact adapter getter/default/constructor qualifiers. Root found an inherited checked circular `from` import admitted despite predictable partial initialization; approved a finite SCC rejection gate while retaining deferred module-import recursion. Product-module helper writes retain conservative wildcard exclusions; specific standard-foundation writers keep their individual gates. No claim of minimal symbol-level invalidation is made.
 
 ## Supporting workers
 
