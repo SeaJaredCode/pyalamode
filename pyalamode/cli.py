@@ -59,12 +59,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         operations = {
             "abs": "abs(exact int) -> exact int; one positional argument.",
-            "len": "len(exact str, bytes or recursively admitted tuple) -> exact int; one positional argument.",
+            "len": "len(exact str, bytes, recursively admitted tuple, Vector, OrderedMap, Map or Set) -> exact int; one positional argument.",
             "min": "min(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "max": "max(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "fun": "Runtime identity marker. Execution adds no checked evidence and performs no input validation.",
-            "tuple": "Exact recursive tuple[T1, T2], homogeneous tuple[T, ...], or empty tuple[()]; immutable data only, no subclasses or callable payloads. Construction and len are admitted; indexing and iteration remain unsupported.",
-            "Callable": "typing/collections.abc Callable[[T1, T2], R]: fixed positional pure invocation, exact inputs/result and stable captures; failure upper bound ZeroDivisionError and RecursionError. Analyzed callers supply resolved checked callable evidence; annotations do not prove actual callbacks pure.",
+            "tuple": "Exact recursive tuple[T1, T2], homogeneous tuple[T, ...], or empty tuple[()]; immutable data only, no subclasses or callable payloads. Fixed tuples use literal indexes/slices; homogeneous tuples admit exact int indexes/slices. Equality and len are characterized; iteration remains unsupported.",
+            "Callable": "typing/collections.abc Callable[[T1, T2], R]: fixed positional pure invocation, exact inputs/result and stable captures; failure upper bound IndexError, KeyError, ValueError, ZeroDivisionError and RecursionError. Analyzed callers supply resolved checked callable evidence; annotations do not prove actual callbacks pure.",
+            "Vector": "Vector[T]: eager exact deep data. of(*explicit items), Vector[T].of() empty, int index/slice, appended(T), updated_at(int,T), concat(Vector[T]), map(checked Callable[[T],R]), filter(checked Callable[[T],bool]), fold(checked Callable[[A,T],A],A). Retains prior versions; tuple-copy updates O(n); len/equality. IndexError and zero-step ValueError; callback failures propagate. GenericAlias types are runtime erased.",
+            "OrderedMap": "OrderedMap[K,V]: exact homogeneous scalar keys and recursively admitted values; of(*exact pair tuples), typed empty, key lookup/get(key,V default)/contains, updated/without/merge, entries()/keys()/values() -> Vector. Replace preserves key position, new keys append; right merge wins; order participates in equivalence. Missing lookup KeyError; tuple-copy updates O(n).",
+            "Map": "Map[K,V]: unordered exact homogeneous scalar keys; of(*exact pair tuples), typed empty, lookup/get/contains/updated/without/merge and extensional equality. ordered_entries()/ordered_keys()/ordered_values() -> Vector use scalar total order. No arbitrary traversal or callbacks; canonical representation; missing lookup KeyError; tuple-copy updates O(n).",
+            "Set": "Set[T]: unordered homogeneous exact scalar elements; of(*items), typed empty, contains/added/without/union/intersection/difference, ordered_values() -> Vector in scalar total order. No arbitrary traversal or callbacks; typed extensional equality and canonical representation; tuple-copy updates O(n).",
             "module": "# mode: fun after the optional shebang/encoding/docstring and before executable source, or project require_modules globs; initialization is checked without application imports or evaluation.",
         }
         if args.symbol in operations:

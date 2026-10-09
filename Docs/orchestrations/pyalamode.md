@@ -27,13 +27,13 @@
   - Task: /root/m02_modules
   - Depends on: 1
   - Acceptance: A09–A10; initialization, stable constants/captures/defaults, checked graphs and recursion.
-  - Evidence: Frozen50-test suite passed macOS1.292s/Linux2.329s; independent83 source cases,20 project layouts,6 warm transitions clean; actual warm body-analysis skip verified; CLI ordinary build/run and negative no-output gates. Named26-file/208-function/320-edge measurements recorded separately. Commit pending.
-- [ ] 3. Persistent collections
-  - State: queued
-  - Task: not started
+  - Evidence: Frozen50-test suite passed macOS1.292s/Linux2.329s; independent83 source cases,20 project layouts,6 warm transitions clean; actual warm body-analysis skip verified; CLI ordinary build/run and negative no-output gates. Named26-file/208-function/320-edge measurements recorded separately. Commit ca3db3f.
+- [x] 3. Persistent collections
+  - State: complete
+  - Task: /root/m03_collections
   - Depends on: 2
   - Acceptance: A11–A13; nested invariants, retained versions, traversal/callback safety, published costs/trust.
-  - Evidence: pending
+  - Evidence: Frozen93-test suite passesmacOS1.508s/Linux3.646s; independent113sourcecases,11projectlayouts,namespace/cache/backendbytefreshness and262runtimeassertions×3seeds clean; hugeint43focusedchecks/hookzero and8foundationwritergates clean. Ordinaryunchangedbuild/run and3negativebuildnooutputgates verified.36runtimeconditions/108intervals perplatform at100/1000/10000, actualretention/updatecosts andmatchingfinalsourceidentities published. Commitpending.
 - [ ] 4. Records and boundaries
   - State: queued
   - Task: not started
@@ -140,3 +140,22 @@
 - Milestone 2 app code/tests/examples frozen by worker; final combined50-test suite passed macOS1.292s and Linux2.329s. README and Docs/milestones/02-modules.md inspected. Independent conformance and final named measurements running against frozen sources.
 
 - Milestone 2 measurements: branched_integer_rollup_v1,26 modules/208 functions/320 direct call edges,5 trials per platform. Medians macOS cold/warm/unrelated/leaf0.675846/0.481166/0.483994/0.505263s; Linux0.879751/0.623652/0.627578/0.662288s. Hits/misses0/26,26/0,25/1,23/3 on every trial. Both package snapshots match frozen checkout. Docs/evidence/m02-measurements.md publishes conditions/limits.
+
+- Milestone 2 committed ca3db3f; staged whitespace clean and working tree clean before M3 dispatch.
+- /root/m03_review owns Docs/conformance/m03-cases.md; implementation/review run in parallel only after M2 verification.
+
+- M3 approved engineering plan: tuple-backed Vector/OrderedMap; canonically ordered homogeneous exactscalar Map/Set; O(n) copying updates and O(kn) full retained history, no externalbackend. Conditional callable failure bound expands to ZeroDivisionError/RecursionError/IndexError/KeyError/ValueError. No unordered general callbacks/traversal.
+- Runtimehelper dispatch: fresh agent hit threadlimit, so completed /root/m02_modules reused with new curated disjoint unit: pyalamode/collections.py,tests/m03_runtime.py,benchmarks/m03_collections.py,Docs/evidence/m03-runtime-*. MainM3builder owns all checker/static/export/docs files; reviewer owns only conformance. No CatWrangler identity propagation.
+
+- M3 pre-freeze root combined89-test suite passes macOS1.397s/Linux3.051s. Independent interim110source cases,11project layouts,6namespace/cache transitions clean. Runtime membership mismatch fixed with __contains__, 23runtime tests cover hooks/metaclass/cycles/forgedstorage/retention/order/callbackdata. Finalsourcefreeze/conformance/performance pending.
+
+- M3 combinedproduct/tests/examples frozen. Root90-test finalsuite passesmacOS1.490s/Linux3.131s. Independentruntime262assertions/process at seeds1,2,8675309 identicaloutput. Nested-schema validation/equality RecursionError boundedseparately, meaningfulregression included. Conformancefinal/backendbytefreshness and100/1000/10000runtime measurements pending.
+
+- M3 final4diagnostic-remediationstrings corrected (no behavior change); revisedmodeldigest6f0cbbc5837c3054f65bb1c3b8d4f6b0c5ce85a39506037790fdcc3af65fa184, renewedfreeze. Root90-test suite passesmacOS1.388s/Linux3.084s. Finalfocusedconformanceannotation willrecordnewmodeldigest; benchmarkonlybeforeafterhash/hardware refinement rerunsmeasurementsagainstupdatedsnapshot.
+- M3rootCLI example:3sourcefiles/8functions/20calls, successfulfreshunchangedsourcebuild, ordinaryexecutionoutputpreservesoriginalVector andcanonicalMap/Set results.
+
+- M3actualpostfreezefinding: validexactint key10**5000 caused hiddenValueError fromeagerdecimaldiagnosticpathformatting inMap/OrderedMapconstructors andnestedvalidation. Approved ONLYruntimeinternaldiagnostickeyformatter hex fallback (publicrepr/strictformatting scope unchanged) andfocusedtests; runtimefreeze reopened. Earliermeasurements preservedhistoricallyuntilfinalrerun. No checkerfailureuniversechange required.
+
+- M3transitivefoundationfix: finiteactualbackendbuiltin/types inventory, knownanalyzedwritersinvalidatecollectionclasses+warmcontext; unrelatedscalarstridentity retainsproof/cache. Latestchecker7791b1ae028218413af16d02f956bb434f6cb8e7b073d4369ad6ba1b83683539, runtimec0a4738ae85c1048b44c160a19f2d425c2872a5b601dcd352989903ad4102ab6. Combined93-tests passmacOS1.508s/Linux3.646s. Finalfocusedconformance andfinalmetrics againsttheseidentities running.
+
+- M3allworkerterminalreadiness inspected; Docs/milestones/03-collections.md andDocs/evidence/m03-runtime-measurements.md complete. Finalsrc/productidentities matchbothrawplatformmeasurements; sourceunchangedgatespass.
