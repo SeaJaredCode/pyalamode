@@ -5,10 +5,10 @@ from typing import Any
 import hashlib
 from pathlib import Path
 
-CHECKER_VERSION = "effects-capabilities-5.1"
+CHECKER_VERSION = "domains-failures-6.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-ops-5"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-ops-6"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -16,18 +16,18 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
+            for name in ("__init__.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
     "PAL002": ("unsupported target", "Use the published CPython 3.13.1 standard-build macOS/Linux target."),
     "PAL101": ("binding already initialized", "Derive a new local name; exclusive branches can initialize one name once."),
     "PAL102": ("binding not initialized on every path", "Initialize the name in every continuing branch before using it."),
-    "PAL110": ("unsupported statement or binding", "Extract scalar decision logic using simple assignments, if, return, and pass."),
+    "PAL110": ("unsupported statement or binding", "Use the published finite initialization, if/return, exact match, characterized try/except and borrow statements."),
     "PAL120": ("unsupported declaration", "Use module mode or a resolved @fun, checked nested functions, and stable supported defaults."),
     "PAL121": ("misplaced module directive", "Place # mode: fun after the optional shebang, encoding declaration and docstring, before executable statements."),
-    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
-    "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection, record and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
+    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record/variant/Option/Result types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
+    "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection, record, closed-domain and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
     "PAL210": ("operation operand contract not established", "Supply the exact operand types in the published operation contract; no coercion is implicit."),
     "PAL211": ("return contract not established", "Return the declared recursively exact admitted data or checked callable contract on every completing path."),
     "PAL221": ("input contract not established", "Supply values with established recursively exact data schemas and actual checked callable/capture evidence; ordinary unknown inputs remain caller obligations."),
@@ -36,6 +36,8 @@ RULES = {
     "PAL241": ("module initialization is not characterized", "Use supported stable initialization and import only characterized foundations or checked functional modules."),
     "PAL310": ("effect bound exceeded", "Declare the characterized effect at the receiving boundary within project policy, or pass stable data to a pure calculation. Effect names never authorize unknown operations."),
     "PAL320": ("capability lifetime or escape unsupported", "Use an exact capability parameter or the finite borrow scope; lend it only to checked capability slots. Capabilities cannot be data, aliases, defaults, captures or returned values."),
+    "PAL330": ("pattern coverage or binding unsupported", "Use unchanged exact product cases/records with fresh irrefutable captures and explicit complete case coverage or a policy-permitted wildcard."),
+    "PAL340": ("failure handler contract unsupported", "Use unchanged characterized builtin categories and opaque handler-local exception targets only through failure_value; exception state and arbitrary cleanup remain unsupported."),
     "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
 }
 
@@ -94,6 +96,10 @@ class FunctionContract:
     effect_origins: dict[str, list[str]] = field(default_factory=dict)
     capability_parameters: dict[str, dict] = field(default_factory=dict)
     borrow_scopes: list[dict] = field(default_factory=list)
+    failure_edges: list[dict] = field(default_factory=list)
+    direct_failures: list[str] = field(default_factory=list)
+    patterns: list[dict] = field(default_factory=list)
+    handlers: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -113,6 +119,7 @@ class CheckResult:
     initialization_failures: list[str] = field(default_factory=list)
     binding_context: list[str] = field(default_factory=list)
     records: list[dict] = field(default_factory=list)
+    variants: list[dict] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:

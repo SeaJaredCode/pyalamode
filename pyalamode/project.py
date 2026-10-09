@@ -57,8 +57,9 @@ class ProjectResult:
                 "coverage": {"eligible_functions": sum(r.eligible_functions for r in self.results),
                              "selected_functions": sum(r.selected_functions for r in self.results),
                              "selected_records": sum(len(r.records) for r in self.results),
+                             "selected_variants": sum(len(r.variants) for r in self.results),
                              "analyzed_call_sites": sum(r.analyzed_call_sites for r in self.results)},
-                "claim_scope": "Selected functions, record declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
+                "claim_scope": "Selected functions, record/variant declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
 
 
 def runtime_error(target: str = TARGET) -> str | None:
@@ -92,11 +93,14 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
             return {}, "tool.pyalamode must be a table"
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
-                    "require_modules": [], "guarded_exports": [], "effect_bounds": {}}
+                    "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": []}
         for key, value in policy.items():
             if key == "require_modules":
                 if type(value) is not list or any(type(pattern) is not str or not pattern or pattern.startswith("/") or ".." in Path(pattern).parts or "\\" in pattern for pattern in value):
                     return policy, "require_modules must be a list of nonempty project-relative glob patterns"
+            elif key == "explicit_cases":
+                if type(value) is not list or any(type(selection) is not str or selection.count(":") != 1 or any(not part.isidentifier() for part in selection.split(":", 1)[0].split(".")) or not selection.split(":", 1)[1].isidentifier() for selection in value) or len(set(value)) != len(value):
+                    return policy, "explicit_cases must list unique exact module:Domain selections"
             elif key == "effect_bounds":
                 from .checker import EFFECT_FAMILIES
                 if type(value) is not dict:
@@ -115,7 +119,7 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
                 if len(set(value)) != len(value):
                     return policy, "guarded_exports contains duplicate selections"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 5 configuration"
+                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 6 configuration"
         if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
             return policy, "guarded_exports conflicts with boundary_guards=off"
         if policy.get("boundary_guards") == "exports" and not policy.get("guarded_exports"):
@@ -161,7 +165,7 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
-                             binding_context=payload.get("binding_context", []), records=payload.get("records", []))
+                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), variants=payload.get("variants", []))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
         if payload["mode"] != result.mode:
             return None
@@ -238,6 +242,10 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     for selection in policy.get("effect_bounds", {}):
         if selection not in selected:
             result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"effect bound selection `{selection}` does not resolve to a selected function", origin="project effect policy"))
+    selected_domains = {info.module + ":" + info.node.name for info in graph.variants.values()}
+    for selection in policy.get("explicit_cases", []):
+        if selection not in selected_domains:
+            result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"explicit_cases selection `{selection}` does not resolve to a checked top-level domain", origin="project pattern policy"))
     _guard_plan(result, policy, project_root, graph)
     result.elapsed_seconds = time.perf_counter() - started
     return result
@@ -250,7 +258,7 @@ def _guard_plan(result, policy, root, graph):
         return
     if result.status:
         return
-    replacements = graph.record_dependency_replacements | graph.collection_dependency_replacements
+    replacements = graph.record_dependency_replacements | graph.collection_dependency_replacements | graph.domain_dependency_replacements
     if replacements:
         result.tooling.append(diagnostic("PAL001", str(root), "guard foundation has analyzed replacements: " + ", ".join(sorted(replacements)), origin="guard dependency"))
     records = record_schemas(result.results)
@@ -322,7 +330,7 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
     result = check_paths(paths, root=project_root, target=target, cache=False)
     if result.status:
         return result
-    if not any(file.selected_functions or file.module_mode or file.records for file in result.results):
+    if not any(file.selected_functions or file.module_mode or file.records or file.variants for file in result.results):
         result.tooling.append(diagnostic("PAL001", str(project_root), "build requires a participating function, record declaration or functional module; no checked artifact was produced"))
         return result
     if destination.exists():

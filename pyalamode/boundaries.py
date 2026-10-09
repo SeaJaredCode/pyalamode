@@ -276,7 +276,8 @@ def _freeze(value, path, active, exclusive, adapter):
     kind = type(value)
     if _collections._scalar_type(kind):
         return value
-    if _collections._collection_type(kind) or _records._record_info(kind) is not None:
+    if (_collections._collection_type(kind) or _records._record_info(kind) is not None
+            or _records._variants._case_info(kind) is not None):
         _collections._validate(value, path)
         return value
     adapter_source = adapter is not None and kind is object.__getattribute__(adapter, "_source")
@@ -354,6 +355,11 @@ def _thaw(value):
     info = _records._record_info(kind)
     if info is not None:
         return {name: _thaw(item) for (name, _), item in zip(info[1], _records._record_values(value, info))}
+    case_info = _records._variants._case_info(kind)
+    if case_info is not None:
+        return {"variant": case_info[4], "case": case_info[5],
+                "fields": {name: _thaw(item) for (name, _), item in
+                           zip(case_info[1], _records._variants._case_values(value, case_info))}}
     if kind is tuple:
         return [_thaw(item) for item in value]
     if kind is _collections.Vector:

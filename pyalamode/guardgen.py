@@ -12,7 +12,14 @@ from .checker import SCALARS, _contract_type, _module_name
 
 
 def record_schemas(results):
-    return {record["schema"]: record for result in results for record in result.records}
+    schemas = {record["schema"]: record for result in results for record in result.records}
+    schemas["Record['pyalamode:Failure']"] = {"name": "Failure", "fields": {"category": "str", "message": "str"}}
+    for result in results:
+        for variant in result.variants:
+            schemas[variant["schema"]] = variant
+            for name, case in variant["cases"].items():
+                schemas[case["schema"]] = {**case, "name": variant["name"] + "." + name}
+    return schemas
 
 
 def supported_schema(text, records, seen=()):
@@ -22,11 +29,15 @@ def supported_schema(text, records, seen=()):
         return False
     if schema.name in SCALARS:
         return True
-    if schema.name.startswith("record:"):
+    if schema.name.startswith("variant:"):
+        if text in seen or text not in records:
+            return False
+        return all(supported_schema(case["schema"], records, (*seen, text)) for case in records[text]["cases"].values())
+    if schema.name.startswith(("record:", "case:")):
         if text in seen or text not in records:
             return False
         return all(supported_schema(t, records, (*seen, text)) for t in records[text]["fields"].values())
-    return schema.name in {"tuple", "Vector", "Map", "OrderedMap", "Set"} and all(supported_schema(str(t), records, seen) for t in schema.arguments)
+    return schema.name in {"tuple", "Vector", "Map", "OrderedMap", "Set", "Option", "Result", "Some", "Nothing", "Ok", "Err"} and all(supported_schema(str(t), records, seen) for t in schema.arguments)
 
 
 class Schemas:
@@ -48,13 +59,26 @@ class Schemas:
         children = "(" + ", ".join(self.code(str(t)) for t in schema.arguments) + ("," if len(schema.arguments) == 1 else "") + ")"
         if schema.name == "tuple":
             return "('tuple', " + children + ", " + repr(schema.variadic) + ")"
+        if schema.name.startswith("variant:"):
+            module, name = schema.name[len("variant:"):].rsplit(":", 1)
+            reference = self.local_records.get(text) or self.module(module) + "." + name
+            cases = []
+            for case_name, case in self.records[text]["cases"].items():
+                fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in case["fields"].items()) + ("," if len(case["fields"]) == 1 else "") + ")"
+                cases.append("(" + reference + "." + case_name + ", " + fields + ")")
+            return "('variant', " + reference + ", (" + ", ".join(cases) + ("," if len(cases) == 1 else "") + "))"
+        if schema.name.startswith("case:"):
+            module, domain, name = schema.name[len("case:"):].rsplit(":", 2)
+            reference = self.local_records.get(text) or self.module(module) + "." + domain + "." + name
+            fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in self.records[text]["fields"].items()) + ("," if len(self.records[text]["fields"]) == 1 else "") + ")"
+            return "('case', " + reference + ", " + fields + ")"
         if schema.name.startswith("record:"):
             module, name = schema.name[len("record:"):].rsplit(":", 1)
             record = self.records[text]
             fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in record["fields"].items()) + ("," if len(record["fields"]) == 1 else "") + ")"
             reference = self.local_records.get(text) or self.module(module) + "." + name
             return "('record', " + reference + ", " + fields + ")"
-        if schema.name in {"Vector", "Map", "OrderedMap", "Set"}:
+        if schema.name in {"Vector", "Map", "OrderedMap", "Set", "Option", "Result", "Some", "Nothing", "Ok", "Err"}:
             return "(" + repr(schema.name) + ", " + children + ")"
         raise ValueError("guard schemas require supported exact data, not Callable evidence")
 
@@ -67,6 +91,12 @@ def _prefix(tree):
     names.update(n.arg for n in ast.walk(tree) if isinstance(n, ast.arg))
     names.update(n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
     for node in ast.walk(tree):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)) and node.name:
+            names.add(node.name)
+        if isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             names.update(alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name) for alias in node.names)
     prefix = "_pyalamode_guard_"
@@ -108,7 +138,11 @@ def facade_source(source, module, contracts, records):
 def debug_source(source, result, records):
     tree = ast.parse(source)
     prefix = _prefix(tree)
-    local_records = {record["schema"]: prefix + "record" + str(index) for index, record in enumerate(result.records)}
+    declarations = [*result.records, *result.variants]
+    local_records = {record["schema"]: prefix + "record" + str(index) for index, record in enumerate(declarations)}
+    for variant in result.variants:
+        for name, case in variant["cases"].items():
+            local_records[case["schema"]] = local_records[variant["schema"]] + "." + name
     schemas = Schemas(records, prefix, local_records)
     validate = prefix + "validate"
     contracts = {contract.name: contract for contract in result.contracts}
@@ -140,6 +174,10 @@ def debug_source(source, result, records):
                 nested = getattr(node, field, None)
                 if isinstance(nested, list):
                     setattr(node, field, visit(nested, qualified, contract))
+            for handler in getattr(node, "handlers", []):
+                handler.body = visit(handler.body, qualified, contract)
+            for case in getattr(node, "cases", []):
+                case.body = visit(case.body, qualified, contract)
             output.append(node)
             if contract and isinstance(node, (ast.Assign, ast.AnnAssign)):
                 for item in contract.data_assertions:
@@ -152,7 +190,7 @@ def debug_source(source, result, records):
     for node in tree.body:
         aliased.append(node)
         if isinstance(node, ast.ClassDef):
-            for record in result.records:
+            for record in declarations:
                 if record["name"] == node.name:
                     aliased.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=local_records[record["schema"]], ctx=ast.Store())], value=ast.Name(id=node.name, ctx=ast.Load())), node))
     tree.body = aliased

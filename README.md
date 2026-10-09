@@ -1,6 +1,6 @@
 # Pyalamode
 
-Pyalamode checks a functional core in ordinary Python. The current M5 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, and finite checked effectful shells with opaque capabilities. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
+Pyalamode checks a functional core in ordinary Python. The current M6 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, and characterized failure handlers. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
 The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux** (`cpython-3.13.1`). Other patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Installation under another Python 3.13 patch does not establish compatibility.
 
@@ -21,6 +21,8 @@ pyalamode check examples/records --no-cache
 python -m examples.records.demo
 pyalamode check examples/effects --no-cache
 python -m examples.effects.demo
+pyalamode check examples/domains --no-cache
+python -m examples.domains.demo
 ```
 
 The scalar example prints `1300` and `0`. The module example prints `1500`, `6`, `6`, and `2`. Its checked core uses stable imports, defaults, a closure, a recursive calculation, and tuple inputs; its ordinary demo prints those results without receiving a purity claim.
@@ -75,6 +77,8 @@ Every parameter and result has an explicit supported annotation. Analyzed calls 
 | Callables | Stable `typing` or `collections.abc` `Callable[[int, str], int]`; fixed positional pure invocation. Product `Effectful[[ClockCapability], int, Clock]` adds a finite effect upper bound and exact capability slots. Actual target/capture evidence is required. |
 | Capabilities | Exact `IOCapability`, `StateCapability`, `ClockCapability`, `RandomCapability`, `EnvironmentCapability`; borrowed invocation inputs in matching effectful functions, excluded from stable data/returns/defaults/captures/aliases |
 | Collections | Stable `pyalamode` imports of `Vector[T]`, `OrderedMap[K, V]`, `Map[K, V]`, and `Set[T]`; recursively admitted data; map keys and Set elements use one exact scalar domain |
+| Variants | Exact `@variant` domains with nested `@case` payloads; `Option[T]` (`Some`, `Nothing`) and `Result[T,E]` (`Ok`, `Err`); finite exhaustive exact class patterns |
+| Failure data | Exact immutable `Failure(category: str, message: str)`; `failure_value` converts a supported opaque actual handler exception token to fixed immutable data |
 | Records | Exact `@record` declarations with fixed public typed fields and stable defaults; recursive admitted data, pure slot reads, exact type-sensitive equality and `replace` |
 
 Callable parameters express a required input contract. They do not turn an unknown function, lambda, protocol, or ordinary annotated parameter into checked pure evidence. Checked callers supply resolved checked functions or pass a callable already established by their own input contract. Callable annotations allow nested callable inputs/results, but exclude `Any`, ellipsis signatures, variadics, and keyword-only callback shapes. Optional positional defaults and positional-only parameters are compatible when the complete fixed positional call fits. Direct checked calls also support normal positional-only, positional-or-keyword, keyword-only, and default arguments.
@@ -87,13 +91,53 @@ Stable constants require a single characterized source initialization and no ana
 
 The scalar operations remain integer unary `+`/`-`, integer `+`/`-`/`*`/`//`/`%`, same-type integer/string/bytes comparisons, string/bytes concatenation, boolean `not`/`and`/`or`/equality, right-hand literal `is None`/`is not None`, and conditional expressions. Approved builtin signatures are `abs(int)`, `len(str|bytes|admitted_tuple|product_collection)`, and two-or-more homogeneous positional `min`/`max` over exact `int`, `str`, or `bytes`. Division and remainder disclose `ZeroDivisionError`.
 
-Statements include one-name initialization, annotated initialization, `if`/`elif`/`else`, `return`, `pass`, docstrings, and checked nested function definitions. Each reachable binding initializes once. Exclusive branches may initialize the same name; missing initialization and reachable reinitialization fail. Imports are module-level dependencies.
+Statements include one-name initialization, annotated initialization, `if`/`elif`/`else`, `return`, `pass`, docstrings, checked nested function definitions, exhaustive finite `match`, and characterized `try`/`except` handlers. Each reachable binding initializes once. Exclusive branches may initialize the same name; missing initialization and reachable reinitialization fail. Imports are module-level dependencies.
 
 Module initializers and defaults use closed stable data expressions, earlier stable bindings, approved builtin calls, and checked callable references. **Calling application functions in initialization/default expressions is excluded**, even if their invocation contract is checked. Annotation expressions are parsed from the finite whitelist. Functions admit the resolved identity `fun` and finite identity `effects` declarations; fixed record classes admit the library declaration `record`. Imports, decorators, annotations and defaults must be available when Python evaluates them. Initialization and definition-time default failures are reported separately from invocation failures.
 
 Local imports resolve from the project root with package-before-module precedence and required package initializers. A strict module imports only characterized foundations or functional local modules. Cyclic direct from-imports and eager cyclic namespace reads in initialization/defaults/non-postponed annotations fail `PAL241`; module imports with deferred function references remain supported. This is a finite conservative availability gate. An ordinary module may perform unchecked initialization before using checked exports. Unresolved external APIs receive no trusted admission. A local file named `pyalamode`, `typing`, `types`, or `collections` cannot acquire foundation behavior through its spelling.
 
-Fixed tuples support in-range literal integer indexing and literal slicing; homogeneous tuples support exact integer indexes and slices. Tuple/collection/record equality requires matching recursive exact data schemas. Map/Set membership uses characterized scalar lookup. Loops, comprehensions, destructuring, arbitrary classes/methods, static patterns, mutable strict data, reflection, generators, async, user exceptions/handlers, external trust approvals, arbitrary effectful operations and Task remain excluded. Dynamic ordinary dispatch stays the ordinary caller's responsibility. The checker is conservative about unknown aliases, ordinary control flow, and cells outside a checked enclosing scope.
+Fixed tuples support in-range literal integer indexing and literal slicing; homogeneous tuples support exact integer indexes and slices. Tuple/collection/record equality requires matching recursive exact data schemas. Map/Set membership uses characterized scalar lookup. Loops, comprehensions, destructuring, arbitrary classes/methods, general patterns, mutable strict data, reflection, generators, async, arbitrary exception construction/raise/handlers, external trust approvals, arbitrary effectful operations and Task remain excluded. Dynamic ordinary dispatch stays the ordinary caller's responsibility. The checker is conservative about unknown aliases, ordinary control flow, and cells outside a checked enclosing scope.
+
+## Closed alternatives and failure values
+
+```python
+from pyalamode import variant, case, fun, Result, Ok, Err, Failure, failure_value
+
+@variant
+class Lookup:
+    @case
+    class Found:
+        value: int
+    @case
+    class Missing:
+        pass
+
+@fun
+def read(value: Lookup) -> int:
+    match value:
+        case Lookup.Found(value=number):
+            return number
+        case Lookup.Missing():
+            return 0
+
+@fun
+def quotient(number: int, divisor: int) -> Result[int, Failure]:
+    try:
+        return Ok(number // divisor)
+    except ZeroDivisionError as caught:
+        return Err(failure_value(caught))
+```
+
+A domain has one or more public nested `@case` declarations with fixed immutable data fields and stable trailing defaults. Construct `Lookup.Found(3)` or `Lookup.Missing()`; the domain is a closed namespace. Cases have no methods, bases, custom constructors, descriptors, or arbitrary match hooks. Field schemas refer to already available data declarations; outer/self/sibling/forward case references are refused. Unchecked changes to case behavior still violate dependency assumptions.
+
+`Option[int]` contains `Some(value)` or `Nothing()`. `Result[int,str]` contains `Ok(value)` or `Err(error)`. Inspect them with `case Some(value=n)`, `case Nothing()`, `case Ok(value=n)`, or `case Err(error=e)`. `accumulate(left,right)` accepts exactly two positional established `Result[T,E]` and `Result[U,E]` schemas and returns `Result[tuple[T,U],Vector[E]]`: successes produce a pair; independent errors appear in left-to-right argument order. Explicit Result parameter/binding annotations supply missing success/error schemas; two sparse `Ok` constructors alone do not establish the full accumulation contract.
+
+An unguarded full case pattern covers its whole tag only when its payload patterns are irrefutable. A nested single case of a multi-case payload domain constrains that outer case. Constrained patterns and guarded patterns cannot bind named captures, because failed attempts may leave partial bindings. Capture-free exact bool guards supply coverage only when statically literal `True`. All declared cases need full coverage, or an explicit final `_` can deliberately cover present and future cases. Adding a case rejects incomplete explicit consumers and keeps a deliberate wildcard valid. Projects can require explicit cases with `explicit_cases = ["core:Lookup"]` under `[tool.pyalamode]`.
+
+Handlers admit unchanged builtin `ZeroDivisionError`, `IndexError`, `KeyError`, `ValueError`, `RecursionError`, `RuntimeError`, `OSError`, and `UnicodeError` categories, including direct tuple selection. `RuntimeError` covers `RecursionError`; `ValueError` covers `UnicodeError`; overlapping handlers are refused. Broad/bare/user handlers, `else`/`finally`, exception construction, and `raise` stay outside the catalog. An `as` target remains an actual mutable Python exception, opaque in checked code and deleted after the handler. Only direct `failure_value(caught)` converts it to immutable category/message data, using exact supported builtin identities and fixed messages without reading payloads, dictionary, traceback, frames, or formatters. Targets cannot alias/capture/escape, overwrite a potentially initialized try binding, or be reused after cleanup.
+
+Catching a characterized failure reduces the failure contract at that operation/call site. It retains every performed effect, operation and dependency assumption. Handler-body failures remain visible outside that handler's mask; warm cache evidence preserves masks per call occurrence. Snapshot validation and optional guards support nested variants; `thaw` emits fresh `{"variant": "module:Domain", "case": "CaseName", "fields": {...}}` envelopes, with fixed `pyalamode:Option`/`pyalamode:Result` identities. See [the M6 contract](Docs/milestones/06-domains.md) and [the domain example](examples/domains/domain.py).
 
 ## Checked effectful shells
 
@@ -175,7 +219,7 @@ def tag_customer(customer: Customer, tag: str) -> Customer:
     return replace(customer, tags=tags)
 ```
 
-Records validate complete recursive field schemas, accept positional/keyword fields and stable trailing defaults, preserve earlier values through replacement, and reject ordinary field mutation, reinitialization and subclassing. Public fields named `self` or `value` are supported; constructor/replacement receivers are positional-only. Methods, custom constructors/validators, descriptors, callable fields, bases/metaclasses, private fields, and forward/recursive record declarations have no M4 contract. Runtime ordinary Python patterns use `__match_args__`; static patterns arrive later. Records are unhashable. Record-only checked builds are supported, and evidence separates the checked declaration from the trusted product implementation.
+Records validate complete recursive field schemas, accept positional/keyword fields and stable trailing defaults, preserve earlier values through replacement, and reject ordinary field mutation, reinitialization and subclassing. Public fields named `self` or `value` are supported; constructor/replacement receivers are positional-only. Methods, custom constructors/validators, descriptors, callable fields, bases/metaclasses, private fields, and forward/recursive record declarations have no M4 contract. Finite exact record patterns support fresh irrefutable captures; guarded or potentially failed partial capture patterns are refused. Records are unhashable. Record-only checked builds are supported, and evidence separates the checked declaration from the trusted product implementation.
 
 In an ordinary shell, `freeze(raw, exclusive=True, schema=Vector[int])` recursively converts exact list/tuple/dict/set/frozenset input to Vector/tuple/OrderedMap/Set and validates the selected result schema. An explicit schema on a simple stable ordinary assignment establishes data for a subsequent analyzed checked call. `exclusive=True` asserts caller-held exclusive access during snapshotting; it does not detect ownership or acquire a lock. Missing mutable-source preconditions, cycles, subclasses, foreign hooks, and live views fail. Repeated acyclic references are copied by value. `thaw(snapshot)` creates independent fresh nested lists/dictionaries/sets; record exports are field dictionaries. Neither operation is admitted inside pure checked functions, defaults or functional initialization.
 
@@ -207,7 +251,7 @@ pyalamode explain Vector
 pyalamode explain PAL250
 ```
 
-A build freshly checks selected source and resolved local dependencies, copies unchanged Python bytes in off/exports mode, optionally generates the selected façade/debug assertions, and writes `pyalamode-evidence.json` in a fresh output directory. To run a copied example, enter that directory and run `python -m examples.records.demo` with the installed Pyalamode library available. Builds require a participating function, record declaration or functional module, reject existing outputs, and publish no artifact after a failed gate, generated-source compile error or freshness check. Package distribution and consumer verification are later milestones.
+A build freshly checks selected source and resolved local dependencies, copies unchanged Python bytes in off/exports mode, optionally generates the selected façade/debug assertions, and writes `pyalamode-evidence.json` in a fresh output directory. To run a copied example, enter that directory and run `python -m examples.records.demo` with the installed Pyalamode library available. Builds require a participating function, record/variant declaration or functional module, reject existing outputs, and publish no artifact after a failed gate, generated-source compile error or freshness check. Package distribution and consumer verification are later milestones.
 
 Strict failures return status 1. Tooling, syntax, policy, and unsupported-target errors return 2. Audit findings alone return 0, label evidence unverified, and leave ordinary behavior unchanged. An empty ordinary selection may pass `check` but supplies no participating function or module claim. The same commands are available as `python -m pyalamode`.
 
@@ -222,4 +266,4 @@ python -m unittest discover -s tests -p 'm0*.py' -v
 python benchmarks/m01_scalar.py --output /tmp/pyalamode-m01.json
 ```
 
-The M5 suite adds finite operation/declared/required effect unions, concrete and conditional higher-order capability slots, data/alias/capture/lifetime escape refusals, controlled providers, whole-path IO cleanup, permission gates, partial warm callable evidence, and current source/policy/product/writer fingerprints. The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.
+The M6 suite adds case-set freshness and explicit-case policy, full/guarded/nested pattern coverage, opaque exception cleanup/collision gates, per-call failure masks preserving effects, ordered immutable error accumulation, supported variant guards and nonexecuting ordinary builds. The M5 suite adds finite operation/declared/required effect unions, concrete and conditional higher-order capability slots, data/alias/capture/lifetime escape refusals, controlled providers, whole-path IO cleanup, permission gates, partial warm callable evidence, and current source/policy/product/writer fingerprints. The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.

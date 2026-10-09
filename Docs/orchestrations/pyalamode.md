@@ -45,13 +45,13 @@
   - Task: /root/m05_effects; runtime helper /root/m04_records; independent reviewer /root/m05_review
   - Depends on: 4
   - Acceptance: A17–A18; finite effects, capability lifetime, unknown-operation rejection and provider classification.
-  - Evidence: Frozen194 suite passes native3.259s/Linux10.087s. Root installed-CLI all-five-family unchanged-artifact execution, explicit capability HOF/borrow and failed-build gates pass; three shipped negatives each1/nooutput. Root independently reran all175 published literal cases (36admit/139refuse) and reconciled26 checkout hashes. Reviewer332focused assertions perplatform plus194suite and35-entry source maps pass; actual Linux package/CLI installed. Runtime20rows/60intervals/1500calls perplatform, ten product/four support identities current/crossplatform/beforeafter identical. Contracts, final conformance, README and costs inspected; milestone commit pending.
-- [ ] 6. Domain alternatives and failure
-  - State: queued
-  - Task: not started
+  - Evidence: Frozen194 suite passes native3.259s/Linux10.087s. Root installed-CLI all-five-family unchanged-artifact execution, explicit capability HOF/borrow and failed-build gates pass; three shipped negatives each1/nooutput. Root independently reran all175 published literal cases (36admit/139refuse) and reconciled26 checkout hashes. Reviewer332focused assertions perplatform plus194suite and35-entry source maps pass; actual Linux package/CLI installed. Runtime20rows/60intervals/1500calls perplatform, ten product/four support identities current/crossplatform/beforeafter identical. Contracts, final conformance, README and costs inspected; Commitf6ea4c1.
+- [x] 6. Domain alternatives and failure
+  - State: complete
+  - Task: /root/m06_domains; runtime helper /root/m05_effects; independent reviewer /root/m06_review
   - Depends on: 5
   - Acceptance: A19–A20; exhaustive alternatives, characterized handlers, immutable failure data.
-  - Evidence: pending
+  - Evidence: Corrected frozen242 suite passes rootnative4.775s/Linux14.739s; root23 installed-CLI/native artifact/guard/failed-build/explain gates pass. Root independently reran236 published literal sources (73admit/163refuse) and reconciled70 source identities plus11 current references. Reviewer595 focused assertions/platform and actual installedLinuxwheel13-file inventory pass; full source maps unchanged/current/crossplatform. Runtime36rows108intervals2700calls+360warmups/platform at10/100,12product+8owned maps independently inspected. Final contracts, conformance and costs inspected; commit recorded after creation.
 - [ ] 7. Standard-operation contracts
   - State: queued
   - Task: not started
@@ -168,3 +168,13 @@
 - M5 review fixes: unused nested capability tuple refused; correct nested TOML effect-bound table; actual effects-function/submodule name collision modeled; imported private borrow-class method writers rejected. Ambient secrets/random import setup removed in favor of a finite direct OS-entropy operation; recorded provider classifications remain unchanged.
 
 - M5 final gate observed against frozen checker5.1/runtime31d3ee92: all workers terminal, named final conformance corpus rerun by root, full source maps and actual generated-artifact measurements reconciled. Human measurements remain unmeasured; full-interface capability permission restriction, no captures/data/transfer, rooted IO TOCTOU assumptions and logical lease limits are published. No required engineering gate remains for M5.
+
+- M5 committed f6ea4c1; staged whitespace passed and clean tree observed before M6 dispatch. Fresh M6 main/reviewer tasks are planning only. Runtime fresh dispatch and former runtime revival hit client thread limit, so terminal M5 main is reused with curated disjoint runtime-only ownership. M6 exact variant/pattern/handler catalog must be reviewed before code admission; ordinary exception targets must retain actual Python values with explicit immutable conversion and a distinct cleanup lifetime.
+
+- M6 plan approved: nested closed variant/case declarations; typed Option/Result, binary ordered error accumulation; finite irrefutable class/record patterns with constrained and guarded captures refused; explicit-cases wildcard policy and case-set freshness. Ordinary builtin-category try handlers retain actual opaque handler-local exception targets and explicitly convert to immutable fixed-message Failure; cleanup targets cannot escape/rebind. Handler masks retain effects/trust/operations and respect RuntimeError/RecursionError and ValueError/UnicodeError hierarchies. Runtime schema/recursive fresh tagged exports agreed; main and helper file ownership disjoint.
+
+- M6 interim root verification:234 native tests pass3.336s; actual admitted Lookup/Result source executes unchanged, returns correct closed cases and immutable failures. Root verified per-occurrence handled/unhandled calls and Clock effect retention. Independent review found nested constrained payload coverage, private-helper writer crashes and generated debug-prefix collisions; focused regressions/fixes are in progress. Root found inherited record/new-case class-local defaults shadowing annotation/default names; correction remains a pre-freeze gate. Final two-platform tests, corpus/source maps, installed CLI workflows and runtime measurements remain pending.
+
+- M6 first frozen candidate:241 tests passed rootnative4.366s/Linux13.169s, root23 installed-CLI/native execution/guard/failed-build/explain gates passed. Freeze reopened for a concrete family-dependency gap: analyzed Some/Ok behavior writers did not invalidate Option/Result identity-only or nested-schema consumers. Focused correction approved; earlier final outputs/measurements are historical until the corrected tree is frozen and verified again. No dependent milestone has started.
+
+- M6 corrected final gate observed: all three workers terminal; independent complete236-source corpus,70-source map/11references and raw36-row observations rerun/reconciled by root. Nested constrained coverage, generated-name collisions, private helper writer crash, real class-suite lookup and contained-case family dependencies have meaningful regressions. Actual source remains unchanged across final tests/artifact execution/measurements. Exact supported builtin handlers, positional binary accumulation and guard/caller limits are published; human measurements remain unmeasured. No required M6 engineering gate remains.

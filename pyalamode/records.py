@@ -58,6 +58,9 @@ def _annotation_schema(annotation, namespace=None):
     info = _record_info(annotation)
     if info is not None:
         return ("record", info[0], info[1])
+    alternative = _variants._annotation_schema(annotation, namespace)
+    if alternative is not None:
+        return alternative
     if type(annotation) is GenericAlias:
         origin = object.__getattribute__(annotation, "__origin__")
         arguments = object.__getattribute__(annotation, "__args__")
@@ -103,6 +106,8 @@ def _annotation_node(node, namespace):
             name = next((name for name, cls in (("Vector", _collections.Vector), ("Map", _collections.Map),
                                                ("OrderedMap", _collections.OrderedMap), ("Set", _collections.Set)) if origin is cls), None)
             if name is None:
+                name = _variants._annotation_origin(origin)
+            if name is None:
                 _collections._invalid("annotation", "unsupported record data annotation")
             schema = (name, tuple(_annotation_node(part, namespace) for part in parts))
         _check_schema(schema)
@@ -120,7 +125,13 @@ def _annotation_binding(node, namespace):
     if type(node) is ast.Attribute:
         owner = _annotation_binding(node.value, namespace)
         if type(owner) is ModuleType:
-            return ModuleType.__getattribute__(owner, "__dict__").get(node.attr, _MISSING)
+            attributes = ModuleType.__getattribute__(owner, "__dict__")
+            if type(attributes) is not dict or any(type(name) is not str for name in attributes):
+                _collections._invalid("annotation", "module metadata names require exact strings")
+            return attributes.get(node.attr, _MISSING)
+        alternative = _variants._annotation_attribute(owner, node.attr)
+        if alternative is not _MISSING:
+            return alternative
     _collections._invalid("annotation", "unsupported record annotation namespace")
 
 
@@ -130,6 +141,8 @@ def _check_schema(schema):
     if type(schema) is not tuple or not schema or type(schema[0]) is not str:
         _collections._invalid("schema", "unsupported exact data schema")
     name = schema[0]
+    if _variants._check_schema(schema):
+        return
     if name == "record":
         if len(schema) != 3:
             _collections._invalid("schema", "malformed record schema")
@@ -166,6 +179,9 @@ def _validate_schema(value, schema, path="value", active=None):
             _collections._invalid(path, "expected exact " + schema)
         return
     name = schema[0]
+    if name in ("variant", "case", "Option", "Result", "Some", "Nothing", "Ok", "Err"):
+        _variants._validate_schema(value, schema, path, active)
+        return
     if name == "record":
         expected = schema[1]
     elif name == "tuple":
@@ -350,3 +366,9 @@ def replace(value, /, **changes):
     _collections._validate(value)
     values = _record_values(value, info)
     return info[0](*(changes.get(name, item) for name, item in zip(names, values)))
+
+
+# Imported after these definitions: collections imports records during its own
+# initialization. Alternatives create only fixed classes/catalogs at import and
+# consult completed collection functions only when ordinary data is used.
+from . import variants as _variants
