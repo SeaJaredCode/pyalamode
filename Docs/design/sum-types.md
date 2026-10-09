@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stages 0, 1 and 2a implemented on branch `sum-types`, merged with M11 (`c668439`) including union encoding; stage 2b needs a compatibility decision; stage 3 queued.
+Status: stages 0, 1 and 2 implemented on branch `sum-types` and merged with M11 (`c668439`); stage 3 queued.
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -19,22 +19,16 @@ Open unions (structural "anything with this class" sets) stay unsupported. `Opti
 
 | Stage | Scope | Depends on | State |
 |---|---|---|---|
-| 0 | `oneof` becomes the canonical decorator; `variant` stays an identical transitional alias | M6 | Implemented on `sum-types` |
+| 0 | `oneof` becomes the canonical decorator, with a transitional `variant` alias | M6 | Implemented, then superseded by stage 2 |
 | 1 | Closed unions in annotations, values, matches, records, cases, guards and value encoding | M6, M11 | Implemented on `sum-types` |
-| 2a | User-facing rename: README, examples, explain text, CLI summary and PAL130 wording use `oneof`; `variant` is documented as a deprecated alias | M11 | Implemented on `sum-types` |
-| 2b | Format rename: serialized `Variant[...]` contract text, `variant` kinds in baselines, reports and wheel evidence, the export envelope key, version bump, alias removal | Decision on M10 baseline and M11 wheel compatibility | Needs decision |
+| 2 | Full rename to `oneof`; the `variant` spelling is gone | M11 | Implemented on `sum-types` |
 | 3 | Open tagged `@oneof(open=True)` with a distribution-scoped case registry | M11 committed, stage 2 | Queued |
 
 Stage order follows the original design note. Closed unions stand alone, unlock `int | None`, and exercise the multi-member value representation. Open tagged work touches registry and policy, so it reviews separately. Stage 2 waits for M11 because the uncommitted M11 tree edits the same checker lines and adds new files (`encoding.py`, `distribution.py`) that name `variant`.
 
 ## Stage 0: `oneof`
 
-`sum` collides with the builtin, and `alt` reads as branching in FP vocabulary. `oneof` is the canonical spelling.
-
-- `pyalamode.oneof` is the decorator. `pyalamode.variant` is the same object during the transition, so runtime identity, case registration and export envelopes are unchanged.
-- The checker admits both names wherever it admitted `variant`, through the same unchanged-foundation checks. Rebinding either name invalidates the domain vocabulary exactly as before.
-- `pyalamode explain oneof` describes the declaration. `explain variant` remains.
-- Stage 2 removes the alias, renames internal identifiers and decides the export envelope key. The `{"variant": ...}` envelope key is a wire format and changes only with an explicit M11 encoding decision.
+`sum` collides with the builtin, and `alt` reads as branching in FP vocabulary. `oneof` is the canonical spelling. Stage 0 introduced it alongside a transitional `variant` alias. Stage 2 removed the alias.
 
 ## Stage 1: closed unions
 
@@ -98,16 +92,15 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 
 ## Stage 2: rename
 
-Stage 2a changed only spelling that people read: README, examples, explain text, the CLI gate summary and the PAL130 remediation. Historical milestone, evidence and conformance documents keep `@variant`, because they record what was built and measured. Existing M6 tests keep `@variant`, which exercises the alias until it is removed.
+The project has no users yet, so the rename is complete rather than aliased.
 
-Stage 2b changes formats, so it moves together with one compatibility decision:
-
-1. Serialized contract text `Variant['m:X']` becomes `OneOf['m:X']`. Caches recompute; reviewed M10 baselines that quote contract text need migration or a legacy reader.
-2. The `variant` kind in migration rows, editor symbols, `selected_variants` coverage keys and M11 wheel evidence becomes `oneof`. M10 baseline loading validates kinds, so old baselines need a legacy mapping.
-3. The `{"variant": ...}` export envelope key. Exported data may already exist outside the project, so this needs a reader for the old key or an explicit decision to break it.
-4. `CHECKER_VERSION` and `OPERATION_VERSION` bump, with the previous values registered as legacy if old baselines stay readable.
-5. Remove the `variant` alias and switch the M6 tests to `@oneof`. M12 should merge first if its tests use `@variant`.
-6. Internal names (`variants.py`, `VariantInfo`, `variant:` schema prefixes) can stay. They appear in product file inventories and foundation evidence, and renaming them has no user benefit.
+- `@variant` no longer exists. `pyalamode.oneof` is the only spelling, and the runtime module is `pyalamode/sums.py`. A module named `oneof.py` would be shadowed by the `oneof` function on the package.
+- Checker identities use `oneof:module:Name`, serialized contract text uses `OneOf['module:Name']`, and value kinds use `oneof_class:`.
+- Result and report fields are `oneofs` and `selected_oneofs`. Migration boundary kinds and editor symbols use `oneof`.
+- The fresh export envelope is `{"oneof": domain_identity, "case": name, "fields": {...}}`.
+- `CHECKER_VERSION` is `sums-unions-11.1` and `OPERATION_VERSION` ends in `-union-ops-11.1`. Baselines from earlier builds are refused as unrecognized provenance, which is correct with no users.
+- Genuine M10 history stays readable as provenance. The legacy reader accepts its `variant` boundary kind, its `selected_variants` coverage key and its `variants.py` product inventory, and nothing else uses those spellings.
+- Historical milestone, evidence and conformance documents keep `@variant`, because they record what was built and measured at the time.
 
 ## Stage 3: open tagged (after M11)
 
@@ -116,10 +109,6 @@ Stage 2b changes formats, so it moves together with one compatibility decision:
 - The case registry collects cases across the distribution's modules. The domain fingerprint covers the full collected set.
 - Coverage: inside the defining distribution, explicit coverage works as for closed domains. Outside it, a final `_` is mandatory regardless of policy, and `explicit_cases` cannot select the domain.
 - Encoding: case identity is the declaring `module:Domain.Case`, which is already stable across the distribution.
-
-## Version strings
-
-`CHECKER_VERSION` and `OPERATION_VERSION` are not bumped on this branch. M10 baseline loading requires them to equal the current values, so a bump makes every M11-era reviewed baseline unsupported unless it is registered as legacy. Cache, evidence and distribution freshness do not depend on the bump, because they hash the exact product file bytes. Whether to bump, and how to treat existing baselines, is an orchestrator decision.
 
 ## Merge notes for the orchestrator
 

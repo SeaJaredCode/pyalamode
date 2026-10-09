@@ -229,10 +229,10 @@ def handled(n:int)->int:
                 self.rejected(writer+body)
 
     def test_shared_product_function_globals_alias_writers_refuse(self):
-        for owner in ["std.text_replace", "std.compose", "failure_value", "live_io", "effects", "freeze", "thaw", "record", "variant", "Vector.fold"]:
+        for owner in ["std.text_replace", "std.compose", "failure_value", "live_io", "effects", "freeze", "thaw", "record", "oneof", "Vector.fold"]:
             for writing in [f"{owner}.__globals__['str']=print", f"namespace={owner}.__globals__\nnamespace['str']=print", f"{owner}.__globals__.update({{'str':print}})"]:
                 with self.subTest(owner=owner, writing=writing):
-                    self.rejected("import pyalamode.standard as std\nfrom pyalamode import freeze,thaw,record,variant\n"+writing+"\n@fun\ndef f(s:str)->bytes:return utf8_encode(s)\n")
+                    self.rejected("import pyalamode.standard as std\nfrom pyalamode import freeze,thaw,record,oneof\n"+writing+"\n@fun\ndef f(s:str)->bytes:return utf8_encode(s)\n")
         self.rejected(FUNCTIONS+"action=compose(increment,double)\naction.__globals__['str']=print\n@fun\ndef f(s:str)->bytes:return utf8_encode(s)\n")
         for writing in ["std.text_replace.__globals__['__builtins__']['str']=print", "namespace=std._exact.__globals__['__builtins__']\nnamespace.update(str=print)", "namespace=std._exact.__globals__.get('__builtins__')\nnamespace['str']=print"]:
             self.rejected("import pyalamode.standard as std\n"+writing+"\n@fun\ndef f(s:str)->bool:return text_startswith(s,'a')\n")

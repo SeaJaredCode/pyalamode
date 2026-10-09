@@ -17,7 +17,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from benchmarks.m03_collections import environment, target_gate, _measure
-from pyalamode import boundaries, variants, records
+from pyalamode import boundaries, sums, records
 from pyalamode import Some, Ok, Err, Failure, Vector, recorded_clock
 from pyalamode.model import foundation_identities
 from pyalamode.project import build_paths
@@ -26,9 +26,9 @@ WARMUP_CALLS = 10
 CONDITIONS = ("domain_construct", "domain_match", "option_match", "result_success", "result_failure", "validation_errors")
 SELECTED = ("construct", "domain_size", "option_size", "quotient", "validate_pair")
 FIXTURE = '''# mode: fun
-from pyalamode import variant, case, Option, Some, Nothing, Result, Ok, Err, Vector, Failure, failure_value, accumulate
+from pyalamode import oneof, case, Option, Some, Nothing, Result, Ok, Err, Vector, Failure, failure_value, accumulate
 
-@variant
+@oneof
 class Batch:
     @case
     class Ready:
@@ -83,7 +83,7 @@ def apply(callback: Effectful[[ClockCapability], Result[int, Failure], Clock], c
 
 
 def source_snapshot():
-    paths = ("pyalamode/variants.py", "pyalamode/failures.py", "pyalamode/records.py",
+    paths = ("pyalamode/sums.py", "pyalamode/failures.py", "pyalamode/records.py",
              "pyalamode/collections.py", "pyalamode/boundaries.py", "tests/m06_runtime.py",
              "benchmarks/m06_domains.py", "benchmarks/m03_collections.py")
     return {"owned_sources": {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in paths},
@@ -236,7 +236,7 @@ def benchmark(sizes, trials, calls):
     rows = []
     with tempfile.TemporaryDirectory(prefix="pyalamode-m06-benchmark-") as temporary:
         modes, smoke, smoke_output, smoke_name = build_and_smoke(Path(temporary))
-        catalog = {"record_classes": len(records._RECORDS), "case_classes": len(variants._CASES), "domain_classes": len(variants._VARIANTS)}
+        catalog = {"record_classes": len(records._RECORDS), "case_classes": len(sums._CASES), "domain_classes": len(sums._ONEOFS)}
         try:
             for original, selected, details, _, _ in modes:
                 for condition in CONDITIONS:
@@ -256,7 +256,7 @@ def benchmark(sizes, trials, calls):
                                      "median_seconds_per_call": statistics.median(item["elapsed_seconds"] for item in observations) / calls,
                                      "maximum_traced_peak_bytes": max(item["traced_peak_bytes"] for item in observations),
                                      "all_correctness_obligations_passed": True})
-            assert catalog == {"record_classes": len(records._RECORDS), "case_classes": len(variants._CASES), "domain_classes": len(variants._VARIANTS)}
+            assert catalog == {"record_classes": len(records._RECORDS), "case_classes": len(sums._CASES), "domain_classes": len(sums._ONEOFS)}
         finally:
             for _, _, _, output, name in modes:
                 sys.path.remove(str(output))

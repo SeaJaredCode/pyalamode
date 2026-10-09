@@ -20,7 +20,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from benchmarks.m03_collections import environment, target_gate, _measure
-from pyalamode import boundaries, records, variants
+from pyalamode import boundaries, records, sums
 from pyalamode import Vector, OrderedMap, Ok, Err
 from pyalamode.model import foundation_identities
 from pyalamode.project import build_paths
@@ -358,8 +358,8 @@ def benchmark(sizes, trials, calls):
     rows = []
     with tempfile.TemporaryDirectory(prefix="pyalamode-m07-benchmark-") as temporary:
         modes, smoke, smoke_output, smoke_name = build_and_smoke(Path(temporary), sizes)
-        catalog = {"record_classes": len(records._RECORDS), "case_classes": len(variants._CASES),
-                   "domain_classes": len(variants._VARIANTS)}
+        catalog = {"record_classes": len(records._RECORDS), "case_classes": len(sums._CASES),
+                   "domain_classes": len(sums._ONEOFS)}
         try:
             for original, selected, details, _, _ in modes:
                 for condition in CONDITIONS:
@@ -379,8 +379,8 @@ def benchmark(sizes, trials, calls):
                                      "median_seconds_per_call": statistics.median(item["elapsed_seconds"] for item in observations) / calls,
                                      "maximum_traced_peak_bytes": max(item["traced_peak_bytes"] for item in observations),
                                      "all_correctness_obligations_passed": True})
-            assert catalog == {"record_classes": len(records._RECORDS), "case_classes": len(variants._CASES),
-                               "domain_classes": len(variants._VARIANTS)}
+            assert catalog == {"record_classes": len(records._RECORDS), "case_classes": len(sums._CASES),
+                               "domain_classes": len(sums._ONEOFS)}
         finally:
             for _, _, _, output, name in modes:
                 sys.path.remove(str(output))

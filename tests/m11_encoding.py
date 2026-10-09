@@ -10,14 +10,14 @@ from types import GenericAlias, MemberDescriptorType
 import unittest
 from unittest.mock import patch
 
-from pyalamode import record, variant, case, Vector, OrderedMap, Map, Set, Option, Some, Nothing, Result, Ok, Err, Failure
-from pyalamode import records, variants, collections
+from pyalamode import record, oneof, case, Vector, OrderedMap, Map, Set, Option, Some, Nothing, Result, Ok, Err, Failure
+from pyalamode import records, sums, collections
 from pyalamode.encoding import value_encode, value_decode
 from pyalamode import encoding
 from pyalamode.encoding_contracts import ENCODING_NAMES, ENCODING_VERSION, operation_contract, operation_catalog
 
 
-@variant
+@oneof
 class Choice:
     @case
     class Number:
@@ -321,7 +321,7 @@ class EncodingRuntime(unittest.TestCase):
         # Changing/deleting __new__ can alter CPython tp_new even after the
         # attribute is restored. Discard these distinct test classes/catalog
         # rows; do not poison later ordinary constructors in the suite.
-        before = records._RECORDS, variants._CASES, variants._VARIANTS
+        before = records._RECORDS, sums._CASES, sums._ONEOFS
         try:
             kind = record(type("PoisonRecord", (object,), {
                 "__module__": "m11_hook_fixture", "__annotations__": {"value": int}}))
@@ -334,14 +334,14 @@ class EncodingRuntime(unittest.TestCase):
                 self.assertEqual(MemberDescriptorType.__get__(descriptor, result, kind), 7)
             number = case(type("Number", (object,), {"__module__": "m11_hook_fixture",
                                                      "__qualname__": "PoisonDomain.Number", "__annotations__": {"value": int}}))
-            domain = variant(type("PoisonDomain", (object,), {"__module__": "m11_hook_fixture", "Number": number}))
+            domain = oneof(type("PoisonDomain", (object,), {"__module__": "m11_hook_fixture", "Number": number}))
             packet = value_encode(number(7), domain)
             with patch.object(number, "__init__", hook), patch.object(number, "__new__", hook, create=True):
                 result = value_decode(packet, domain)
             self.assertIs(type(result), number)
             self.assertEqual(hits, [])
         finally:
-            records._RECORDS, variants._CASES, variants._VARIANTS = before
+            records._RECORDS, sums._CASES, sums._ONEOFS = before
 
     def test_foreign_replaced_storage_and_metadata_descriptors_refuse_before_hooks(self):
         packet = value_encode(Defaulted(7), Defaulted)
@@ -367,7 +367,7 @@ class EncodingRuntime(unittest.TestCase):
         def hook(*args):
             hits.append("metaclass")
             raise AssertionError("metaclass lookup ran")
-        with patch.object(variants._DomainType, "__getattribute__", hook):
+        with patch.object(sums._DomainType, "__getattribute__", hook):
             self.assertEqual(value_encode(value, Choice), packet)
             result = value_decode(packet, Choice)
         self.assertIs(type(result), type(value))
@@ -441,7 +441,7 @@ class EncodingRuntime(unittest.TestCase):
             value_decode(envelope(b"\x20" + u32(1025), b"\x00"), Defaulted)
 
     def test_record_field_closed_case_count_and_schema_bytes_bounds(self):
-        before = records._RECORDS, variants._CASES, variants._VARIANTS
+        before = records._RECORDS, sums._CASES, sums._ONEOFS
         try:
             def generated_record(count, width=4):
                 names = tuple("f" + str(index).rjust(3, "0") + "x" * (width - 4) for index in range(count))
@@ -463,7 +463,7 @@ class EncodingRuntime(unittest.TestCase):
                     name = "C" + str(index)
                     attributes[name] = case(type(name, (object,), {"__module__": "m11_count_fixture",
                                                                 "__qualname__": domain_name + "." + name}))
-                domain = variant(type(domain_name, (object,), attributes))
+                domain = oneof(type(domain_name, (object,), attributes))
                 value = attributes["C0"]()
                 if count == 128:
                     self.roundtrip(value, domain)
@@ -474,7 +474,7 @@ class EncodingRuntime(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "schema case count"):
                         value_encode(value, domain)
         finally:
-            records._RECORDS, variants._CASES, variants._VARIANTS = before
+            records._RECORDS, sums._CASES, sums._ONEOFS = before
 
     def test_codec_registry_is_never_consulted(self):
         hits = []

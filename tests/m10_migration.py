@@ -94,11 +94,11 @@ class MigrationCase(unittest.TestCase):
 
     def test_exact_eligible_denominator_and_display_subset(self):
         (self.root / "__init__.py").write_text("")
-        self.path.write_text('''from pyalamode import fun, record, variant, case, effects, Clock, ClockCapability, unsafe
+        self.path.write_text('''from pyalamode import fun, record, oneof, case, effects, Clock, ClockCapability, unsafe
 @record
 class Customer:
     value: int
-@variant
+@oneof
 class Choice:
     @case
     class First:
@@ -130,7 +130,7 @@ def raw():
         _, state, _, _ = observe(self.root, [self.root / "plain.py"])
         self.assertEqual(state["coverage"], {"eligible_modules": 4, "selected_modules": 1, "checked_modules": 1,
             "eligible_functions": 9, "selected_functions": 4, "checked_functions": 4,
-            "checked_exports": 5, "selected_records": 1, "selected_variants": 1})
+            "checked_exports": 5, "selected_records": 1, "selected_oneofs": 1})
         self.assertEqual(state["scope"]["displayed_paths"], ["plain.py"])
         root_module = next(row for row in state["boundaries"] if row["path"] == "__init__.py")
         self.assertEqual((root_module["selector"], root_module["qualified_name"]), ("module:", ""))

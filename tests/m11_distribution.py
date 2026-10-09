@@ -192,14 +192,14 @@ class DistributionTests(unittest.TestCase):
         out=self.wheel();other=self.base/'out2'/out.name;r=build_paths([self.producer],root=self.producer,artifact='wheel',output=other);self.assertEqual(r.status,0,r.to_dict());self.assertEqual(out.read_bytes(),other.read_bytes())
         old=out.read_bytes();r=build_paths([self.producer],root=self.producer,artifact='wheel',output=out);self.assertEqual(r.status,2);self.assertEqual(out.read_bytes(),old)
 
-    def test_nonalphabetical_signature_record_and_variant_order(self):
+    def test_nonalphabetical_signature_record_and_oneof_order(self):
         source="""# mode: fun
-from pyalamode import record, variant, case
+from pyalamode import record, oneof, case
 @record
 class Invoice:
     zulu: int
     alpha: str
-@variant
+@oneof
 class State:
     @case
     class Zulu:
@@ -554,14 +554,14 @@ def quote(zulu:int,alpha:int)->int:
         if (self.base/'out').exists():(self.base/'out').rename(self.base/('retained-out-'+mode))
         for p in self.site.iterdir():shutil.rmtree(p)
         (self.producer/'checked_pricing/core.py').write_text('''# mode: fun
-from pyalamode import record, variant, case
+from pyalamode import record, oneof, case
 @record
 class Invoice:
     order_id: str
 @record
 class Wrapper:
     item: Invoice
-@variant
+@oneof
 class Message:
     @case
     class Has:
@@ -614,7 +614,7 @@ def carry(value:tuple[Invoice,...])->tuple[Invoice,...]:
                         self.assertIsNot(intrinsic.analyzers[path].result,semantic.analyzers[path].result);self.assertIsNot(intrinsic.analyzers[path].tree,semantic.analyzers[path].tree)
                     identity="Record['checked_pricing.core:Invoice']";self.assertTrue(intrinsic.records[identity].valid);self.assertFalse(semantic.records[identity].valid)
                     core=intrinsic.modules['checked_pricing.core'];echo=next(c for c in core.result.contracts if c.name=='echo');self.assertTrue({'local','typed','made','boxed','tag'}<=set(x['name']for x in echo.data_assertions))
-                    self.assertEqual(intrinsic.records["Record['checked_pricing.core:Wrapper']"].fields['item'],identity);self.assertEqual(intrinsic.variants["Variant['checked_pricing.core:Message']"].cases['Has'].fields['item'],identity)
+                    self.assertEqual(intrinsic.records["Record['checked_pricing.core:Wrapper']"].fields['item'],identity);self.assertEqual(intrinsic.oneofs["OneOf['checked_pricing.core:Message']"].cases['Has'].fields['item'],identity)
                     self.assertEqual(r.analysis_counts['intrinsic_graphs'],1);self.assertEqual(r.analysis_counts['intrinsic_writer_scan_files'],3);self.assertEqual(r.analysis_counts['intrinsic_fresh_body_files'],3);self.assertEqual(r.analysis_counts['intrinsic_source_dependency_edges'],sum(map(len,dependencies.values())))
                     self.assertEqual(r.to_dict()['coverage']['eligible_functions'],2)
                     for _ in range(2):

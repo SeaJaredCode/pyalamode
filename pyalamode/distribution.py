@@ -242,7 +242,7 @@ def _schema(value):
     def valid(s, depth=0):
         if s is None:raise DistributionError("unknown exact schema")
         if depth>32: raise DistributionError("schema depth exceeded")
-        if s.name.startswith(("record:","variant:","case:")):
+        if s.name.startswith(("record:","oneof:","case:")):
             label=s.name.split(":",1)[1];text(label,1024)
             if label.count(":")!=(2 if s.name.startswith("case:") else 1): raise DistributionError("invalid nominal identity")
             mod,*names=label.split(":");module(mod);name=".".join(names)
@@ -354,7 +354,7 @@ def _contract(value,kind):
         text(value["implementation_evidence"]);text(value["equivalence"])
         for key in ("ordinary_validation_failures","ordinary_representation_failures"):
             for name,reason in mapping(value[key]).items():strings([name],FAILURES|{"TypeError","AttributeError"});text(reason)
-    elif kind=="variant":
+    elif kind=="oneof":
         shape(value,set("name schema path line cases case_fingerprint enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
         _schema(value["schema"]);sha(value["case_fingerprint"]);text(value["equivalence"])
         for name,row in mapping(value["cases"]).items():
@@ -769,7 +769,7 @@ def build_wheel(result,capture,root,destination):
         members[path]=artifact;members[info+"/pyalamode/sources/"+path]=raw
         namespace=graph.module_name(absolute)
         modules.append({"module":namespace,"authored_path":path,"source_sha256":hashlib.sha256(raw).hexdigest(),"installed_path":path,"artifact_sha256":hashlib.sha256(artifact).hexdigest(),"initialization":{"source_evidence":file.initialization_evidence,"effects":[] if file.module_mode and file.verified else None,"failures":file.initialization_failures if file.module_mode and file.verified else None},"setup_observations":file.setup_observations})
-        for kind,rows in (("function",[asdict(c) for c in file.contracts]),("record",file.records),("variant",file.variants)):
+        for kind,rows in (("function",[asdict(c) for c in file.contracts]),("record",file.records),("oneof",file.oneofs)):
             for c in rows:
                 selector=namespace+":"+c["name"]
                 if selector in declaration["exports"]:
@@ -805,7 +805,7 @@ def build_wheel(result,capture,root,destination):
     members[info+"/WHEEL"]=("Wheel-Version: 1.0\nGenerator: "+CHECKER_VERSION+"\nRoot-Is-Purelib: true\nTag: py3-none-any\n").encode()
     from .encoding_contracts import ENCODING_VERSION
     artifacts={k:{"sha256":hashlib.sha256(v).hexdigest(),"size":len(v),"role":"generated" if k in generated else "authored" if "/sources/" in k else "metadata" if k.startswith(info) else "source"} for k,v in members.items()}
-    payload={"identity":{"name":declaration["name"],"version":declaration["version"],"packages":declaration["packages"],"wheel_tag":"py3-none-any"},"target":{"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"},"producer":{"checker":CHECKER_VERSION,"edition":EDITION,"operation_contract":OPERATION_VERSION,"standard_version":"pyalamode.standard-v1","integration_version":"pyalamode.integrations-v1","encoding_version":ENCODING_VERSION,"product_artifacts":foundation_identities(),"runtime_environment":runtime_environment()},"inputs":{"policy_sha256":hashlib.sha256(policyraw).hexdigest(),"sources":{str(Path(p).relative_to(root)):{"sha256":hashlib.sha256(v).hexdigest(),"module":graph.module_name(p) if str(Path(p).relative_to(root)) in files else None,"ownership":"project","shipped":str(Path(p).relative_to(root)) in files,"participating":bool(owned[p].module_mode or owned[p].contracts or owned[p].records or owned[p].variants)} for p,v in capture["raw_sources"].items() if Path(p).is_relative_to(root)},"checked_dependencies":public_receipts(capture["distribution_snapshot"]),"integration_inputs":capture["integration_snapshot"]["inputs"],"resolution":{m["module"]:m["authored_path"] for m in modules},"selection":{graph.module_name(r.path):r.module_mode for r in result.results}},"modules":modules,"exports":exports,"guards":{"mode":result.boundary_guards,"exports":guards,"debug":debug,"generated_files":{k:hashlib.sha256(v).hexdigest() for k,v in generated.items()}},"artifacts":artifacts,"claim_scope":"Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."}
+    payload={"identity":{"name":declaration["name"],"version":declaration["version"],"packages":declaration["packages"],"wheel_tag":"py3-none-any"},"target":{"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"},"producer":{"checker":CHECKER_VERSION,"edition":EDITION,"operation_contract":OPERATION_VERSION,"standard_version":"pyalamode.standard-v1","integration_version":"pyalamode.integrations-v1","encoding_version":ENCODING_VERSION,"product_artifacts":foundation_identities(),"runtime_environment":runtime_environment()},"inputs":{"policy_sha256":hashlib.sha256(policyraw).hexdigest(),"sources":{str(Path(p).relative_to(root)):{"sha256":hashlib.sha256(v).hexdigest(),"module":graph.module_name(p) if str(Path(p).relative_to(root)) in files else None,"ownership":"project","shipped":str(Path(p).relative_to(root)) in files,"participating":bool(owned[p].module_mode or owned[p].contracts or owned[p].records or owned[p].oneofs)} for p,v in capture["raw_sources"].items() if Path(p).is_relative_to(root)},"checked_dependencies":public_receipts(capture["distribution_snapshot"]),"integration_inputs":capture["integration_snapshot"]["inputs"],"resolution":{m["module"]:m["authored_path"] for m in modules},"selection":{graph.module_name(r.path):r.module_mode for r in result.results}},"modules":modules,"exports":exports,"guards":{"mode":result.boundary_guards,"exports":guards,"debug":debug,"generated_files":{k:hashlib.sha256(v).hexdigest() for k,v in generated.items()}},"artifacts":artifacts,"claim_scope":"Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."}
     payload["claim_scope"]=CLAIM_SCOPE
     envelope={"schema":1,"kind":"pyalamode-checked-distribution","payload":payload,"sha256":digest(payload)}
     bounded(envelope);validate_evidence(envelope)

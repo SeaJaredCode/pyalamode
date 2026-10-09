@@ -159,7 +159,7 @@ class EditorSession:
             self.current.result.tooling.append(diagnostic("PAL001", str(self.root), "server product bytes changed after startup; restart required", origin="editor loaded implementation"))
             for file in self.current.result.results:
                 file.diagnostics.append(diagnostic("PAL001", file.path, "server product bytes changed after startup; restart required", origin="editor loaded implementation"))
-                for declaration in [*file.records, *file.variants]:
+                for declaration in [*file.records, *file.oneofs]:
                     declaration["source_evidence"] = "unverified: loaded server implementation changed"
                 for contract in file.contracts:
                     contract.source_evidence = "unverified: loaded server implementation changed"
@@ -175,7 +175,7 @@ class EditorSession:
                     self.regions.append({"uri": Path(file.path).as_uri(), "range": node_range(text, node),
                                          "selectionRange": _selection(text, node), "name": contract.name,
                                          "kind": "function", "mode": file.mode, "contract": asdict(contract)})
-            for kind, declarations in (("record", file.records), ("variant", file.variants), ("unsafe", file.unsafe_adapters)):
+            for kind, declarations in (("record", file.records), ("oneof", file.oneofs), ("unsafe", file.unsafe_adapters)):
                 for declaration in declarations:
                     node = self.nodes.get(file.path, {}).get(declaration["name"])
                     if node:

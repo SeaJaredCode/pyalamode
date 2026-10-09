@@ -15,10 +15,10 @@ def record_schemas(results):
     schemas = {record["schema"]: record for result in results for record in result.records}
     schemas["Record['pyalamode:Failure']"] = {"name": "Failure", "fields": {"category": "str", "message": "str"}}
     for result in results:
-        for variant in result.variants:
-            schemas[variant["schema"]] = variant
-            for name, case in variant["cases"].items():
-                schemas[case["schema"]] = {**case, "name": variant["name"] + "." + name}
+        for oneof in result.oneofs:
+            schemas[oneof["schema"]] = oneof
+            for name, case in oneof["cases"].items():
+                schemas[case["schema"]] = {**case, "name": oneof["name"] + "." + name}
     return schemas
 
 
@@ -31,7 +31,7 @@ def supported_schema(text, records, seen=()):
         return True
     if schema.name == "union":
         return all(supported_schema(str(member), records, seen) for member in schema.arguments)
-    if schema.name.startswith("variant:"):
+    if schema.name.startswith("oneof:"):
         if text in seen or text not in records:
             return False
         return all(supported_schema(case["schema"], records, (*seen, text)) for case in records[text]["cases"].values())
@@ -63,14 +63,14 @@ class Schemas:
             return "('union', " + children + ")"
         if schema.name == "tuple":
             return "('tuple', " + children + ", " + repr(schema.variadic) + ")"
-        if schema.name.startswith("variant:"):
-            module, name = schema.name[len("variant:"):].rsplit(":", 1)
+        if schema.name.startswith("oneof:"):
+            module, name = schema.name[len("oneof:"):].rsplit(":", 1)
             reference = self.local_records.get(text) or self.module(module) + "." + name
             cases = []
             for case_name, case in self.records[text]["cases"].items():
                 fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in case["fields"].items()) + ("," if len(case["fields"]) == 1 else "") + ")"
                 cases.append("(" + reference + "." + case_name + ", " + fields + ")")
-            return "('variant', " + reference + ", (" + ", ".join(cases) + ("," if len(cases) == 1 else "") + "))"
+            return "('oneof', " + reference + ", (" + ", ".join(cases) + ("," if len(cases) == 1 else "") + "))"
         if schema.name.startswith("case:"):
             module, domain, name = schema.name[len("case:"):].rsplit(":", 2)
             reference = self.local_records.get(text) or self.module(module) + "." + domain + "." + name
@@ -142,11 +142,11 @@ def facade_source(source, module, contracts, records):
 def debug_source(source, result, records):
     tree = ast.parse(source)
     prefix = _prefix(tree)
-    declarations = [*result.records, *result.variants]
+    declarations = [*result.records, *result.oneofs]
     local_records = {record["schema"]: prefix + "record" + str(index) for index, record in enumerate(declarations)}
-    for variant in result.variants:
-        for name, case in variant["cases"].items():
-            local_records[case["schema"]] = local_records[variant["schema"]] + "." + name
+    for oneof in result.oneofs:
+        for name, case in oneof["cases"].items():
+            local_records[case["schema"]] = local_records[oneof["schema"]] + "." + name
     schemas = Schemas(records, prefix, local_records)
     validate = prefix + "validate"
     contracts = {contract.name: contract for contract in result.contracts}

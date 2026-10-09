@@ -1,4 +1,4 @@
-"""Exact closed alternatives with ordinary slot classes and native patterns.
+"""Closed tagged sums (@oneof/@case), Option and Result: exact slot classes and native patterns.
 
 The identity catalogs describe data, not callable purity. Generic arguments are
 schemas erased by constructors; unchanged definitions remain caller obligations.
@@ -8,10 +8,10 @@ from types import GenericAlias, GetSetDescriptorType
 from . import collections as _collections
 from . import records as _records
 
-__all__ = ["oneof", "variant", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate"]
+__all__ = ["oneof", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate"]
 
 _CASES = ()
-_VARIANTS = ()
+_ONEOFS = ()
 _DATA = object()
 
 
@@ -29,8 +29,8 @@ def _pending_info(kind):
     return None
 
 
-def _variant_info(kind):
-    for entry in _VARIANTS:
+def _oneof_info(kind):
+    for entry in _ONEOFS:
         if kind is entry[0]:
             return entry
     return None
@@ -180,7 +180,7 @@ def _declaration(cls, path):
 
 
 def case(cls):
-    """Create a fixed case declaration; its containing variant closes its tag."""
+    """Create a fixed case declaration; its containing oneof closes its tag."""
     attributes = _declaration(cls, "case")
     annotations = attributes.get("__annotations__", {})
     if type(annotations) is not dict:
@@ -223,8 +223,8 @@ class _DomainType(type):
 
 def oneof(cls):
     """Seal a declaration-only namespace with its exact nested case set."""
-    global _CASES, _VARIANTS
-    attributes = _declaration(cls, "variant")
+    global _CASES, _ONEOFS
+    attributes = _declaration(cls, "oneof")
     cases = []
     allowed = {"__module__", "__qualname__", "__doc__", "__dict__", "__weakref__",
                "__firstlineno__", "__static_attributes__"}
@@ -234,15 +234,15 @@ def oneof(cls):
         if name in allowed:
             continue
         if not name.isidentifier() or name.startswith("_"):
-            _collections._invalid("variant", "cases require public identifiers")
+            _collections._invalid("oneof", "cases require public identifiers")
         info = _pending_info(value)
         if info is None or info[3] is not None:
-            _collections._invalid("variant", "domain contains only unattached exact case declarations")
+            _collections._invalid("oneof", "domain contains only unattached exact case declarations")
         if type.__getattribute__(value, "__module__") != module or type.__getattribute__(value, "__qualname__") != qualified + "." + name or info[5] != name:
-            _collections._invalid("variant", "case must be declared inside its domain under its own name")
+            _collections._invalid("oneof", "case must be declared inside its domain under its own name")
         cases.append((value, info[1]))
     if not cases:
-        _collections._invalid("variant", "domain requires at least one case")
+        _collections._invalid("oneof", "domain requires at least one case")
 
     def reject_subclass(subclass, **kwargs):
         raise TypeError("closed domains cannot be subclassed")
@@ -255,12 +255,8 @@ def oneof(cls):
     _CASES = tuple((kind, fields, defaults, product, identity, name)
                    if any(kind is candidate for candidate, _ in cases) else entry
                    for entry in _CASES for kind, fields, defaults, family, old_identity, name in (entry,))
-    _VARIANTS += ((product, identity, tuple(cases)),)
+    _ONEOFS += ((product, identity, tuple(cases)),)
     return product
-
-
-# Transitional alias: the same object, so identities and envelopes are unchanged.
-variant = oneof
 
 
 class Option:
@@ -312,9 +308,9 @@ def _schema_origins():
 
 
 def _annotation_schema(annotation, namespace):
-    info = _variant_info(annotation)
+    info = _oneof_info(annotation)
     if info is not None:
-        return ("variant", info[0], info[2])
+        return ("oneof", info[0], info[2])
     info = _case_info(annotation)
     if info is not None and info[3] is not Option and info[3] is not Result:
         return ("case", info[0], info[1])
@@ -336,7 +332,7 @@ def _annotation_origin(origin):
 
 
 def _annotation_attribute(owner, name):
-    info = _variant_info(owner)
+    info = _oneof_info(owner)
     if info is not None:
         return next((kind for kind, _ in info[2] if type.__getattribute__(kind, "__name__") == name), _records._MISSING)
     return _records._MISSING
@@ -353,10 +349,10 @@ def _check_fields(fields):
 
 def _check_schema(schema):
     name = schema[0]
-    if name == "variant":
+    if name == "oneof":
         if len(schema) != 3 or type(schema[2]) is not tuple:
-            _collections._invalid("schema", "malformed variant schema")
-        info = _variant_info(schema[1])
+            _collections._invalid("schema", "malformed oneof schema")
+        info = _oneof_info(schema[1])
         if info is None:
             _collections._invalid("schema", "expected exact declared domain")
         for entry in schema[2]:
@@ -367,7 +363,7 @@ def _check_schema(schema):
                 _collections._invalid("schema", "case belongs to another domain")
             _check_fields(entry[1])
         if schema[2] != info[2]:
-            _collections._invalid("schema", "variant differs from its closed case set")
+            _collections._invalid("schema", "oneof differs from its closed case set")
         return True
     if name == "case":
         if len(schema) != 3:
@@ -395,7 +391,7 @@ def _validate_schema(value, schema, path, active):
     name = schema[0]
     if info is None:
         _collections._invalid(path, "expected exact " + name)
-    if name == "variant":
+    if name == "oneof":
         if info[3] is not schema[1]:
             _collections._invalid(path, "expected exact declared domain case")
         fields = info[1]

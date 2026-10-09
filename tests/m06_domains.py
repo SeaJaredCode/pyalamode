@@ -10,8 +10,8 @@ import unittest
 from pyalamode.checker import analyze_source, analyze_sources
 from pyalamode.project import check_paths, build_paths
 
-IMPORTS = 'from pyalamode import fun, variant, case, record, Vector, Option, Some, Nothing, Result, Ok, Err, accumulate, Failure, failure_value\n'
-DOMAIN = '''@variant
+IMPORTS = 'from pyalamode import fun, oneof, case, record, Vector, Option, Some, Nothing, Result, Ok, Err, accumulate, Failure, failure_value\n'
+DOMAIN = '''@oneof
 class Choice:
     @case
     class Number:
@@ -38,7 +38,7 @@ class Domains(unittest.TestCase):
         self.checked('''@record
 class Payload:
     number: int
-@variant
+@oneof
 class Wrapped:
     @case
     class Present:
@@ -110,12 +110,12 @@ def f(p:Pair)->int:
         self.rejected(full.replace('def f(v:Choice)', 'def f(v:Choice,n:int)'), 'PAL101')
 
     def test_nested_case_constraint_is_not_payload_domain_coverage(self):
-        prefix = DOMAIN + "@variant\nclass Outer:\n    @case\n    class Value:\n        item:Choice\n"
+        prefix = DOMAIN + "@oneof\nclass Outer:\n    @case\n    class Value:\n        item:Choice\n"
         for body in ["case Outer.Value(item=Choice.Number(n)):return n", "case Outer.Value(item=Choice.Number()):return 1"]:
             self.rejected(prefix + "@fun\ndef f(x:Outer)->int:\n    match x:\n        " + body + "\n", 'PAL330')
         self.rejected(prefix + "@fun\ndef f(x:Outer)->int:\n    match x:\n        case Outer.Value(item=Choice.Number(n)):return n\n        case _:return 0\n", 'PAL330')
         self.checked(prefix + "@fun\ndef f(x:Outer)->int:\n    match x:\n        case Outer.Value(item=Choice.Number()):return 1\n        case _:return 0\n")
-        self.rejected("@variant\nclass Shadow:\n    @case\n    class case:pass\n    @case\n    class Later:pass\n", 'PAL120')
+        self.rejected("@oneof\nclass Shadow:\n    @case\n    class case:pass\n    @case\n    class Later:pass\n", 'PAL120')
 
     def test_finite_boolean_and_none_patterns(self):
         self.checked('@fun\ndef f(v:bool)->int:\n    match v:\n        case True:return 1\n        case False:return 0\n')
@@ -123,7 +123,7 @@ def f(p:Pair)->int:
         self.rejected('@fun\ndef f(v:int)->int:\n    match v:\n        case 0:return 0\n        case _:return 1\n','PAL330')
 
     def test_declarations_and_data_exclude_hidden_behavior(self):
-        sources = [DOMAIN.replace('@variant', '@variant()'), '@case\nclass Misplaced:pass\n', DOMAIN.replace('class Choice:', 'class Choice(object):'), DOMAIN.replace('class Number:', 'class Number(object):'), DOMAIN.replace('value: int', 'value: list[int]'), DOMAIN.replace('value: int','value: Choice'), DOMAIN.replace('value: int','value: "Choice.Empty"'), DOMAIN.replace('@case\n    class Number:', '@record\n    class Number:'), DOMAIN.replace('value: int','value: int\n        def hidden(self): return 0'), DOMAIN + 'Choice.Number.__match_args__ = ("other",)\n', DOMAIN + 'alias=Choice.Number\nalias.__match_args__=("other",)\n']
+        sources = [DOMAIN.replace('@oneof', '@oneof()'), '@case\nclass Misplaced:pass\n', DOMAIN.replace('class Choice:', 'class Choice(object):'), DOMAIN.replace('class Number:', 'class Number(object):'), DOMAIN.replace('value: int', 'value: list[int]'), DOMAIN.replace('value: int','value: Choice'), DOMAIN.replace('value: int','value: "Choice.Empty"'), DOMAIN.replace('@case\n    class Number:', '@record\n    class Number:'), DOMAIN.replace('value: int','value: int\n        def hidden(self): return 0'), DOMAIN + 'Choice.Number.__match_args__ = ("other",)\n', DOMAIN + 'alias=Choice.Number\nalias.__match_args__=("other",)\n']
         for source in sources:
             with self.subTest(source=source): self.rejected(source)
         self.rejected(DOMAIN + '@fun\ndef f()->Choice:\n    return Choice.Number(True)\n','PAL221')
@@ -131,7 +131,7 @@ def f(p:Pair)->int:
 
     def test_declaration_class_default_lookup_matches_actual_python(self):
         record = "@record\nclass Pair:\n    int:int=3\n    value:int=4\n@fun\ndef f()->Pair:return Pair()\n"
-        case = "@variant\nclass Lookup:\n    @case\n    class Found:\n        int:int=3\n        value:int=4\n@fun\ndef f()->Lookup:return Lookup.Found()\n"
+        case = "@oneof\nclass Lookup:\n    @case\n    class Found:\n        int:int=3\n        value:int=4\n@fun\ndef f()->Lookup:return Lookup.Found()\n"
         for source in [record,case]:
             self.rejected(source, 'PAL130')
             with self.assertRaises(TypeError):exec(compile(IMPORTS+source,'declaration.py','exec'),{})
@@ -226,7 +226,7 @@ def now(cap:ClockCapability)->int:
         self.rejected('@fun\ndef f()->int:\n    raise ValueError("bad")\n')
 
     def test_private_domain_helpers_cannot_crash_or_preserve_certification(self):
-        writers = ["from pyalamode.variants import _DomainType\n_DomainType.__setattr__.__code__=unknown\n", "import pyalamode.variants as helper\nhelper._case_info.__code__=unknown\n", "from pyalamode.failures import failure_value\nfailure_value.__code__=unknown\n", "from domain import Choice\nChoice.Number.__init__.__code__=unknown\n"]
+        writers = ["from pyalamode.sums import _DomainType\n_DomainType.__setattr__.__code__=unknown\n", "import pyalamode.sums as helper\nhelper._case_info.__code__=unknown\n", "from pyalamode.failures import failure_value\nfailure_value.__code__=unknown\n", "from domain import Choice\nChoice.Number.__init__.__code__=unknown\n"]
         for writer in writers:
             with self.subTest(writer=writer), tempfile.TemporaryDirectory() as temp:
                 root=Path(temp)
@@ -238,8 +238,8 @@ def now(cap:ClockCapability)->int:
                 self.assertFalse(result.verified);self.assertFalse((root/'out').exists())
 
     def test_private_public_api_imports_retain_canonical_foundation_gates(self):
-        for imports in ['from pyalamode.variants import Option,Some\n', 'import pyalamode.variants as v\n']:
-            source = imports + 'import pyalamode.variants as writer\nwriter._case_info.__code__=unknown\n' + ('@fun\ndef f()->Option[int]:return Some(1)\n' if 'from ' in imports else '@fun\ndef f()->v.Option[int]:return v.Some(1)\n')
+        for imports in ['from pyalamode.sums import Option,Some\n', 'import pyalamode.sums as v\n']:
+            source = imports + 'import pyalamode.sums as writer\nwriter._case_info.__code__=unknown\n' + ('@fun\ndef f()->Option[int]:return Some(1)\n' if 'from ' in imports else '@fun\ndef f()->v.Option[int]:return v.Some(1)\n')
             self.rejected(source)
 
     def test_builtin_family_case_writers_invalidate_identity_nested_and_warm_guards(self):
@@ -247,12 +247,12 @@ def now(cap:ClockCapability)->int:
             for route in ['public','from_private','private_module']:
                 with self.subTest(symbol=symbol,route=route),tempfile.TemporaryDirectory() as temp:
                     root=Path(temp)
-                    imports = 'from pyalamode import fun,Vector\nfrom pyalamode.variants import Option,Result\n' if route=='from_private' else 'from pyalamode import fun,Vector,Option,Result\n'
+                    imports = 'from pyalamode import fun,Vector\nfrom pyalamode.sums import Option,Result\n' if route=='from_private' else 'from pyalamode import fun,Vector,Option,Result\n'
                     (root/'affected.py').write_text(imports+'@fun\ndef identity(value:'+affected+')->'+affected+':return value\n@fun\ndef nested(value:Vector['+affected+'])->Vector['+affected+']:return value\n')
                     (root/'untouched.py').write_text('from pyalamode import fun,Option,Result\n@fun\ndef identity(value:'+untouched+')->'+untouched+':return value\n')
                     (root/'pyproject.toml').write_text('[tool.pyalamode]\nboundary_guards="exports"\nguarded_exports=["affected:identity"]\n')
                     for _ in range(2):self.assertEqual(check_paths([root/'affected.py',root/'untouched.py'],root=root).status,0)
-                    writer = 'from pyalamode import '+symbol+'\n'+symbol+'.__setattr__=unknown\n' if route=='public' else 'from pyalamode.variants import '+symbol+' as alias\nalias.__setattr__=unknown\n' if route=='from_private' else 'import pyalamode.variants as v\nv.'+symbol+'.__init__.__code__=unknown\n'
+                    writer = 'from pyalamode import '+symbol+'\n'+symbol+'.__setattr__=unknown\n' if route=='public' else 'from pyalamode.sums import '+symbol+' as alias\nalias.__setattr__=unknown\n' if route=='from_private' else 'import pyalamode.sums as v\nv.'+symbol+'.__init__.__code__=unknown\n'
                     (root/'writer.py').write_text(writer)
                     run=check_paths([root/'affected.py',root/'untouched.py',root/'writer.py'],root=root)
                     self.assertEqual(run.status,1)

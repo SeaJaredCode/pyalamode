@@ -325,21 +325,21 @@ class EditorCase(unittest.TestCase):
         self.assertFalse(caller["verified"])
         self.assertIn("PAL211", [row["rule"] for row in caller["diagnostics"]])
 
-    def test_package_variant_cases_and_guard_schemas_override_shadow_catalog(self):
+    def test_package_oneof_cases_and_guard_schemas_override_shadow_catalog(self):
         module = self.root / "dependency.py"
         package = self.root / "dependency"
         package.mkdir()
         initializer = package / "__init__.py"
-        prefix = "# mode: fun\nfrom pyalamode import variant,case\n@variant\nclass Choice:\n    @case\n    class Found:\n"
+        prefix = "# mode: fun\nfrom pyalamode import oneof,case\n@oneof\nclass Choice:\n    @case\n    class Found:\n"
         module.write_text(prefix + "        payload:int=1\n    @case\n    class Extra:pass\n")
         initializer.write_text(prefix + '        payload:str="package"\n')
         self.path.write_text("# mode: fun\nfrom dependency import Choice\ndef f(item:Choice)->str:\n    match item:\n        case Choice.Found(payload=value):return value\n")
         report = self.project()
         files = {row["path"]: row for row in report["report"]["files"]}
         self.assertTrue(files[str(self.path)]["verified"])
-        self.assertEqual(files[str(initializer)]["variants"][0]["cases"]["Found"]["fields"], {"payload": "str"})
-        self.assertEqual(set(files[str(initializer)]["variants"][0]["cases"]), {"Found"})
-        self.assertEqual(set(files[str(module)]["variants"][0]["cases"]), {"Found", "Extra"})
+        self.assertEqual(files[str(initializer)]["oneofs"][0]["cases"]["Found"]["fields"], {"payload": "str"})
+        self.assertEqual(set(files[str(initializer)]["oneofs"][0]["cases"]), {"Found"})
+        self.assertEqual(set(files[str(module)]["oneofs"][0]["cases"]), {"Found", "Extra"})
         self.assertFalse(files[str(module)]["verified"])
         self.assertIn("PAL241", [row["rule"] for row in files[str(module)]["diagnostics"]])
         self.path.write_text(self.path.read_text().replace("->str:", "->int:"))

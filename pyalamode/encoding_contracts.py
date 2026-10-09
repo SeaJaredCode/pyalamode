@@ -24,7 +24,7 @@ _FOUNDATIONS = ["builtins." + name for name in sorted(ENCODING_FOUNDATIONS["buil
     "exact int arithmetic/comparison/shifts/bit operations", "exact str ordinal iteration/index/comparison/join/split/isidentifier/startswith",
     "exact bytes index/slice/construction/comparison", "exact tuple/list/set private traversal/construction/append/extend/add/remove",
     "pyalamode.collections exact classes/descriptor owners", "pyalamode.records._RECORDS fixed identity/field rows",
-    "pyalamode.variants._VARIANTS/_CASES fixed closed-domain/case rows and Option/Result identities",
+    "pyalamode.sums._ONEOFS/_CASES fixed closed-domain/case rows and Option/Result identities",
     "complete inherited collection/record/domain native and product foundations",
 ]
 

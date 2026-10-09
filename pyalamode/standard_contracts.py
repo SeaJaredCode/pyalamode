@@ -50,8 +50,8 @@ _FOUNDATIONS = ["builtins." + name for name in sorted(STANDARD_NATIVE["builtins"
     "types.FunctionType", "exact str.split/join/replace/startswith/subscription",
     "exact bytes.hex/fromhex/subscription", "exact int arithmetic/comparison/shifts/bit operations", "exact tuple/list private construction/iteration/append/reverse",
     "pyalamode.collections.Vector/OrderedMap/_invalid/_validate/_storage/_validate_key/_function/_new",
-    "pyalamode.variants.Ok/Err exact construction and fixed payload slots",
-    "complete inherited collections/records/variants native and product foundations",
+    "pyalamode.sums.Ok/Err exact construction and fixed payload slots",
+    "complete inherited collections/records/oneofs native and product foundations",
 ]
 
 

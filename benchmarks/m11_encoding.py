@@ -28,9 +28,9 @@ WARMUPS = 10
 INTERVALS = 3
 CALLS = 25
 FIXTURE = '''# mode: fun
-from pyalamode import record,variant,case,Map,value_encode,value_decode
+from pyalamode import record,oneof,case,Map,value_encode,value_decode
 
-@variant
+@oneof
 class InvoiceStatus:
     @case
     class Ready:

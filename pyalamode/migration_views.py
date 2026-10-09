@@ -234,7 +234,7 @@ def capture_state(snapshot, policy, inventory):
                         reasons.append("source_fun")
                     if any(analyzer._effects_like(d) for d in node.decorator_list):
                         reasons.append("source_effects")
-                if kind in {"record", "variant"}:
+                if kind in {"record", "oneof"}:
                     reasons = []
                 source_evidence = file.initialization_evidence if kind == "module" else data.get("source_evidence", "unchecked ordinary source")
                 checked = bool(selected and source_evidence.startswith("checked"))
@@ -266,7 +266,7 @@ def capture_state(snapshot, policy, inventory):
                         append("function", node, qualified, info is not None, info=info)
                         visit(node.body, qualified + ".")
                     elif isinstance(node, ast.ClassDef):
-                        for kind, declarations, evidence_rows in (("record", graph.record_declarations, file.records), ("variant", graph.variant_declarations, file.variants)):
+                        for kind, declarations, evidence_rows in (("record", graph.record_declarations, file.records), ("oneof", graph.oneof_declarations, file.oneofs)):
                             declaration = next((info for info in declarations if info.analyzer is analyzer and info.node is node), None)
                             if declaration:
                                 data = next((data for data in evidence_rows if data["name"] == node.name and data["line"] == node.lineno), {})
@@ -344,7 +344,7 @@ def capture_state(snapshot, policy, inventory):
                           "selected_functions": sum(row["selected"] for row in functions), "checked_functions": sum(row["strict_checked"] for row in functions),
                           "checked_exports": sum(row["public_export"] and row["strict_checked"] for row in boundaries),
                           "selected_records": sum(row["selected"] for row in boundaries if row["kind"] == "record"),
-                          "selected_variants": sum(row["selected"] for row in boundaries if row["kind"] == "variant")},
+                          "selected_oneofs": sum(row["selected"] for row in boundaries if row["kind"] == "oneof")},
              "boundaries": boundaries, "findings": list(grouped.values()), "policy": _policy(policy),
              "approvals": copy.deepcopy(snapshot.result.integration_approvals), "unsafe_adapters": unsafe}
     return normalize_state(state)

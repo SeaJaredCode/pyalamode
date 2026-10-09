@@ -43,7 +43,7 @@ def _validate(value, path="value", active=None):
     if _scalar_type(kind):
         return
     record_info = _records._record_info(kind)
-    case_info = _records._variants._case_info(kind)
+    case_info = _records._sums._case_info(kind)
     if kind is not tuple and not _collection_type(kind) and record_info is None and case_info is None:
         _invalid(path)
     active = set() if active is None else active
@@ -55,7 +55,7 @@ def _validate(value, path="value", active=None):
         if record_info is not None:
             _records._validate_record(value, record_info, path, active)
         elif case_info is not None:
-            _records._variants._validate_case(value, case_info, path, active)
+            _records._sums._validate_case(value, case_info, path, active)
         elif kind is tuple:
             for index, item in enumerate(value):
                 _validate(item, f"{path}[{index}]", active)
@@ -132,9 +132,9 @@ def _equal(left, right):
     record_info = _records._record_info(kind)
     if record_info is not None:
         return _records._record_equal(left, right, record_info)
-    case_info = _records._variants._case_info(kind)
+    case_info = _records._sums._case_info(kind)
     if case_info is not None:
-        return _records._variants._case_equal(left, right, case_info)
+        return _records._sums._case_equal(left, right, case_info)
     return False
 
 
@@ -154,9 +154,9 @@ def _data_repr(value):
     record_info = _records._record_info(kind)
     if record_info is not None:
         return _records._record_repr(value, record_info)
-    case_info = _records._variants._case_info(kind)
+    case_info = _records._sums._case_info(kind)
     if case_info is not None:
-        return _records._variants._case_repr(value, case_info)
+        return _records._sums._case_repr(value, case_info)
     _invalid("representation")
 
 

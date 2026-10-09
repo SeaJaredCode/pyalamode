@@ -2,12 +2,12 @@
 
 import unittest
 
-from pyalamode import (variant, case, Option, Some, Nothing, Result, Ok, Err,
+from pyalamode import (oneof, case, Option, Some, Nothing, Result, Ok, Err,
                       accumulate, Failure, failure_value, record, replace,
                       Vector, Map, OrderedMap, Set, freeze, thaw, recorded_clock)
 from pyalamode.boundaries import validate_data
 from pyalamode import records as _records
-from pyalamode import variants as _variants
+from pyalamode import sums as _sums
 from pyalamode import failures as _failures
 
 
@@ -16,7 +16,7 @@ class Point:
     number: int
 
 
-@variant
+@oneof
 class Lookup:
     @case
     class Found:
@@ -28,7 +28,7 @@ class Lookup:
         pass
 
 
-@variant
+@oneof
 class Batch:
     @case
     class Ready:
@@ -122,7 +122,7 @@ class M6RuntimeTests(unittest.TestCase):
         self.assertEqual(hooks, binding_calls)
 
     def test_public_payload_names_do_not_collide_with_constructor(self):
-        @variant
+        @oneof
         class PublicNames:
             @case
             class Data:
@@ -207,7 +207,7 @@ class M6RuntimeTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 validate_data(value, schema)
         with self.assertRaises(TypeError):
-            validate_data(Lookup.Missing(), ("variant", Lookup, domain[2][:-1]))
+            validate_data(Lookup.Missing(), ("oneof", Lookup, domain[2][:-1]))
         with self.assertRaises(TypeError):
             validate_data(Lookup.Missing(), ("case", Lookup.Missing, (("wrong", "int"),)))
 
@@ -281,7 +281,7 @@ class M6RuntimeTests(unittest.TestCase):
         value = Hostile()
         for invoke in (lambda: Some(value), lambda: Ok((value,)), lambda: Err(value),
                        lambda: freeze(value), lambda: thaw(value), lambda: failure_value(value),
-                       lambda: Option[Hostile], lambda: validate_data(Nothing(), ("variant", Hostile, ())),
+                       lambda: Option[Hostile], lambda: validate_data(Nothing(), ("oneof", Hostile, ())),
                        lambda: validate_data(Nothing(), ("case", Hostile, ()))):
             with self.assertRaises(TypeError):
                 invoke()
@@ -337,15 +337,15 @@ class M6RuntimeTests(unittest.TestCase):
     def test_thaw_exact_envelopes_are_recursively_fresh(self):
         shared = Some(Vector.of(Point(1)))
         exported = thaw((shared, shared))
-        self.assertEqual(tuple(exported[0]), ("variant", "case", "fields"))
-        self.assertEqual(exported[0]["variant"], "pyalamode:Option")
+        self.assertEqual(tuple(exported[0]), ("oneof", "case", "fields"))
+        self.assertEqual(exported[0]["oneof"], "pyalamode:Option")
         self.assertEqual(exported[0]["case"], "Some")
         exported[0]["fields"]["value"][0]["number"] = 99
         self.assertEqual(exported[1]["fields"]["value"][0]["number"], 1)
         self.assertEqual(shared.value[0].number, 1)
-        self.assertEqual(thaw(Nothing()), {"variant": "pyalamode:Option", "case": "Nothing", "fields": {}})
-        self.assertEqual(thaw(Lookup.Missing())["variant"], __name__ + ":Lookup")
-        self.assertEqual(thaw(Err("bad")), {"variant": "pyalamode:Result", "case": "Err", "fields": {"error": "bad"}})
+        self.assertEqual(thaw(Nothing()), {"oneof": "pyalamode:Option", "case": "Nothing", "fields": {}})
+        self.assertEqual(thaw(Lookup.Missing())["oneof"], __name__ + ":Lookup")
+        self.assertEqual(thaw(Err("bad")), {"oneof": "pyalamode:Result", "case": "Err", "fields": {"error": "bad"}})
 
     def test_accumulate_success_and_ordered_independent_errors(self):
         left, right = Ok(1), Ok("x")
@@ -389,15 +389,15 @@ class M6RuntimeTests(unittest.TestCase):
         class EmptyDomain:
             pass
         with self.assertRaises(TypeError):
-            variant(EmptyDomain)
+            oneof(EmptyDomain)
         class WrongDomain:
             Alias = Alone
         with self.assertRaises(TypeError):
-            variant(WrongDomain)
+            oneof(WrongDomain)
         class FieldDomain:
             value: int
         with self.assertRaises(TypeError):
-            variant(FieldDomain)
+            oneof(FieldDomain)
         class MethodCase:
             def run(self):
                 return 1
@@ -427,7 +427,7 @@ class M6RuntimeTests(unittest.TestCase):
                 raise AssertionError
         bad = Evil()
         for schema in (("case", Lookup.Found, (("point", bad),)),
-                       ("variant", Lookup, ((Lookup.Found, (("point", bad),)),)),
+                       ("oneof", Lookup, ((Lookup.Found, (("point", bad),)),)),
                        ("Result", ("int", bad)), ("Option", (bad,)),
                        ("Nothing", ("int",))):
             with self.assertRaises(TypeError):

@@ -8,7 +8,7 @@ type label resolves an object; decode uses only the explicitly selected schema.
 from types import GenericAlias, MemberDescriptorType, GetSetDescriptorType, MappingProxyType, UnionType
 from . import collections as _collections
 from . import records as _records
-from . import variants as _variants
+from . import sums as _sums
 
 __all__ = ["value_encode", "value_decode"]
 
@@ -194,7 +194,7 @@ class _Compiler:
     __slots__ = ("records", "domains", "cases", "budget", "labels")
 
     def __init__(self):
-        self.records, self.domains, self.cases = _records._RECORDS, _variants._VARIANTS, _variants._CASES
+        self.records, self.domains, self.cases = _records._RECORDS, _sums._ONEOFS, _sums._CASES
         for rows, arity in ((self.records, 3), (self.domains, 3), (self.cases, 6)):
             if type(rows) is not tuple or any(type(row) is not tuple or len(row) != arity for row in rows):
                 _type_error("schema", "malformed product schema metadata")
@@ -219,7 +219,7 @@ class _Compiler:
                 if label is not None:
                     labels.append((label, row[0]))
             for row in self.domains:
-                if type(row[0]) is not _variants._DomainType or type(row[1]) is not str:
+                if type(row[0]) is not _sums._DomainType or type(row[1]) is not str:
                     _type_error("schema", "malformed product schema metadata")
                 original = _identity(row[0], unrelated=True)
                 if original is not None:
@@ -256,7 +256,7 @@ class _Compiler:
 
     def domain(self, info, depth):
         kind, original, entries = info
-        if type(kind) is not _variants._DomainType or type(entries) is not tuple or not entries:
+        if type(kind) is not _sums._DomainType or type(entries) is not tuple or not entries:
             _type_error("schema", "malformed product schema metadata")
         _limit(len(entries), MAX_CASES, "schema", "schema case count")
         identity = self.nominal(kind)
@@ -286,9 +286,9 @@ class _Compiler:
 
     def builtin_case(self, kind, fields):
         info = self.find(self.cases, kind)
-        expected_name = next(name for cls, name in ((_variants.Some, "Some"), (_variants.Nothing, "Nothing"),
-                                                   (_variants.Ok, "Ok"), (_variants.Err, "Err")) if cls is kind)
-        family = _variants.Option if kind is _variants.Some or kind is _variants.Nothing else _variants.Result
+        expected_name = next(name for cls, name in ((_sums.Some, "Some"), (_sums.Nothing, "Nothing"),
+                                                   (_sums.Ok, "Ok"), (_sums.Err, "Err")) if cls is kind)
+        family = _sums.Option if kind is _sums.Some or kind is _sums.Nothing else _sums.Result
         if info is None or info[3] is not family or type(info[5]) is not str or info[5] != expected_name:
             _type_error("schema", "malformed product schema metadata")
         descriptors = _field_descriptors(kind, info[1])
@@ -300,13 +300,13 @@ class _Compiler:
     def alternative(self, tag, children):
         cases = []
         if tag in (0x23, 0x25):
-            cases.append(self.builtin_case(_variants.Some, (("value", children[0]),)))
+            cases.append(self.builtin_case(_sums.Some, (("value", children[0]),)))
         if tag in (0x23, 0x26):
-            cases.append(self.builtin_case(_variants.Nothing, ()))
+            cases.append(self.builtin_case(_sums.Nothing, ()))
         if tag in (0x24, 0x27):
-            cases.append(self.builtin_case(_variants.Ok, (("value", children[0]),)))
+            cases.append(self.builtin_case(_sums.Ok, (("value", children[0]),)))
         if tag in (0x24, 0x28):
-            cases.append(self.builtin_case(_variants.Err, (("error", children[1] if tag == 0x24 else children[0]),)))
+            cases.append(self.builtin_case(_sums.Err, (("error", children[1] if tag == 0x24 else children[0]),)))
         return _Node(tag, children=children, cases=tuple(cases))
 
     def annotation(self, annotation, depth=0):
@@ -322,9 +322,9 @@ class _Compiler:
             return self.domain(info, depth)
         info = self.find(self.cases, annotation)
         if info is not None and info[3] is not None:
-            if annotation is _variants.Nothing:
+            if annotation is _sums.Nothing:
                 return self.alternative(0x26, ())
-            if info[3] is not _variants.Option and info[3] is not _variants.Result:
+            if info[3] is not _sums.Option and info[3] is not _sums.Result:
                 domain = self.annotation(info[3], depth + 1)
                 selected = next((index for index, case in enumerate(domain.cases) if case.kind is annotation), None)
                 if selected is None:
@@ -360,8 +360,8 @@ class _Compiler:
                 if tag in (0x13, 0x14, 0x15) and children[0].tag > 4:
                     _type_error("schema", "unsupported schema key domain")
                 return _Node(tag, kind, children, descriptors=(_collection_descriptor(kind),))
-        for tag, kind, arity in ((0x23, _variants.Option, 1), (0x24, _variants.Result, 2),
-                                  (0x25, _variants.Some, 1), (0x27, _variants.Ok, 1), (0x28, _variants.Err, 1)):
+        for tag, kind, arity in ((0x23, _sums.Option, 1), (0x24, _sums.Result, 2),
+                                  (0x25, _sums.Some, 1), (0x27, _sums.Ok, 1), (0x28, _sums.Err, 1)):
             if origin is kind:
                 if len(arguments) != arity:
                     _type_error("schema", "unsupported schema origin/arity")
@@ -392,7 +392,7 @@ class _Compiler:
             if info is None or schema[2] is not info[1]:
                 _type_error("schema", "malformed product schema metadata")
             return self.record(info, depth)
-        if name == "variant" and len(schema) == 3:
+        if name == "oneof" and len(schema) == 3:
             info = self.find(self.domains, schema[1])
             if info is None or schema[2] is not info[2]:
                 _type_error("schema", "malformed product schema metadata")
@@ -600,8 +600,8 @@ def _encode(value, node, writer, budget, depth, path):
                 writer.number(selected)
                 writer.number(len(values))
             else:
-                wire_tag = next(wire for kind, wire in ((_variants.Some, 0x31), (_variants.Nothing, 0x32),
-                                                        (_variants.Ok, 0x33), (_variants.Err, 0x34)) if item.kind is kind)
+                wire_tag = next(wire for kind, wire in ((_sums.Some, 0x31), (_sums.Nothing, 0x32),
+                                                        (_sums.Ok, 0x33), (_sums.Err, 0x34)) if item.kind is kind)
                 writer.byte(wire_tag)
             for (name, child), member in zip(item.fields, values):
                 _encode(member, child, writer, budget, depth + 1, path + "." + name)
@@ -762,8 +762,8 @@ def _decode(node, reader, budget, depth, path):
     tag = reader.byte()
     expected = 0x10 if node.tag == 0x11 else 0x21 if node.tag == 0x22 else node.tag
     if node.tag >= 0x23:
-        kind = next((kind for wire, kind in ((0x31, _variants.Some), (0x32, _variants.Nothing),
-                                            (0x33, _variants.Ok), (0x34, _variants.Err)) if tag == wire), None)
+        kind = next((kind for wire, kind in ((0x31, _sums.Some), (0x32, _sums.Nothing),
+                                            (0x33, _sums.Ok), (0x34, _sums.Err)) if tag == wire), None)
         item = next((case for case in node.cases if case.kind is kind), None)
         if item is None:
             _value_error(path, "value tag differs from selected schema")

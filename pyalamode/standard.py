@@ -6,7 +6,7 @@ the runtime does not register or certify callable behavior.
 """
 
 from . import collections as _collections
-from . import variants as _variants
+from . import sums as _sums
 
 __all__ = ["text_split", "text_join", "text_replace", "text_startswith", "text_slice",
            "integer_clamp", "integer_parse_decimal", "integer_format_decimal",
@@ -253,9 +253,9 @@ def result_traverse(values, callback, /):
     for value in items:
         result = callback(value)
         _collections._validate(result, "traverse.result")
-        if type(result) is _variants.Err:
+        if type(result) is _sums.Err:
             return result
-        if type(result) is not _variants.Ok:
+        if type(result) is not _sums.Ok:
             _collections._invalid("traverse.result", "expected exact Ok or Err")
         output.append(object.__getattribute__(result, "value"))
-    return _variants.Ok(_collections._new(_collections.Vector, "_items", tuple(output)))
+    return _sums.Ok(_collections._new(_collections.Vector, "_items", tuple(output)))

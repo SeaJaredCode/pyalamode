@@ -9,7 +9,7 @@ import unittest
 from pyalamode.checker import analyze_source
 from pyalamode.project import check_paths, build_paths
 
-IMPORTS = 'from pyalamode import fun, oneof, variant, case, record, Option, Some, Nothing\n'
+IMPORTS = 'from pyalamode import fun, oneof, case, record, Option, Some, Nothing\n'
 DECLARATIONS = '''@record
 class Point:
     x: int
@@ -41,17 +41,20 @@ def area(v: Shape | Point | None) -> int:
 
 
 class OneOf(unittest.TestCase):
-    def test_runtime_alias_is_the_same_decorator(self):
+    def test_variant_spelling_is_gone(self):
         import pyalamode
-        self.assertIs(pyalamode.oneof, pyalamode.variant)
         self.assertIn('oneof', pyalamode.__all__)
+        self.assertNotIn('variant', pyalamode.__all__)
+        self.assertFalse(hasattr(pyalamode, 'variant'))
+        result = analyze_source('from pyalamode import fun, case\nfrom pyalamode import variant\n@variant\nclass Lookup:\n    @case\n    class Found:\n        value: int\n@fun\ndef f(v: Lookup) -> int:\n    return 1\n', path='lookup.py')
+        self.assertIn('PAL130', [d.rule for d in result.diagnostics])
 
     def test_checker_admits_oneof_and_module_attribute_spelling(self):
         for prefix, decorator in [(IMPORTS, '@oneof'), ('import pyalamode\nfrom pyalamode import fun, case\n', '@pyalamode.oneof')]:
             source = prefix + decorator + '\nclass Lookup:\n    @case\n    class Found:\n        value: int\n    @case\n    class Missing:\n        pass\n@fun\ndef f(v: Lookup) -> int:\n    match v:\n        case Lookup.Found(n): return n\n        case Lookup.Missing(): return 0\n'
             result = analyze_source(source, path='lookup.py')
             self.assertTrue(result.verified, '\n'.join(d.format() for d in result.diagnostics))
-            self.assertEqual(len(result.variants), 1)
+            self.assertEqual(len(result.oneofs), 1)
 
     def test_rebound_oneof_is_not_a_domain_declaration(self):
         source = IMPORTS + 'oneof = record\n@oneof\nclass Lookup:\n    @case\n    class Found:\n        value: int\n'

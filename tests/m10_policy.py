@@ -83,7 +83,7 @@ def recount(value):
         "checked_functions": sum(r["kind"] == "function" and r["strict_checked"] for r in rows),
         "checked_exports": sum(r["kind"] != "module" and r["strict_checked"] and r["public_export"] for r in rows),
         "selected_records": sum(r["kind"] == "record" and r["selected"] for r in rows),
-        "selected_variants": sum(r["kind"] == "variant" and r["selected"] for r in rows)}
+        "selected_oneofs": sum(r["kind"] == "oneof" and r["selected"] for r in rows)}
 
 
 def normalized(specs=(("core", "f", 1),)):

@@ -54,7 +54,7 @@ APPROVAL_KEYS = set("operation contract_sha256 dependency_sha256 owner rationale
 ASSUMPTION_KEYS = set("identity version effects failures initialization provenance approval contract_sha256 dependency_sha256 installed_identity admission source_evidence".split())
 INSTALLED_KEYS = set("distribution version build cache_tag platform base_prefix abiflags extension_suffixes native_artifacts adapter_artifact interpreter_executable interpreter_core resolution native_setup_trust operation invocation_backend native_operations".split())
 LEGACY_PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py".split())
-PRODUCTS = LEGACY_PRODUCTS | {"distribution.py", "encoding.py", "encoding_contracts.py"}
+PRODUCTS = (LEGACY_PRODUCTS - {"variants.py"}) | {"sums.py", "distribution.py", "encoding.py", "encoding_contracts.py"}
 LEGACY_CHECKER = "migration-team-policy-10.0"
 LEGACY_OPERATION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -233,9 +233,10 @@ def _location(value, *, diagnostic=False):
             _text(value[key], nullable=key == "first_binding")
 
 
-def _logical(value):
+def _logical(value, legacy=False):
     _shape(value, {"kind", "selector", "qualified_name"})
-    if value["kind"] not in {"module", "function", "record", "variant"}:
+    # Genuine M10 history spells closed sums "variant"; current files use "oneof".
+    if value["kind"] not in {"module", "function", "record", "variant" if legacy else "oneof"}:
         _fail("unsupported migration boundary kind")
     _selector(value["selector"], module=value["kind"] == "module")
     _text(value["qualified_name"])
@@ -602,7 +603,7 @@ def _state(state, *, retained=False):
         _path(exclusion["path"])
         _text(exclusion["reason"], nonempty=True)
     scope["exclusions"] = _sort_rows(scope["exclusions"])
-    _shape(value["coverage"], set("eligible_modules selected_modules checked_modules eligible_functions selected_functions checked_functions checked_exports selected_records selected_variants".split()))
+    _shape(value["coverage"], set("eligible_modules selected_modules checked_modules eligible_functions selected_functions checked_functions checked_exports selected_records".split()) | {"selected_variants" if legacy else "selected_oneofs"})
     for count in value["coverage"].values():
         _integer(count)
     _policy(value["policy"],legacy=legacy)
@@ -611,7 +612,7 @@ def _state(state, *, retained=False):
     for row in value["boundaries"]:
         _shape(row, BOUNDARY_KEYS)
         logical = {key: row[key] for key in ("kind", "selector", "qualified_name")}
-        _logical(logical)
+        _logical(logical, legacy=legacy)
         _path(row["path"])
         _text(row["signature"], nullable=True)
         _digest(row["definition_sha256"])
@@ -654,7 +655,7 @@ def _state(state, *, retained=False):
         _shape(row, FINDING_KEYS)
         if row["rule"] not in SOURCE_RULES:
             _fail("tooling/policy/unknown rule cannot become audit debt")
-        _logical(row["logical_boundary"])
+        _logical(row["logical_boundary"], legacy=legacy)
         _text(row["signature"], nullable=True)
         _text(row["origin"])
         context = row["context"]
@@ -685,7 +686,7 @@ def _state(state, *, retained=False):
         if birth is None:
             birth = identity
         _shape(birth, IDENTITY_KEYS)
-        _logical(birth["logical_boundary"])
+        _logical(birth["logical_boundary"], legacy=legacy)
         if birth["identity_version"] != IDENTITY_VERSION or any(birth[k] != identity[k] for k in ("rule", "signature", "context_sha256", "origin")):
             _fail("finding birth cannot change rule/context/signature/origin")
         if birth["logical_boundary"]["kind"] != row["logical_boundary"]["kind"] or not retained and birth != identity:
@@ -788,7 +789,7 @@ def _state(state, *, retained=False):
                     "checked_functions": sum(b["kind"] == "function" and b["strict_checked"] for b in rows),
                     "checked_exports": sum(b["kind"] != "module" and b["public_export"] and b["strict_checked"] for b in rows),
                     "selected_records": sum(b["kind"] == "record" and b["selected"] for b in rows),
-                    "selected_variants": sum(b["kind"] == "variant" and b["selected"] for b in rows)}
+                    ("selected_variants" if legacy else "selected_oneofs"): sum(b["kind"] == ("variant" if legacy else "oneof") and b["selected"] for b in rows)}
         if value["coverage"] != expected or expected["eligible_modules"] != len(inputs["sources"]):
             _fail("migration denominator does not match actual boundary/source inventory")
     _canonical(value)

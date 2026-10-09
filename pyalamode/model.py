@@ -6,10 +6,10 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "checked-distribution-11.0"
+CHECKER_VERSION = "sums-unions-11.1"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-ops-11"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-union-ops-11.1"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -22,7 +22,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "sums.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -145,7 +145,7 @@ class CheckResult:
     initialization_failures: list[str] = field(default_factory=list)
     binding_context: list[str] = field(default_factory=list)
     records: list[dict] = field(default_factory=list)
-    variants: list[dict] = field(default_factory=list)
+    oneofs: list[dict] = field(default_factory=list)
     setup_observations: list[dict] = field(default_factory=list)
     unsafe_adapters: list[dict] = field(default_factory=list)
     integration_inputs: dict[str, dict] = field(default_factory=dict)

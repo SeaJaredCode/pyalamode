@@ -58,7 +58,7 @@ def _annotation_schema(annotation, namespace=None):
     info = _record_info(annotation)
     if info is not None:
         return ("record", info[0], info[1])
-    alternative = _variants._annotation_schema(annotation, namespace)
+    alternative = _sums._annotation_schema(annotation, namespace)
     if alternative is not None:
         return alternative
     if type(annotation) is GenericAlias:
@@ -113,7 +113,7 @@ def _annotation_node(node, namespace):
             name = next((name for name, cls in (("Vector", _collections.Vector), ("Map", _collections.Map),
                                                ("OrderedMap", _collections.OrderedMap), ("Set", _collections.Set)) if origin is cls), None)
             if name is None:
-                name = _variants._annotation_origin(origin)
+                name = _sums._annotation_origin(origin)
             if name is None:
                 _collections._invalid("annotation", "unsupported record data annotation")
             schema = (name, tuple(_annotation_node(part, namespace) for part in parts))
@@ -136,7 +136,7 @@ def _annotation_binding(node, namespace):
             if type(attributes) is not dict or any(type(name) is not str for name in attributes):
                 _collections._invalid("annotation", "module metadata names require exact strings")
             return attributes.get(node.attr, _MISSING)
-        alternative = _variants._annotation_attribute(owner, node.attr)
+        alternative = _sums._annotation_attribute(owner, node.attr)
         if alternative is not _MISSING:
             return alternative
     _collections._invalid("annotation", "unsupported record annotation namespace")
@@ -148,7 +148,7 @@ def _union_classes(schema):
         return tuple(kind for name, kind in _SCALARS if name == schema)
     if type(schema) is tuple and len(schema) == 3 and schema[0] in ("record", "case"):
         return (schema[1],)
-    if type(schema) is tuple and len(schema) == 3 and schema[0] == "variant" and type(schema[2]) is tuple:
+    if type(schema) is tuple and len(schema) == 3 and schema[0] == "oneof" and type(schema[2]) is tuple:
         return tuple(entry[0] for entry in schema[2] if type(entry) is tuple and len(entry) == 2)
     _collections._invalid("schema", "union members are exact scalars, records, domains or cases")
 
@@ -196,7 +196,7 @@ def _canonical(schema):
     if name in ("record", "case") and len(schema) == 3 and type(schema[2]) is tuple:
         return (name, schema[1], tuple((field[0], _canonical(field[1])) if type(field) is tuple and len(field) == 2 else field
                                        for field in schema[2]))
-    if name == "variant" and len(schema) == 3 and type(schema[2]) is tuple:
+    if name == "oneof" and len(schema) == 3 and type(schema[2]) is tuple:
         return (name, schema[1], tuple((entry[0], _canonical(("case", entry[0], entry[1]))[2])
                                        if type(entry) is tuple and len(entry) == 2 and type(entry[1]) is tuple else entry
                                        for entry in schema[2]))
@@ -221,7 +221,7 @@ def _check_schema(schema):
         if _union_schema(schema[1]) != schema:
             _collections._invalid("schema", "union schema is not canonical")
         return
-    if _variants._check_schema(schema):
+    if _sums._check_schema(schema):
         return
     if name == "record":
         if len(schema) != 3:
@@ -265,8 +265,8 @@ def _validate_schema(value, schema, path="value", active=None):
                 _validate_schema(value, member, path, active)
                 return
         _collections._invalid(path, "expected exact member of closed union")
-    if name in ("variant", "case", "Option", "Result", "Some", "Nothing", "Ok", "Err"):
-        _variants._validate_schema(value, schema, path, active)
+    if name in ("oneof", "case", "Option", "Result", "Some", "Nothing", "Ok", "Err"):
+        _sums._validate_schema(value, schema, path, active)
         return
     if name == "record":
         expected = schema[1]
@@ -457,4 +457,4 @@ def replace(value, /, **changes):
 # Imported after these definitions: collections imports records during its own
 # initialization. Alternatives create only fixed classes/catalogs at import and
 # consult completed collection functions only when ordinary data is used.
-from . import variants as _variants
+from . import sums as _sums

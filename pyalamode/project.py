@@ -95,9 +95,9 @@ class ProjectResult:
                 "coverage": {"eligible_functions": sum(r.eligible_functions for r in self.results),
                              "selected_functions": sum(r.selected_functions for r in self.results),
                              "selected_records": sum(len(r.records) for r in self.results),
-                             "selected_variants": sum(len(r.variants) for r in self.results),
+                             "selected_oneofs": sum(len(r.oneofs) for r in self.results),
                              "analyzed_call_sites": sum(r.analyzed_call_sites for r in self.results)},
-                "claim_scope": "Selected functions, record/variant declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
+                "claim_scope": "Selected functions, record/oneof declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
 
 
 @dataclass
@@ -203,7 +203,7 @@ def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=T
         result.tooling.extend(diagnostic("PAL001", str(project_root), reason, origin="editor freshness") for reason in stale)
         for file in result.results:
             file.diagnostics.append(diagnostic("PAL001", file.path, "editor snapshot is stale; recheck required", origin="editor freshness"))
-            for declaration in [*file.records, *file.variants]:
+            for declaration in [*file.records, *file.oneofs]:
                 declaration["source_evidence"] = "unverified: stale editor snapshot"
             for contract in file.contracts:
                 contract.source_evidence = "unverified: stale editor snapshot"
@@ -347,7 +347,7 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
-                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), variants=payload.get("variants", []),
+                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), oneofs=payload.get("oneofs", []),
                              setup_observations=payload.get("setup_observations", []),
                              unsafe_adapters=payload.get("unsafe_adapters", []), integration_inputs=payload.get("integration_inputs", {}))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
@@ -489,7 +489,7 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     for selection in policy.get("effect_bounds", {}):
         if selection not in selected:
             result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"effect bound selection `{selection}` does not resolve to a selected function", origin="project effect policy"))
-    selected_domains = {info.module + ":" + info.node.name for info in graph.variants.values()}
+    selected_domains = {info.module + ":" + info.node.name for info in graph.oneofs.values()}
     for selection in policy.get("explicit_cases", []):
         if selection not in selected_domains:
             result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"explicit_cases selection `{selection}` does not resolve to a checked top-level domain", origin="project pattern policy"))
@@ -632,7 +632,7 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
         return result
     if result.status:
         return result
-    if not any(file.selected_functions or file.module_mode or file.records or file.variants for file in result.results):
+    if not any(file.selected_functions or file.module_mode or file.records or file.oneofs for file in result.results):
         result.tooling.append(diagnostic("PAL001", str(project_root), "build requires a participating function, record declaration or functional module; no checked artifact was produced"))
         return result
     if destination.exists():
@@ -815,7 +815,7 @@ def _finish_distributions(result, snapshot, graph, root, intrinsic):
                     analyzer = intrinsic.modules.get(namespace) if intrinsic else None
                     if analyzer is None:
                         raise DistributionError("export absent from actual source")
-                    reports = [asdict(c) for c in analyzer.result.contracts] if row["kind"] == "function" else analyzer.result.records if row["kind"] == "record" else analyzer.result.variants
+                    reports = [asdict(c) for c in analyzer.result.contracts] if row["kind"] == "function" else analyzer.result.records if row["kind"] == "record" else analyzer.result.oneofs
                     actual = next((c for c in reports if c["name"] == export),None)
                     if actual is None:
                         source_status = max(source_status,1)
@@ -825,7 +825,7 @@ def _finish_distributions(result, snapshot, graph, root, intrinsic):
                         raise DistributionError("producer contract disagrees with parsed declarations")
                     if analyzer.result.status==0:_distribution_contract_relation(payload,actual,row["contract"],intrinsic,row["kind"])
                     current=graph.modules[namespace]
-                    current_reports=[asdict(c) for c in current.result.contracts] if row["kind"]=="function" else current.result.records if row["kind"]=="record" else current.result.variants
+                    current_reports=[asdict(c) for c in current.result.contracts] if row["kind"]=="function" else current.result.records if row["kind"]=="record" else current.result.oneofs
                     current_actual=next((c for c in current_reports if c["name"]==export),None)
                     if current_actual is None:source_status=max(source_status,1)
                     else:proven.append({**row,"contract":current_actual})
