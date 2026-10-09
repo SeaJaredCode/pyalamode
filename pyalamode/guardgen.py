@@ -130,8 +130,10 @@ def facade_source(source, module, contracts, records):
         args = copy.deepcopy(function.args)
         for arg in args.posonlyargs + args.args + args.kwonlyargs:
             arg.annotation = None
-        args.defaults = [ast.parse(original + ".__defaults__[" + str(i) + "]", mode="eval").body for i in range(len(args.defaults))]
-        args.kw_defaults = [ast.parse(original + ".__kwdefaults__[" + repr(arg.arg) + "]", mode="eval").body if default is not None else None for arg, default in zip(args.kwonlyargs, args.kw_defaults)]
+        # A @tailrec driver takes *arguments; its declared defaults live on the wrapped body.
+        source_function = original + (".__wrapped__" if contract.tail_recursive else "")
+        args.defaults = [ast.parse(source_function + ".__defaults__[" + str(i) + "]", mode="eval").body for i in range(len(args.defaults))]
+        args.kw_defaults = [ast.parse(source_function + ".__kwdefaults__[" + repr(arg.arg) + "]", mode="eval").body if default is not None else None for arg, default in zip(args.kwonlyargs, args.kw_defaults)]
         signature = ast.FunctionDef(name=contract.name, args=args, body=[ast.Pass()], decorator_list=[])
         signature = ast.unparse(ast.fix_missing_locations(signature)).split("\n", 1)[0]
         lines += [original + " = " + original_module + "." + contract.name, signature]
@@ -177,7 +179,11 @@ def debug_source(source, result, records):
                     node.body[insertion:insertion] = entries
                 output.append(node)
                 continue
-            if isinstance(node, ast.Return) and contract and supported_schema(contract.returns, records):
+            # A @tailrec tail call returns the trampoline's private continuation;
+            # the driver's final value is the real result, so only plain returns are asserted.
+            tail_call = contract is not None and contract.tail_recursive and any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == contract.name.rsplit(".", 1)[-1] for n in ast.walk(node))
+            if isinstance(node, ast.Return) and contract and supported_schema(contract.returns, records) and not tail_call:
                 temporary = prefix + "return_" + str(node.lineno)
                 output.append(ast.copy_location(ast.Assign(targets=[ast.Name(id=temporary, ctx=ast.Store())], value=node.value or ast.Constant(value=None)), node))
                 output.append(assertion(temporary, contract.returns, contract.path + ":" + str(node.lineno) + " " + contract.name + " return", node))

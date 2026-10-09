@@ -31,6 +31,7 @@ RULES = {
     "PAL102": ("binding not initialized on every path", "Initialize the name in every continuing branch before using it."),
     "PAL110": ("unsupported statement or binding", "Use the published finite initialization, if/return, exact match, characterized try/except and borrow statements."),
     "PAL120": ("unsupported declaration", "Use module mode or a resolved @fun, checked nested functions, and stable supported defaults."),
+    "PAL122": ("tail call shape not established", "Make every self call `return name(...)` with a complete positional argument list, carrying pending work in accumulator parameters; no self references in operations, callbacks, try or with blocks, nested captures or mutual recursion."),
     "PAL121": ("misplaced module directive", "Place # mode: fun after the optional shebang, encoding declaration and docstring, before executable statements."),
     "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record/oneof domain/closed union/Option/Result types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
     "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection, record, closed-domain and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
@@ -126,6 +127,7 @@ class FunctionContract:
     operation_contracts: list[dict] = field(default_factory=list)
     callable_default_evidence: dict[str, dict] = field(default_factory=dict)
     external_assumptions: list[dict] = field(default_factory=list)
+    tail_recursive: bool = False
 
 
 @dataclass

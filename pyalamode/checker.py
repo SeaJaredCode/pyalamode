@@ -19,6 +19,8 @@ from .integration_contracts import (INTEGRATION_NAMES, INTEGRATION_FOUNDATIONS,
                                     INTEGRATION_VERSION, integration_snapshot)
 
 BUILTINS = frozenset({"abs", "min", "max", "len"})
+# Function selection markers: @fun is an identity marker; @tailrec is a proven trampoline wrapper.
+MARKERS = frozenset({"fun", "tailrec"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
 DOMAIN_TYPES = frozenset({"Option", "Result"})
 DOMAIN_CASES = frozenset({"Some", "Nothing", "Ok", "Err"})
@@ -203,6 +205,8 @@ class ScalarAnalyzer:
         self.in_dead = False
         self.global_writes: dict[str, list[ast.AST]] = {}
         self.marker_names: set[str] = set()
+        # Local marker name -> "fun" or "tailrec"; both select a function for checking.
+        self.marker_kinds: dict[str, str] = {}
         self.marker_modules: set[str] = set()
         self.marker_imports: dict[str, ast.AST] = {}
         self.module_imports: dict[str, ast.AST] = {}
@@ -232,18 +236,26 @@ class ScalarAnalyzer:
         if isinstance(node, ast.Call):
             return self._marker_like(node.func)
         return ((isinstance(node, ast.Name) and node.id in self.marker_names) or
-                (isinstance(node, ast.Attribute) and node.attr == "fun" and isinstance(node.value, ast.Name)
+                (isinstance(node, ast.Attribute) and node.attr in MARKERS and isinstance(node.value, ast.Name)
                  and node.value.id in self.marker_modules))
 
+    def _marker_kind(self, node: ast.expr) -> str | None:
+        if isinstance(node, ast.Name):
+            return self.marker_kinds.get(node.id)
+        if isinstance(node, ast.Attribute) and node.attr in MARKERS:
+            return node.attr
+        return None
+
     def _marker_valid(self, node: ast.expr) -> bool:
+        kind = self._marker_kind(node)
         if isinstance(node, ast.Name):
             imported = self.marker_imports.get(node.id)
             return (imported is not None and self._stable(node.id, imported)
-                    and not self._attribute_changed("pyalamode", "fun"))
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.attr == "fun":
+                    and not self._attribute_changed("pyalamode", kind))
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.attr in MARKERS:
             imported = self.module_imports.get(node.value.id)
             return (imported is not None and self._stable(node.value.id, imported)
-                    and not self._attribute_changed("pyalamode", "fun"))
+                    and not self._attribute_changed("pyalamode", kind))
         return False
 
     def _prepare(self) -> ast.Module | CheckResult:
@@ -269,10 +281,11 @@ class ScalarAnalyzer:
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module == "pyalamode" and node.level == 0:
                 for alias in node.names:
-                    if alias.name == "fun":
-                        name = alias.asname or "fun"
+                    if alias.name in MARKERS:
+                        name = alias.asname or alias.name
                         self.marker_names.add(name)
                         self.marker_imports[name] = node
+                        self.marker_kinds[name] = alias.name
             if isinstance(node, ast.ImportFrom) and node.module == "types" and node.level == 0:
                 for alias in node.names:
                     if alias.name == "NoneType":
@@ -776,6 +789,7 @@ class FunctionInfo:
     handlers: list[dict] = field(default_factory=list)
     direct_failures: set[str] = field(default_factory=set)
     external_operation_sites: dict[str, set[int]] = field(default_factory=dict)
+    tailrec: bool = False
 
     @property
     def identity(self) -> str:
@@ -1583,10 +1597,21 @@ class SourceGraph:
             seen.add(current)
             return any(target == start or recursive(start, target, seen) for target in self.functions[current].calls)
         for info in self.functions.values():
+            if info.tailrec:
+                # The trampoline only handles direct self tail calls; a cycle through
+                # another function would re-enter the body from a foreign frame.
+                cyclic = sorted(target for target in info.calls if target != info.identity and recursive(info.identity, target, set()))
+                if cyclic:
+                    previous = info.analyzer.boundary
+                    info.analyzer.boundary = info.qualified
+                    info.analyzer.emit("PAL122", info.node, "@tailrec does not support mutual recursion (through " + ", ".join(t.split("::")[-1] for t in cyclic) + "); use one self-tail-recursive function")
+                    info.analyzer.boundary = previous
             if recursive(info.identity, info.identity, set()):
                 # Recursive application operations can raise at an invocation;
                 # each call edge retains its own enclosing handler masks.
                 for edge in info.failure_edges:
+                    if info.tailrec and edge["target"] == info.identity:
+                        continue  # constant stack depth: proven self tail calls never deepen the stack
                     if recursive(info.identity, edge["target"], set()) and "RecursionError" not in edge["handled"]:
                         info.failures.add("RecursionError")
         changed = True
@@ -2544,17 +2569,66 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return symbol.node is not None and symbol.node.lineno < self.constant_limit
         return not self.active or self.active.parent is not None or postponed or symbol.node.lineno < self.active.node.lineno
 
+    def _tail_shape(self, info):
+        """PAL122: every use of the function's own name is a complete positional tail call."""
+        node, name = info.node, info.node.name
+        arguments = node.args
+        positional = arguments.posonlyargs + arguments.args
+        required = len(positional) - len(arguments.defaults)
+        def refuse(at, reason):
+            self.emit("PAL122", at, reason)
+        if arguments.kwonlyargs or arguments.vararg or arguments.kwarg:
+            refuse(node, "@tailrec functions take positional parameters only, so a tail call can rebind every parameter")
+        if name in _written_names(node.body) or name in {a.arg for a in positional + arguments.kwonlyargs}:
+            refuse(node, "@tailrec function name must refer only to the function itself inside its body")
+        tail = set()
+
+        def tail_expression(expression):
+            if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name) and expression.func.id == name:
+                if expression.keywords or any(isinstance(a, ast.Starred) for a in expression.args) or not required <= len(expression.args) <= len(positional):
+                    refuse(expression, "a tail call passes a complete positional argument list matching the signature (defaults permitted)")
+                tail.add(id(expression))
+            elif isinstance(expression, ast.IfExp):
+                tail_expression(expression.body)
+                tail_expression(expression.orelse)
+
+        def tail_statements(body):
+            for statement in body:
+                if isinstance(statement, ast.Return) and statement.value is not None:
+                    tail_expression(statement.value)
+                elif isinstance(statement, ast.If):
+                    tail_statements(statement.body)
+                    tail_statements(statement.orelse)
+                elif isinstance(statement, ast.Match):
+                    for case in statement.cases:
+                        tail_statements(case.body)
+        tail_statements(node.body)
+        parameters = {a.arg for a in positional}
+        for statement in node.body:
+            for sub in ast.walk(statement):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and any(
+                        isinstance(n, ast.Name) and n.id in parameters for n in ast.walk(sub)):
+                    refuse(sub, "nested functions in a @tailrec body cannot capture its parameters, which each tail call rebinds")
+                if isinstance(sub, ast.Name) and sub.id == name:
+                    parent = self.parents.get(id(sub))
+                    if not (isinstance(parent, ast.Call) and parent.func is sub and id(parent) in tail):
+                        refuse(sub, "self call is not in tail position; carry the pending work in an accumulator parameter and `return " + name + "(...)` directly (not inside try, with, an operation or a callback)")
+
     def _marker_valid(self, node):
         if not self._foundation_available("pyalamode") or not super()._marker_valid(node):
             return False
         name = node.id if isinstance(node, ast.Name) else node.value.id
+        kind = self._marker_kind(node)
         imported = self.marker_imports.get(name) or self.module_imports.get(name)
         if self.active:
             if self.active.parent and name in (set(self.active.parent.parameters) | set(_written_names(self.active.parent.node.body))):
                 return False
             if self.active.parent is None and self.parents.get(id(self.active.node)) is self.tree and imported.lineno >= self.active.node.lineno:
                 return False
-        return not self._module_changed("pyalamode", "fun")
+        if kind == "tailrec" and any(a._attribute_changed("sys", "_getframe") or a._module_changed("sys", "_getframe") for a in self.graph.analyzers.values()):
+            # The trampoline distinguishes tail calls by the caller's frame.
+            return False
+        return not self._module_changed("pyalamode", kind)
 
     def _annotation(self, node, *, extra_names=()):
         original = node
@@ -2901,7 +2975,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 continue
             if module in {"pyalamode", "pyalamode.effects", "pyalamode.sums", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__", "pyalamode.standard", "pyalamode.encoding"} and self._foundation_available(module):
                 if symbol.kind == "import":
-                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode.encoding": ENCODING_NAMES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES, *ENCODING_NAMES}, "types": {"NoneType"}, "pyalamode.sums": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
+                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode.encoding": ENCODING_NAMES, "pyalamode": {"fun", "tailrec", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES, *ENCODING_NAMES}, "types": {"NoneType"}, "pyalamode.sums": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
                     if symbol.name.split(":", 1)[1] not in allowed.get(module, set()):
                         self.emit("PAL241", node, f"foundation import `{symbol.name}` has no supported contract")
                 continue
@@ -2944,7 +3018,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         decorators = node.decorator_list
         ordinary = [d for d in decorators if not self._effects_like(d)]
         if ordinary and (len(ordinary) != 1 or not self._marker_valid(ordinary[0])):
-            self.emit("PAL120", node, "only one unchanged @fun and one finite @effects declaration are supported")
+            self.emit("PAL120", node, "only one unchanged @fun or @tailrec and one finite @effects declaration are supported")
+        info.tailrec = len(ordinary) == 1 and self._marker_kind(ordinary[0]) == "tailrec"
+        if info.tailrec:
+            self._tail_shape(info)
         if not decorators and not (self.module_mode or info.parent or info.identity in self.graph.candidate_functions):
             self.emit("PAL120", node, "function is not selected by module mode or a resolved marker")
         if info.parent:
@@ -3003,6 +3080,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             self.emit("PAL211", node, "a completing path falls through with None instead of the declared result")
         info.direct_failures = set(info.failures)
         contract = FunctionContract(info.qualified, self.path, node.lineno, dict(info.parameters), info.returns, dict(info.kinds),
+                                    tail_recursive=info.tailrec,
                                     defaults={n: v.kind or "unknown" for n, v in info.defaults.items()},
                                     captures={n: info.captures[n].kind or "unknown" for n in info.capture_uses},
                                     callable_targets={n: list(info.captures[n].callable.targets) for n in info.capture_uses if info.captures[n].callable},
