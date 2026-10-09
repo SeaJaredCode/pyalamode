@@ -32,7 +32,7 @@ RULES = {
     "PAL110": ("unsupported statement or binding", "Use the published finite initialization, if/return, exact match, characterized try/except and borrow statements."),
     "PAL120": ("unsupported declaration", "Use module mode or a resolved @fun, checked nested functions, and stable supported defaults."),
     "PAL121": ("misplaced module directive", "Place # mode: fun after the optional shebang, encoding declaration and docstring, before executable statements."),
-    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record/variant/Option/Result types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
+    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple/product collection/record/oneof domain/closed union/Option/Result types, or fixed Callable contracts; Map keys and Set elements require exact scalar domains. Annotation expressions are never evaluated."),
     "PAL201": ("unsupported expression", "Use the published exact scalar, tuple, collection, record, closed-domain and checked callable expression contracts; move uncharacterized integration to ordinary Python."),
     "PAL210": ("operation operand contract not established", "Supply the exact operand types in the published operation contract; no coercion is implicit."),
     "PAL211": ("return contract not established", "Return the declared recursively exact admitted data or checked callable contract on every completing path."),

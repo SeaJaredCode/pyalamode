@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stages 0 and 1 implemented on branch `sum-types`, merged with M11 (`c668439`) including union encoding; stages 2 and 3 queued.
+Status: stages 0, 1 and 2a implemented on branch `sum-types`, merged with M11 (`c668439`) including union encoding; stage 2b needs a compatibility decision; stage 3 queued.
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -21,7 +21,8 @@ Open unions (structural "anything with this class" sets) stay unsupported. `Opti
 |---|---|---|---|
 | 0 | `oneof` becomes the canonical decorator; `variant` stays an identical transitional alias | M6 | Implemented on `sum-types` |
 | 1 | Closed unions in annotations, values, matches, records, cases, guards and value encoding | M6, M11 | Implemented on `sum-types` |
-| 2 | Full internal rename: identifiers, explain topics, docs, messages, export envelope key, removal of the `variant` alias | M11 committed | Queued |
+| 2a | User-facing rename: README, examples, explain text, CLI summary and PAL130 wording use `oneof`; `variant` is documented as a deprecated alias | M11 | Implemented on `sum-types` |
+| 2b | Format rename: serialized `Variant[...]` contract text, `variant` kinds in baselines, reports and wheel evidence, the export envelope key, version bump, alias removal | Decision on M10 baseline and M11 wheel compatibility | Needs decision |
 | 3 | Open tagged `@oneof(open=True)` with a distribution-scoped case registry | M11 committed, stage 2 | Queued |
 
 Stage order follows the original design note. Closed unions stand alone, unlock `int | None`, and exercise the multi-member value representation. Open tagged work touches registry and policy, so it reviews separately. Stage 2 waits for M11 because the uncommitted M11 tree edits the same checker lines and adds new files (`encoding.py`, `distribution.py`) that name `variant`.
@@ -95,12 +96,18 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 - Tests: `tests/m06_unions.py` adds 18 tests covering the alias, positive flows, refused members, refused operations, coverage, policy, literals, shadowed builtins, payload narrowing, warm-cache freshness after a member domain gains a case, real off/exports/debug builds with rejected guarded inputs, and runtime validation. Two earlier whitelist tests now use still-refused unions (`int | float`, `bool | int`, `tuple[int | list[int]]`) instead of `int | None`.
 - The full suite (419 tests) passes natively on CPython 3.13.1 macOS. One Linux `python:3.13.1-slim` run reported 1 failure in 419 tests before its details could be captured; the rerun was blocked by a Docker Desktop file-sharing hang. Linux verification is outstanding, and that failure is unidentified.
 
-## Stage 2: full rename (after M11)
+## Stage 2: rename
 
-1. Rename runtime and checker internals (`variants.py` to `oneof.py` or kept as a module name, `VariantInfo`, `variant:` schema prefixes, `Variant[...]` serialized text, `selected_variants` report keys, `explain` topics, diagnostics and documentation).
-2. Decide whether the export envelope key moves from `"variant"` to `"oneof"`. That changes the M11 value encoding and its evidence, so it needs its own decision and a reader for the old key if any artifacts already exist.
-3. Remove the `variant` alias once no example, test or fixture uses it.
-4. Bump `CHECKER_VERSION` and `OPERATION_VERSION`, since serialized contract text changes.
+Stage 2a changed only spelling that people read: README, examples, explain text, the CLI gate summary and the PAL130 remediation. Historical milestone, evidence and conformance documents keep `@variant`, because they record what was built and measured. Existing M6 tests keep `@variant`, which exercises the alias until it is removed.
+
+Stage 2b changes formats, so it moves together with one compatibility decision:
+
+1. Serialized contract text `Variant['m:X']` becomes `OneOf['m:X']`. Caches recompute; reviewed M10 baselines that quote contract text need migration or a legacy reader.
+2. The `variant` kind in migration rows, editor symbols, `selected_variants` coverage keys and M11 wheel evidence becomes `oneof`. M10 baseline loading validates kinds, so old baselines need a legacy mapping.
+3. The `{"variant": ...}` export envelope key. Exported data may already exist outside the project, so this needs a reader for the old key or an explicit decision to break it.
+4. `CHECKER_VERSION` and `OPERATION_VERSION` bump, with the previous values registered as legacy if old baselines stay readable.
+5. Remove the `variant` alias and switch the M6 tests to `@oneof`. M12 should merge first if its tests use `@variant`.
+6. Internal names (`variants.py`, `VariantInfo`, `variant:` schema prefixes) can stay. They appear in product file inventories and foundation evidence, and renaming them has no user benefit.
 
 ## Stage 3: open tagged (after M11)
 

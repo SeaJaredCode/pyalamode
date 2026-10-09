@@ -1,7 +1,7 @@
 # mode: fun
-from pyalamode import Map, record, variant, case, value_encode, value_decode
+from pyalamode import Map, record, oneof, case, value_encode, value_decode
 
-@variant
+@oneof
 class InvoiceStatus:
     @case
     class Ready:

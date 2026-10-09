@@ -1,5 +1,5 @@
 # mode: fun
-from pyalamode import variant, case, record, Vector, Option, Some, Nothing
+from pyalamode import oneof, case, record, Vector, Option, Some, Nothing
 from pyalamode import Result, Ok, Err, accumulate, Failure, failure_value
 
 @record
@@ -7,7 +7,7 @@ class User:
     name: str
     tags: Vector[str]
 
-@variant
+@oneof
 class Lookup:
     @case
     class Found:
