@@ -51,6 +51,8 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
   - `case None:`, `case True:`, `case False:`;
   - `case int():`, `case int(n):`, and the same for `bool`, `str`, `bytes`, where the single positional pattern applies to the subject itself;
   - record class patterns and `Domain.Case(...)` patterns, with the existing payload rules;
+  - `case Domain():` for a domain whose cases are all union members. It covers every current and future case of that domain, like a wildcard scoped to it, so `explicit_cases` refuses it for selected domains. It takes no payload patterns. The runtime makes it native: the domain metaclass's `__instancecheck__` is true exactly for the domain's own case classes. On a plain domain subject it is refused; use `_`;
+  - `case Member(...) as name:` binds the narrowed member schema (`int`, the record, the case or the whole domain). The usual rule applies: a capture needs a full, unguarded pattern;
   - literal patterns, which are always partial;
   - a final `_`.
 - Expected coverage is the set of exact runtime classes: each scalar (`bool` contributes `True` and `False`), each record, each case, and every case of each member domain. `bool()` covers both booleans.
@@ -60,7 +62,8 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 - Serialized contracts use the canonical `A | B` text. The cache decoder parses it without evaluating user code.
 
 - Payload narrowing follows the existing M6 rule. `case Point(y=None):` constrains the `Point` case and never exhausts it, so a full `Point` consumer captures `y` and matches it separately, or ends with `_`.
-- Or-patterns, `as` patterns and root captures stay unsupported on union subjects, as on domains.
+- Or-patterns and bare root captures (`case x:`) stay unsupported on union subjects, as on domains.
+- `int | None` and `Option[int]` never unify in either direction. `Option` is tagged and nests; a union is a flat class set.
 
 ### Runtime and guards
 

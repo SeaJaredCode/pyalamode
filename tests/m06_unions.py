@@ -174,6 +174,42 @@ def quoted(v: "bytes | None") -> int:
         self.rejected('@fun\ndef f(v: int | None, int: int) -> int:\n    match v:\n        case int(): return 1\n        case None: return 0\n')
         self.rejected('int = str\n@fun\ndef f(v: str | None) -> int:\n    match v:\n        case int(): return 1\n        case None: return 0\n')
 
+    def test_whole_domain_patterns_and_as_captures(self):
+        self.checked('''@fun
+def radius(s: Shape) -> int:
+    match s:
+        case Shape.Circle(r): return r
+        case Shape.Dot(): return 0
+@fun
+def f(v: Shape | Point | None) -> int:
+    match v:
+        case Shape() as s: return radius(s)
+        case Point() as p: return p.x
+        case None: return 0
+@fun
+def g(v: Shape.Circle | Shape.Dot | int) -> int:
+    match v:
+        case Shape(): return 1
+        case int(n): return n
+@fun
+def h(v: int | str) -> int:
+    match v:
+        case int() as n: return n
+        case str(): return 0
+''')
+        whole = '@fun\ndef f(v: Shape | None) -> int:\n    match v:\n        case Shape(): return 1\n        case None: return 0\n'
+        self.rejected(whole, 'PAL330', policy={'explicit_cases': ['unions:Shape']})
+        self.rejected(whole.replace('case Shape():', 'case Shape(r=1):'), 'PAL330')
+        self.rejected(whole.replace('Shape | None', 'Shape.Circle | None'), 'PAL330')
+        self.rejected('@fun\ndef f(v: Shape) -> int:\n    match v:\n        case Shape(): return 1\n', 'PAL330')
+        self.rejected('@fun\ndef f(v: Point | None) -> int:\n    match v:\n        case Point(x=0) as p: return p.x\n        case _: return 0\n', 'PAL330')
+        self.rejected('@fun\ndef f(v: int | None) -> int:\n    match v:\n        case n: return 0\n', 'PAL330')
+
+    def test_union_and_option_do_not_unify(self):
+        self.rejected('@fun\ndef f(v: int | None) -> Option[int]:\n    return v\n', 'PAL211')
+        self.rejected('@fun\ndef f(v: Option[int]) -> int | None:\n    return v\n', 'PAL211')
+        self.rejected('@fun\ndef f() -> int | None:\n    return Some(1)\n', 'PAL211')
+
     def test_narrowing_inside_payload_does_not_exhaust_it(self):
         self.rejected('@fun\ndef f(p: Point) -> int:\n    match p:\n        case Point(y=None): return 0\n        case Point(y=int(n)): return n\n', 'PAL330')
         self.checked('@fun\ndef f(p: Point) -> int:\n    match p:\n        case Point(y=None): return 0\n        case _: return 1\n')
@@ -200,7 +236,7 @@ class UnionProjects(unittest.TestCase):
             self.assertEqual(failing, {'consumer.py'})
 
     def test_build_off_exports_debug_real_runs(self):
-        source = IMPORTS + DECLARATIONS + SCALAR + MIXED
+        source = IMPORTS + DECLARATIONS + SCALAR + MIXED + '@fun\ndef whole(v: Shape | int) -> int:\n    match v:\n        case Shape() as s: return 100\n        case int(n): return n\n'
         for mode in ['off', 'exports', 'debug']:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
@@ -213,7 +249,8 @@ class UnionProjects(unittest.TestCase):
                 module = 'unions' if mode == 'off' else 'pyalamode_exports.unions'
                 script = ('from unions import Shape, Point\nfrom ' + module + ' import describe, area\n'
                           'assert (describe(4), describe("x"), describe(None)) == (4, 1, 0)\n'
-                          'assert (area(Shape.Circle(3)), area(Shape.Dot()), area(Point(5, None)), area(None)) == (3, 0, 5, -1)\n')
+                          'assert (area(Shape.Circle(3)), area(Shape.Dot()), area(Point(5, None)), area(None)) == (3, 0, 5, -1)\n'
+                          'from unions import whole\nassert (whole(Shape.Dot()), whole(Shape.Circle(1)), whole(7)) == (100, 100, 7)\n')
                 env = {**os.environ, 'PYTHONPATH': str(output) + os.pathsep + str(Path(__file__).resolve().parents[1])}
                 run = subprocess.run([sys.executable, '-c', script], cwd=output, env=env, capture_output=True, text=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
@@ -239,6 +276,9 @@ class UnionRuntime(unittest.TestCase):
             class Filled:
                 value: Pair | None
 
+        self.assertTrue(isinstance(Slot.Filled(None), Slot))
+        self.assertFalse(isinstance(Pair(1), Slot))
+        self.assertFalse(isinstance(Slot, Slot))
         self.assertEqual(Pair(None).left, None)
         self.assertEqual(Slot.Filled(Pair(1, b'z')).value.right, b'z')
         for bad in [lambda: Pair('x'), lambda: Pair(True), lambda: Pair(1, 2), lambda: Slot.Filled(3)]:

@@ -3529,6 +3529,15 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return member
             return None
 
+        if isinstance(pattern, ast.MatchAs) and pattern.pattern is not None and pattern.name:
+            # `case Member(...) as name:` binds the narrowed member, never the whole union.
+            tag, complete = self._union_pattern(pattern.pattern, schema, captures)
+            narrowed = self._union_narrowed(pattern.pattern, schema)
+            if pattern.name in captures:
+                self.emit("PAL330", pattern, "a pattern capture name appears twice")
+            if narrowed is not None:
+                captures[pattern.name] = self.annotation_value(str(narrowed))
+            return tag, complete
         if isinstance(pattern, ast.MatchSingleton):
             kind = "None" if pattern.value is None else "bool"
             if kind not in members:
@@ -3557,6 +3566,20 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     _, complete = self._pattern(pattern.patterns[0], members[kind], captures)
                 return ("bool" if kind == "bool" else kind), complete
             reference = self.graph.reference(self, pattern.cls)
+            domain = self.graph.oneofs.get(reference)
+            if domain is not None:
+                # `case Domain():` covers every current and future case of that domain.
+                classes = {case.identity for case in domain.cases.values()}
+                occupied = set().union(*(self.union_classes(member) or set() for member in schema.arguments))
+                if not domain.valid or reference in self.graph.replaced_oneofs or not classes <= occupied:
+                    self.emit("PAL330", pattern, "whole-domain pattern requires an unchanged @oneof domain whose cases are all union members")
+                    return None, False
+                if pattern.patterns or pattern.kwd_patterns:
+                    self.emit("PAL330", pattern, "whole-domain pattern takes no payload patterns; match its cases to read fields")
+                    return None, False
+                if domain.module + ":" + domain.node.name in self.policy.get("explicit_cases", []):
+                    self.emit("PAL330", pattern, "project explicit_cases policy requires each case of this domain to be matched explicitly")
+                return frozenset(classes), True
             case_info = self.graph.cases.get(reference)
             record_info = self.graph.records.get(reference)
             classes = {case_info.identity} if case_info else {record_info.identity} if record_info else {"Record['pyalamode:Failure']"} if reference == "foundation:pyalamode:Failure" else set()
@@ -3567,6 +3590,21 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return self._pattern(pattern, member, captures)
         self.emit("PAL330", pattern, "pattern has no characterized finite dispatch/binding contract")
         return None, False
+
+    def _union_narrowed(self, pattern, schema):
+        """The exact member schema a successful union pattern establishes, if any."""
+        if isinstance(pattern, ast.MatchSingleton):
+            return TypeSpec("None" if pattern.value is None else "bool")
+        if not isinstance(pattern, ast.MatchClass):
+            return None
+        if isinstance(pattern.cls, ast.Name) and pattern.cls.id in {"bool", "int", "str", "bytes"} and TypeSpec(pattern.cls.id) in schema.arguments:
+            return TypeSpec(pattern.cls.id)
+        reference = self.graph.reference(self, pattern.cls)
+        if reference in self.graph.oneofs or reference in self.graph.cases or reference in self.graph.records:
+            return self.graph.types.get(reference)
+        if reference == "foundation:pyalamode:Failure":
+            return TypeSpec("record:pyalamode:Failure")
+        return None
 
     def _match_statement(self, node, env):
         subject = self._expr(node.subject, env)
@@ -3602,7 +3640,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             is_wildcard = isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.pattern.name is None
             if captures and (not complete or case.guard is not None):
                 self.emit("PAL330", case.pattern, "failed partial/guarded patterns cannot establish fresh capture initialization")
-            if isinstance(case.pattern, ast.MatchAs) and case.pattern.name:
+            if isinstance(case.pattern, ast.MatchAs) and case.pattern.name and (case.pattern.pattern is None or schema.name != "union"):
                 self.emit("PAL330", case.pattern, "root named capture is outside explicit finite dispatch; use class patterns or explicit _")
             branch = dict(env)
             for name, value in captures.items():
@@ -3617,7 +3655,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     self.emit("PAL210", case.guard, "pattern guard requires exact bool")
                 guard_true = guard.literal is True
             if (complete or schema.name == "bool" and isinstance(case.pattern, ast.MatchSingleton)) and (not guarded or guard_true) and tag:
-                coverage.update({"True", "False"} if tag == "bool" else {tag})
+                coverage.update(tag if isinstance(tag, frozenset) else {"True", "False"} if tag == "bool" else {tag})
             if is_wildcard and (not guarded or guard_true):
                 wildcard = True
                 if index != len(node.cases) - 1:

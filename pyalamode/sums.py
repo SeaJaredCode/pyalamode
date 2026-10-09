@@ -220,6 +220,12 @@ class _DomainType(type):
     def __delattr__(cls, name):
         raise AttributeError("closed domain namespace cannot be deleted")
 
+    def __instancecheck__(cls, instance):
+        # Native `case Domain():` matches exactly the domain's own case classes.
+        info = _oneof_info(cls)
+        kind = type(instance)
+        return info is not None and any(kind is case for case, _ in info[2])
+
 
 def oneof(cls):
     """Seal a declaration-only namespace with its exact nested case set."""
