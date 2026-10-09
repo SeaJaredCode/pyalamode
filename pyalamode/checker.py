@@ -216,7 +216,9 @@ class ScalarAnalyzer:
         self.result.diagnostics.append(diagnostic(
             rule, self.path, reason, line=getattr(node, "lineno", 1),
             column=getattr(node, "col_offset", 0) + 1, boundary=self.boundary, origin=origin,
-            first_binding=f"{self.path}:{first}" if first is not None else None))
+            first_binding=f"{self.path}:{first}" if first is not None else None,
+            end_line=getattr(node, "end_lineno", None),
+            end_column=getattr(node, "end_col_offset", -1) + 1 if getattr(node, "end_col_offset", None) is not None else None))
 
     def _stable(self, name: str, imported: ast.AST) -> bool:
         return self.global_writes.get(name) == [imported]
@@ -244,7 +246,7 @@ class ScalarAnalyzer:
             tree = ast.parse(self.source, filename=self.path, feature_version=(3, 13))
         except (SyntaxError, ValueError) as error:
             self.result.diagnostics.append(diagnostic("PAL001", self.path, str(error),
-                                          line=getattr(error, "lineno", 1) or 1))
+                                          line=getattr(error, "lineno", 1) or 1, column_encoding="unicode-codepoints"))
             return self.result
         self.global_writes = _written_names(tree.body)
         for node in ast.walk(tree):
@@ -874,17 +876,26 @@ def _product_source(name: str, path: Path) -> bool:
     return name in files and path == Path(__file__).resolve().parent / files[name]
 
 
-def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | None = None) -> tuple[dict[str, str], list]:
+def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | None = None,
+                 overlays: dict[str, str] | None = None, read_root: Path | None = None) -> tuple[dict[str, str], list]:
     """Read selected files and resolvable local imports, including package initialization."""
     sources: dict[str, str] = {}
     errors = []
     queue = list(paths)
     while queue:
         path = queue.pop(0).resolve()
+        if read_root is not None and not path.is_relative_to(read_root):
+            errors.append(diagnostic("PAL001", str(read_root), "editor source resolves outside workspace; refused before reading", origin="editor source ownership"))
+            continue
         if str(path) in sources:
             continue
         try:
-            raw = path.read_bytes()
+            if overlays and str(path) in overlays:
+                text = overlays[str(path)]
+                encoding, _ = tokenize.detect_encoding(io.BytesIO(text.encode("utf-8")).readline)
+                raw = text.encode(encoding)
+            else:
+                raw = path.read_bytes()
             encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
             source = raw.decode(encoding)
             if raw_sources is not None:
@@ -893,7 +904,7 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
             tree = ast.parse(source, filename=str(path), feature_version=(3, 13))
         except (OSError, UnicodeError, SyntaxError, ValueError) as error:
             errors.append(diagnostic("PAL001", str(path), f"cannot read/parse source: {error}",
-                                     line=getattr(error, "lineno", 1) or 1))
+                                     line=getattr(error, "lineno", 1) or 1, column_encoding="unicode-codepoints"))
             continue
         module = _module_name(str(path), root)
         for node in ast.walk(tree):
@@ -926,10 +937,18 @@ class SourceGraph:
         self.records: dict[str, RecordInfo] = {}
         self.variants: dict[str, VariantInfo] = {}
         self.cases: dict[str, RecordInfo] = {}
+        self.record_declarations: list[RecordInfo] = []
+        self.variant_declarations: list[VariantInfo] = []
         for path, source in sources.items():
             analyzer = FunctionalAnalyzer(source, path, "audit" if audit else "strict", policy, self)
             self.analyzers[path] = analyzer
-            self.modules[_module_name(path, root)] = analyzer
+            module = _module_name(path, root)
+            # Full-project discovery can select both name.py and name/__init__.py.
+            # Match ordinary CPython package-before-module resolution rather than
+            # allowing input ordering to choose an imported namespace.
+            resolved = _local_path(root, module)
+            if module not in self.modules or resolved == Path(path).resolve():
+                self.modules[module] = analyzer
         for analyzer in self.analyzers.values():
             analyzer.prepare()
             for error in self.integration_snapshot["errors"]:
@@ -939,6 +958,9 @@ class SourceGraph:
             analyzer.discover_records()
         for analyzer in self.analyzers.values():
             analyzer.discover_variants()
+        # Case lookup follows the chosen domain, including disjoint tag names;
+        # shadow declarations remain reportable but cannot extend that catalog.
+        self.cases = {case.identity: case for domain in self.variants.values() for case in domain.cases.values()}
         self.replaced_functions: set[str] = set()
         self.replaced_records: set[str] = set()
         self.replaced_variants: set[str] = set()
@@ -1119,9 +1141,9 @@ class SourceGraph:
                 self.replaced_foundations.add(("pyalamode", family))
         # Replacement identities must be established before annotation admission;
         # all signatures still precede bodies, including recursive components.
-        for variant_info in self.variants.values():
+        for variant_info in self.variant_declarations:
             variant_info.analyzer.prepare_variant(variant_info)
-        for record_info in self.records.values():
+        for record_info in self.record_declarations:
             record_info.analyzer.prepare_record(record_info)
         for info in self.functions.values():
             info.analyzer.declare_effects(info)
@@ -1602,15 +1624,15 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         self.parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         doc = tree.body[0] if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant) and type(tree.body[0].value.value) is str else None
         first = tree.body[1] if doc and len(tree.body) > 1 else (tree.body[0] if not doc and tree.body else None)
-        directives = [t for t in tokenize.generate_tokens(io.StringIO(self.source).readline)
+        directives = [t for t in tokenize.generate_tokens(io.StringIO(self.source, newline=None).readline)
                       if t.type == tokenize.COMMENT and t.string.strip() == "# mode: fun"]
-        for token in tokenize.generate_tokens(io.StringIO(self.source).readline):
+        for token in tokenize.generate_tokens(io.StringIO(self.source, newline=None).readline):
             if token.type == tokenize.COMMENT and token.string.strip().startswith("# mode:") and token.string.strip() != "# mode: fun":
                 self.result.diagnostics.append(diagnostic("PAL121", self.path, "the only supported directive is the module header # mode: fun; region toggles are unsupported", line=token.start[0]))
         valid = False
         for token in directives:
             if token.start[1] != 0 or (doc and token.start[0] <= doc.end_lineno) or (first and token.start[0] >= first.lineno) or valid:
-                self.result.diagnostics.append(diagnostic("PAL121", self.path, "module directive must occur once in the module header after any docstring", line=token.start[0], column=token.start[1] + 1))
+                self.result.diagnostics.append(diagnostic("PAL121", self.path, "module directive must occur once in the module header after any docstring", line=token.start[0], column=token.start[1] + 1, column_encoding="unicode-codepoints"))
             else:
                 valid = True
         relative = _module_name(self.path, self.graph.root)
@@ -1906,7 +1928,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         for node in self.tree.body:
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d, {"record"}) for d in node.decorator_list):
                 info = RecordInfo(node, self, _module_name(self.path, self.graph.root))
-                self.graph.records[info.identity] = info
+                self.graph.record_declarations.append(info)
+                if info.identity not in self.graph.records or self.graph.modules.get(info.module) is self:
+                    self.graph.records[info.identity] = info
                 self.graph.types[info.identity] = info.schema
                 self.symbols[node.name] = Symbol("record", info.identity, node)
 
@@ -1918,7 +1942,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 self.emit("PAL120", node, "@case declarations are supported only inside a closed @variant domain")
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"variant"}) for d in node.decorator_list):
                 info = VariantInfo(node, self, _module_name(self.path, self.graph.root))
-                self.graph.variants[info.identity] = info
+                self.graph.variant_declarations.append(info)
+                if info.identity not in self.graph.variants or self.graph.modules.get(info.module) is self:
+                    self.graph.variants[info.identity] = info
                 self.graph.types[info.identity] = TypeSpec("variant:" + info.module + ":" + node.name)
                 self.symbols[node.name] = Symbol("variant", info.identity, node)
                 for member in node.body:
@@ -1941,6 +1967,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         self.definition_mode, self.constant_limit, self.failures = True, info.node.lineno, set()
         before = len(self.result.diagnostics)
         node = info.node
+        if self.graph.variants.get(info.identity) is not info:
+            self.emit("PAL241", node, "closed domain declaration conflicts with the canonical package/module schema; shadowed nominal declarations are unverified", origin="nominal import resolution")
         if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not self._primitive_identity(node.decorator_list[0], {"variant"}):
             self.emit("PAL120", node, "domains require only @variant, nested fixed @case declarations and no bases/metaclass/generic behavior")
         if not self._symbol_stable(node.name, self.symbols[node.name]) or info.identity in self.graph.replaced_variants:
@@ -2021,6 +2049,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         self.active, self.boundary, self.locals = None, node.name, set()
         self.definition_mode, self.constant_limit, self.failures = True, node.lineno, info.failures
         before = len(self.result.diagnostics)
+        if self.graph.records.get(info.identity) is not info:
+            self.emit("PAL241", node, "record declaration conflicts with the canonical package/module schema; shadowed nominal declarations are unverified", origin="nominal import resolution")
         if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not self._primitive_identity(node.decorator_list[0], {"record"}):
             self.emit("PAL120", node, "record declarations require only @record, fixed fields, no bases, metaclass or generic parameters")
         if not self._symbol_stable(node.name, self.symbols[node.name]) or info.identity in self.graph.replaced_records:
@@ -3843,7 +3873,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
 
     def finish(self):
         self.result.records = []
-        for info in self.graph.records.values():
+        for info in self.graph.record_declarations:
             if info.analyzer is not self:
                 continue
             admitted = info.valid and self.result.mode == "strict" and not self.result.diagnostics
@@ -3870,7 +3900,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                                        "Allocation identity, arbitrary formatting/hashing and unsupported hooks are outside strict record operations."],
                 "equivalence": "exact record type and recursively equivalent fields in declaration order"})
         self.result.variants = []
-        for info in self.graph.variants.values():
+        for info in self.graph.variant_declarations:
             if info.analyzer is not self:
                 continue
             admitted = info.valid and self.result.mode == "strict" and not self.result.diagnostics

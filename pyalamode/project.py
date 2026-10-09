@@ -71,6 +71,108 @@ class ProjectResult:
                 "claim_scope": "Selected functions, record/variant declarations, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
 
 
+@dataclass
+class ProjectSnapshot:
+    """Read-only captured full-project evidence, including explicit unsaved provenance."""
+    result: ProjectResult
+    sources: dict[str, str]
+    inputs: dict
+    freshness: str
+    snapshot: str
+    graph: SourceGraph | None = field(default=None, repr=False)
+
+
+def _policy_identity(root):
+    path = root / "pyproject.toml"
+    if path.exists() and not path.resolve().is_relative_to(root):
+        raise ValueError("editor project policy resolves outside workspace; refused before reading")
+    return hashlib.sha256(path.resolve().read_bytes()).hexdigest() if path.exists() else None
+
+
+def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=True,
+                   overlays=None) -> ProjectSnapshot:
+    """Use the same policy/resolution/writer/approval/guard engine as check/build.
+
+    Overlays are existing project-local .py files with decoded text and versions.
+    This captures evidence about those buffers, never a disk build certificate.
+    """
+    project_root = Path(root or Path.cwd()).resolve()
+    selected = list(paths or [project_root])
+    normalized = {}
+    errors = []
+    if any(not Path(path).resolve().is_relative_to(project_root) for path in selected):
+        errors.append(diagnostic("PAL001", str(project_root), "editor source selection resolves outside workspace; refused before reading", origin="editor source ownership"))
+    for path, entry in (overlays or {}).items():
+        candidate = Path(path).resolve()
+        if (not candidate.is_relative_to(project_root) or not candidate.is_file() or candidate.suffix != ".py"
+                or type(entry) is not dict or set(entry) != {"text", "version"}
+                or type(entry.get("text")) is not str or type(entry.get("version")) is not int
+                or entry["version"] < 0):
+            errors.append(diagnostic("PAL001", str(candidate), "editor overlay requires existing project-local Python source, decoded text and nonnegative integer version", origin="editor snapshot"))
+        else:
+            normalized[str(candidate)] = entry
+    captured = {}
+    products = foundation_identities()
+    try:
+        policy_hash = _policy_identity(project_root)
+        overlay_disk = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in normalized}
+        if (project_root / "pyproject.toml").exists() and not (project_root / "pyproject.toml").resolve().is_relative_to(project_root):
+            errors.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), "editor project policy resolves outside workspace", origin="editor snapshot"))
+        if errors:
+            result = ProjectResult(tooling=errors, audit=audit)
+        else:
+            result = check_paths(selected, root=project_root, audit=audit, target=target, cache=cache,
+                                 _overlays={path: entry["text"] for path, entry in normalized.items()}, _capture=captured, _read_root=project_root)
+        raw_sources = captured.get("raw_sources", {})
+        source_inputs = {path: {"sha256": hashlib.sha256(raw).hexdigest(),
+                               "origin": "overlay" if path in normalized else "disk",
+                               "version": normalized[path]["version"] if path in normalized else None,
+                               "disk_sha256": overlay_disk[path] if path in normalized else hashlib.sha256(raw).hexdigest()}
+                         for path, raw in raw_sources.items()}
+        inputs = {"root": str(project_root), "paths": [str(Path(p).resolve()) for p in selected],
+                  "audit": audit, "target": target, "sources": source_inputs, "policy_sha256": policy_hash,
+                  "product_artifacts": products,
+                  "integration_inputs": captured.get("integration_snapshot", {}).get("inputs", {})}
+        stale = []
+        for path, entry in source_inputs.items():
+            if not Path(path).is_relative_to(project_root):
+                stale.append("source resolves outside workspace: " + path)
+            elif hashlib.sha256(Path(path).read_bytes()).hexdigest() != entry["disk_sha256"]:
+                stale.append("source changed during snapshot: " + path)
+        if policy_hash != _policy_identity(project_root):
+            stale.append("policy changed during snapshot")
+        if products != foundation_identities():
+            stale.append("product bytes changed during snapshot")
+        if "selected_paths" in captured:
+            final_paths, final_errors = discover_paths(selected, project_root)
+            if final_errors or [str(path) for path in final_paths] != captured["selected_paths"]:
+                stale.append("source selection/import resolution changed during snapshot")
+        if "integration_snapshot" in captured:
+            policy, policy_error = load_policy(project_root)
+            current = integration_snapshot(policy, project_root)
+            if policy_error or current["errors"] or current["inputs"] != inputs["integration_inputs"]:
+                stale.append("integration identity/approval changed during snapshot")
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        result = ProjectResult(tooling=[diagnostic("PAL001", str(project_root), "cannot capture editor project snapshot: " + str(error), origin="editor snapshot")], audit=audit)
+        inputs = {"root": str(project_root), "paths": [str(p) for p in selected], "audit": audit, "target": target,
+                  "sources": {}, "policy_sha256": None, "product_artifacts": products, "integration_inputs": {}}
+        stale = ["snapshot input capture failed"]
+    freshness = "current overlay snapshot; unsaved" if normalized else "current disk snapshot"
+    if stale:
+        freshness = "stale; recheck required"
+        result.tooling.extend(diagnostic("PAL001", str(project_root), reason, origin="editor freshness") for reason in stale)
+        for file in result.results:
+            file.diagnostics.append(diagnostic("PAL001", file.path, "editor snapshot is stale; recheck required", origin="editor freshness"))
+            for declaration in [*file.records, *file.variants]:
+                declaration["source_evidence"] = "unverified: stale editor snapshot"
+            for contract in file.contracts:
+                contract.source_evidence = "unverified: stale editor snapshot"
+                contract.freshness = "stale; recheck required"
+                contract.behavior = "unverified behavior; no certified effect bound"
+    key = hashlib.sha256(json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return ProjectSnapshot(result, captured.get("sources", {}), inputs, freshness, key, captured.get("graph"))
+
+
 def runtime_error(target: str = TARGET) -> str | None:
     if target != TARGET:
         return f"unsupported requested target {target}; published target is {TARGET}"
@@ -92,12 +194,14 @@ def sysconfig_free_threaded() -> bool:
     return "t" in sys.abiflags
 
 
-def load_policy(root: Path) -> tuple[dict, str | None]:
+def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | None]:
     path = root / "pyproject.toml"
     if not path.exists():
         return {}, None
+    if read_root is not None and not path.resolve().is_relative_to(read_root):
+        return {}, "editor project policy resolves outside workspace; refused before reading"
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
+        data = tomllib.loads(path.resolve().read_text(encoding="utf-8"))
         tool = data.get("tool", {})
         if not isinstance(tool, dict):
             return {}, "pyproject tool must be a table"
@@ -210,18 +314,21 @@ def _cache_write(cache: Path, result: CheckResult) -> None:
 
 
 def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | None = None,
-                audit: bool = False, target: str = TARGET, cache: bool = True) -> ProjectResult:
+                audit: bool = False, target: str = TARGET, cache: bool = True,
+                _overlays=None, _capture=None, _read_root=None) -> ProjectResult:
     started = time.perf_counter()
     project_root = Path(root or Path.cwd()).resolve()
     result = ProjectResult(audit=audit)
     error = runtime_error(target)
     if error:
         result.tooling.append(diagnostic("PAL002", str(project_root), error, origin="runtime target"))
-    policy, error = load_policy(project_root)
+    policy, error = load_policy(project_root, _read_root)
     result.boundary_guards = policy.get("boundary_guards", "off")
     if error:
         result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), error, origin="project policy"))
     files, errors = discover_paths(paths or [], project_root)
+    if _capture is not None:
+        _capture["selected_paths"] = [str(path) for path in files]
     result.tooling.extend(errors)
     if result.tooling:
         result.elapsed_seconds = time.perf_counter() - started
@@ -229,12 +336,16 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     cache_path = project_root / ".pyalamode-cache"
     cache_policy = {**policy, "analysis_mode": "audit" if audit else "strict", "platform": sys.platform}
     raw_sources = {}
-    sources, errors = load_sources(files, project_root, raw_sources)
+    sources, errors = load_sources(files, project_root, raw_sources, _overlays, _read_root)
+    if _capture is not None:
+        _capture.update(sources=sources, raw_sources=raw_sources)
     result.tooling.extend(errors)
     if errors:
         result.elapsed_seconds = time.perf_counter() - started
         return result
     integrations = integration_snapshot(policy, project_root)
+    if _capture is not None:
+        _capture["integration_snapshot"] = integrations
     result.integration_catalog, result.integration_approvals = integrations["catalog"], integrations["approvals"]
     if integrations["errors"]:
         result.tooling.extend(diagnostic("PAL001", str(project_root), error, origin="integration manifests") for error in integrations["errors"])
@@ -242,6 +353,8 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         return result
     dependencies = _source_dependencies(sources, project_root)
     graph = SourceGraph(sources, project_root, audit, {**cache_policy, "_integration_snapshot": integrations})
+    if _capture is not None:
+        _capture["graph"] = graph
     contexts = {path: graph.binding_context(path, dependencies[path]) for path in sources}
     external_inputs = {path: graph.integration_context(path, dependencies[path]) for path in sources}
     keys = {path: fingerprint(raw_sources[path], {**cache_policy, "path": path,

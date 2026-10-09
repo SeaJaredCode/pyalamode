@@ -1,0 +1,24 @@
+Copy core.py to an isolated project before trying these intentional violations.
+Replace quote's body with this straight-line reassignment:
+
+    subtotal = discounted(cents, discount_cents)
+    total = subtotal
+    total = total + 200
+    return total
+
+PAL101 shows the original binding and the second assignment. The bounded preview
+renames the second target and later reads; its RHS continues to read the old total.
+Review the diff and make the edit intentionally. Then recheck the saved project.
+
+Replace added's body with:
+
+    values.appended(value)
+    return values
+
+PAL250 explains that the persistent update returns a new value. Its preview binds
+that result to a fresh unused name and keeps return values unchanged. Decide which
+value the calculation should return; the preview does not make that choice for you.
+
+Unknown operations, closures, branches, effect/trust policy changes and snapshots
+receive explanations without a fabricated safe preview. The protocol never applies
+edits or grants permission/trust. Target-user repair usefulness is UNMEASURED.

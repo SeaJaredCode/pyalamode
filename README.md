@@ -1,6 +1,6 @@
 # Pyalamode
 
-Pyalamode checks a functional core in ordinary Python. The current M7 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, characterized failure handlers, and a bounded standard toolkit for text, integers, UTF-8/hex, eager scan/grouping, composition, partial application and Result traversal. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
+Pyalamode checks a functional core in ordinary Python. The current M9 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, characterized failure handlers, and a bounded standard toolkit for text, integers, UTF-8/hex, eager scan/grouping, composition, partial application and Result traversal, reviewed exact installed external operations, and local editor diagnostics, contracts, authored navigation and read-only repair previews. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
 The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux**, with native filesystem encoding `utf-8` and errors `surrogateescape` (`cpython-3.13.1`). Reports/cache inputs record the observed encoding, error mode and UTF-8 mode. Other native filesystem configurations, patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Ordinary live IO/environment setup checks the same filesystem condition. Installation under another Python 3.13 patch does not establish compatibility.
 
@@ -25,6 +25,8 @@ pyalamode check examples/domains --no-cache
 python -m examples.domains.demo
 pyalamode check examples/standard --no-cache
 python -m examples.standard.demo
+pyalamode check examples/editor --no-cache
+python -m examples.editor.demo
 ```
 
 The scalar example prints `1300` and `0`. The module example prints `1500`, `6`, `6`, and `2`. Its checked core uses stable imports, defaults, a closure, a recursive calculation, and tuple inputs; its ordinary demo prints those results without receiving a purity claim.
@@ -286,6 +288,24 @@ guarded_exports = ["examples.records.core:tag_customer"]
 Build then provides the guarded public alias `pyalamode_exports.examples.records.core:tag_customer`, imported normally with `from pyalamode_exports.examples.records.core import tag_customer`. It validates exact supported arguments before the original body and returned data afterward. Original-module functions remain unwrapped and unguarded in exports mode; checked internal calls use those originals. Guards are off by default and do not freeze inputs, prove effects/ownership/callback purity, or monitor dependency tampering. Selected Callable, Effectful and live capability boundaries are refused. Unknown, ambiguous, duplicate and conflicting selections fail.
 
 `boundary_guards = "debug"` additionally inserts supported exact data assertions at selected function parameters, local bindings and returns in copied source. Reports list coverage; callable evidence obligations remain. Debug assertions add repeated traversal and ordinary import/allocation overhead. The [M4 handoff](Docs/milestones/04-records.md) and [runtime contract](Docs/evidence/m04-runtime-contract.md) publish guard behavior, costs, snapshot preconditions, adapter limits and evidence.
+
+## Local editor
+
+The [local VS Code client](editors/vscode/README.md) uses the same full-project engine as check/build. Install Pyalamode into the supported interpreter's environment, then set `pyalamode.pythonPath` in User settings to its absolute path, such as `/Volumes/Projects/pyalamode/.venv/bin/python`, and open one trusted local workspace. The client preserves that virtual environment path and launches with Python isolation (`-I`) without a shell, so workspace packages and `PYTHONPATH` cannot replace the server at interpreter startup. Install the finite local VSIX using the client guide, or use its extension development command; no Marketplace service is needed.
+
+Problems display shared rule IDs, authored ranges and first bindings. Hover and **Pyalamode: Inspect Project Contracts** show participating boundaries, exact/inferred data and callable contracts, declared/required effects and origins, transitive trust, separate failures/initialization and guard coverage. Definitions/references cover participating declarations and actual checked-call edges; unsupported targets have no guessed destination. **Explain Rule or Operation** accepts rule/catalog names or an exact `module:qualified.function` authored selector. The same selector works with `pyalamode explain core:quote --root /path/to/project`.
+
+Open files supply full-text versioned overlays, including dependency buffers. The server refreshes policy, source/import resolution, analyzed writers and current external identities/expiry at each observation. Reports distinguish unsaved overlay evidence from disk evidence; closing restores disk analysis. This server performs fresh body analysis and makes no incremental-body-reuse claim. Changed product bytes require restarting the loaded server. Tooling/stale failures keep both project and file-level claims unverified.
+
+An eligible code action opens a read-only before/after diff with its source version, full input snapshot, checked candidate and limits. A finite straight-line reassignment preview keeps the second assignment's old-value RHS and renames subsequent reads. A discarded persistent-update preview binds the new value while retaining the original return; choose intentionally how the calculation should use it. Source and policy bytes stay unchanged until you make an edit. No preview adds effects, approvals, ignored errors, conversions or handlers. Closures, branches, aliases, callbacks, capabilities and other unsupported changes receive explanations without a fabricated safe rewrite.
+
+**Open Authored Guard Boundary** validates a local built artifact's actual selected source/facade hashes, coverage and current source/policy/dependency fingerprint, then opens the original compatible declaration or supported debug assertion. It neither runs the artifact nor treats an arbitrary exception string as evidence. The stdio server is also available directly:
+
+```sh
+/absolute/environment/bin/python -I -m pyalamode.editor --stdio --root /absolute/project
+```
+
+This command requires Pyalamode installed in that environment and speaks bounded LSP-style JSON-RPC frames on stdin/stdout. The installed console command `pyalamode editor --stdio --root /absolute/project` is also available under ordinary Python startup assumptions; it does not add interpreter isolation. The [M9 handoff](Docs/milestones/09-editor.md) specifies supported methods, UTF-16 ranges, producer coordinate metadata, provenance, freshness and preview limits. Copy [the editor core](examples/editor/core.py) into an isolated project and use [the repair cases](examples/editor/repair-cases.txt) for a feedback walkthrough. The ordinary demo prints `1300`, `Vector.of(1, 2)` and `Vector.of(1, 2, 3)`. Target-user editor repair usefulness and authoring time remain **UNMEASURED**, with zero participants/attempts; translated-source navigation remains the M14 gate.
 
 ## Check, build, and inspect
 

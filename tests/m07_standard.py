@@ -345,7 +345,7 @@ def f(s:str)->str:
                 self.assertEqual(build.returncode,0,build.stdout+build.stderr)
                 report=json.loads(build.stdout)
                 self.assertEqual(report["standard_operation_version"],"pyalamode.standard-v1")
-                self.assertEqual(len(report["product_artifacts"]),16)
+                self.assertEqual(len(report["product_artifacts"]),17)
                 module="pyalamode_exports.core" if mode=="exports" else "core"
                 run=subprocess.run([sys.executable,"-c",f"from {module} import f;print(f('1,2,3'))"],cwd=output,capture_output=True,text=True)
                 self.assertEqual(run.returncode,0,run.stderr)

@@ -1,0 +1,26 @@
+{
+  "name": "pyalamode-local",
+  "publisher": "pyalamode-local",
+  "displayName": "Pyalamode Local",
+  "description": "Shared local Python checker diagnostics, contracts and read-only previews.",
+  "version": "0.1.0",
+  "engines": {"vscode": "^1.139.0"},
+  "main": "./extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onLanguage:python"],
+  "capabilities": {"untrustedWorkspaces": {"supported": false}, "virtualWorkspaces": false},
+  "contributes": {
+    "configuration": {"title": "Pyalamode", "properties": {
+      "pyalamode.pythonPath": {"type": "string", "default": "", "scope": "machine", "description": "Absolute supported Python interpreter path. Preserve the virtual environment path."}
+    }},
+    "commands": [
+      {"command": "pyalamode.refresh", "title": "Pyalamode: Refresh Diagnostics"},
+      {"command": "pyalamode.restart", "title": "Pyalamode: Restart Local Server"},
+      {"command": "pyalamode.contracts", "title": "Pyalamode: Inspect Project Contracts"},
+      {"command": "pyalamode.explain", "title": "Pyalamode: Explain Rule or Operation"},
+      {"command": "pyalamode.preview", "title": "Pyalamode: Preview Proposed Repair"},
+      {"command": "pyalamode.guardLocation", "title": "Pyalamode: Open Authored Guard Boundary"}
+    ]
+  },
+  "scripts": {"test": "node --test test/client.test.js"}
+}
