@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyalamode"
+version = "0.1.0"
+description = "A closed, static functional subset of ordinary Python"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+classifiers = ["Programming Language :: Python :: 3.13"]
+
+[project.scripts]
+pyalamode = "pyalamode.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pyalamode*"]
