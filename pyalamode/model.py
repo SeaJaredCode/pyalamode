@@ -6,10 +6,10 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "migration-team-policy-10.0"
+CHECKER_VERSION = "checked-distribution-11.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-ops-11"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -22,7 +22,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -47,6 +47,9 @@ RULES = {
     "PAL350": ("external operation approval is not current", "Review the exact operation contract and installed dependency identity, then record explicit owner/rationale/provenance approval within its expiry; drafts and stale approvals cannot admit."),
     "PAL351": ("unsafe ordinary adapter declaration unsupported", "Use an ordinary @unsafe(scope=nonempty_text,rationale=nonempty_text) adapter outside participating code; explicitly snapshot and validate output before a new checked computation."),
     "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
+    "PAL370": ("checked dependency evidence not current", "Rebuild and reinstall the exact checked distribution, then check under current consumer policy."),
+    "PAL371": ("checked export unavailable", "Use an explicitly published current strict export of the declared checked dependency."),
+    "PAL372": ("installed dependency changed during gate", "Restore stable installed inputs and recheck before building."),
     "PAL360": ("new reviewed audit debt", "Review each new normalized finding; fixing other debt does not offset it."),
     "PAL361": ("strict coverage requirement failed", "Restore the selected boundary or satisfy the exact current required export."),
     "PAL362": ("new external trust assumption", "Review the actual operation, contract and installed dependency identities."),
@@ -72,6 +75,7 @@ class Diagnostic:
     end_line: int | None = None
     end_column: int | None = None
     column_encoding: str = "utf-8-bytes"
+    dependency_context: dict | None = None
 
     def format(self) -> str:
         first = f"\n  first binding: {self.first_binding}" if self.first_binding else ""
@@ -166,6 +170,6 @@ class CheckResult:
 def diagnostic(rule: str, path: str, reason: str, *, line: int = 1,
                column: int = 1, boundary: str = "<module>", origin: str = "static source",
                first_binding: str | None = None, end_line: int | None = None,
-               end_column: int | None = None, column_encoding: str = "utf-8-bytes") -> Diagnostic:
+               end_column: int | None = None, column_encoding: str = "utf-8-bytes", dependency_context: dict | None = None) -> Diagnostic:
     return Diagnostic(rule, path, line, column, boundary, origin, reason, RULES[rule][1], first_binding,
-                      end_line, end_column, column_encoding)
+                      end_line, end_column, column_encoding, dependency_context)

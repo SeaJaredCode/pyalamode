@@ -31,7 +31,7 @@ MAX_LOCATIONS = 262_144
 MAX_APPROVALS = 4_096
 MAX_CHAIN = 128
 IDENTITY_VERSION = "migration-identity-v1"
-SOURCE_RULES = frozenset("PAL101 PAL102 PAL110 PAL120 PAL121 PAL130 PAL201 PAL210 PAL211 PAL221 PAL230 PAL240 PAL241 PAL250 PAL310 PAL320 PAL330 PAL340 PAL350 PAL351".split())
+SOURCE_RULES = frozenset("PAL101 PAL102 PAL110 PAL120 PAL121 PAL130 PAL201 PAL210 PAL211 PAL221 PAL230 PAL240 PAL241 PAL250 PAL310 PAL320 PAL330 PAL340 PAL350 PAL351 PAL370 PAL371 PAL372".split())
 EFFECTS = frozenset({"IO", "State", "Clock", "Random", "Environment"})
 FAILURES = frozenset({"IndexError", "KeyError", "ValueError", "ZeroDivisionError", "RecursionError", "RuntimeError", "OSError", "UnicodeError"})
 OPERATIONS = frozenset("pyalamode.integrations." + name for name in ("base64_encode", "base64_decode", "sha256_digest"))
@@ -47,12 +47,16 @@ GATES = {"reject_new_findings": ("new_findings", "PAL360"),
 STATE_KEYS = set("schema kind identity_version target runtime_environment edition checker operation_contract snapshot freshness strict_status current_policy_status current_policy_events required_operations inputs scope coverage boundaries findings policy approvals unsafe_adapters".split())
 BOUNDARY_KEYS = set("id kind selector path qualified_name signature definition_sha256 selected selection_reasons strict_checked public_export required_export mode source_evidence effect_bound required_effects effect_origins external_assumptions failures guard_coverage location".split())
 FINDING_KEYS = set("id identity_key birth_identity rule boundary_id logical_boundary signature context_sha256 context origin count locations review_required".split())
-POLICY_KEYS = set("require_modules effect_bounds explicit_cases external_trust integration_manifests integration_approvals required_exports boundary_guards guarded_exports migration".split())
+LEGACY_POLICY_KEYS = set("require_modules effect_bounds explicit_cases external_trust integration_manifests integration_approvals required_exports boundary_guards guarded_exports migration".split())
+POLICY_KEYS = LEGACY_POLICY_KEYS | {"distribution", "checked_dependencies"}
 IDENTITY_KEYS = set("identity_version rule logical_boundary signature context_sha256 origin".split())
 APPROVAL_KEYS = set("operation contract_sha256 dependency_sha256 owner rationale provenance".split())
 ASSUMPTION_KEYS = set("identity version effects failures initialization provenance approval contract_sha256 dependency_sha256 installed_identity admission source_evidence".split())
 INSTALLED_KEYS = set("distribution version build cache_tag platform base_prefix abiflags extension_suffixes native_artifacts adapter_artifact interpreter_executable interpreter_core resolution native_setup_trust operation invocation_backend native_operations".split())
-PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py".split())
+LEGACY_PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py".split())
+PRODUCTS = LEGACY_PRODUCTS | {"distribution.py", "encoding.py", "encoding_contracts.py"}
+LEGACY_CHECKER = "migration-team-policy-10.0"
+LEGACY_OPERATION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 
@@ -383,8 +387,12 @@ def _migration_policy(value):
         _boolean(value[gate])
 
 
-def _policy(value):
-    _shape(value, POLICY_KEYS)
+def _policy(value, legacy=False):
+    _shape(value, LEGACY_POLICY_KEYS if legacy else POLICY_KEYS)
+    if not legacy:
+        from .distribution import validate_distribution_policy
+        error = validate_distribution_policy({k:v for k,v in value.items() if k in {"distribution","checked_dependencies"} and v is not None})
+        if error: _fail(error)
     for key in ("require_modules", "explicit_cases", "integration_manifests", "required_exports", "guarded_exports"):
         _strings(value[key])
     for pattern in value["require_modules"]:
@@ -410,7 +418,7 @@ def _policy(value):
     _migration_policy(value["migration"])
 
 
-def _required_operation(value, inputs=None):
+def _required_operation(value, inputs=None, *, legacy=None):
     _shape(value, set("operation required_by contract_sha256 dependency_sha256 admission engine_status engine_rule evidence".split()))
     if value["operation"] not in OPERATIONS or value["admission"] not in ADMISSIONS:
         _fail("required operation must be actual finite operation/admission")
@@ -423,7 +431,13 @@ def _required_operation(value, inputs=None):
     if not value["required_by"]:
         _fail("required operation has no actual source requirement")
     for site in value["required_by"]:
-        _shape(site, {"boundary", "path", "line", "via"})
+        _shape(site, {"boundary", "path", "line", "via"} | ({"source_owner"} if legacy is False else set()), {"source_owner"} if legacy is None else set())
+        if "source_owner" in site:
+            owner=site["source_owner"]
+            if owner != "project":
+                _shape(owner,{"name","version","package"})
+                from .distribution import _declaration
+                _declaration({"schema":1,"name":owner["name"],"version":owner["version"],"packages":[owner["package"]]})
         _selector(site["boundary"])
         _path(site["path"])
         _integer(site["line"], 1)
@@ -456,7 +470,7 @@ def _event(value):
     _location(value["location"])
 
 
-def _current_events(value, inputs):
+def _current_events(value, inputs, *, legacy=None):
     _shape(value, {"required_exports", "expired_approvals", "approval_failures"})
     for rows in value.values():
         _array(rows)
@@ -479,9 +493,9 @@ def _current_events(value, inputs):
         if event["after"]["status"] != "expired":
             _fail("expiry event requires actual expired approval")
     for event in value["approval_failures"]:
-        _required_operation(event["after"], inputs)
+        _required_operation(event["after"], inputs, legacy=legacy)
         if event["before"] is not None:
-            _required_operation(event["before"])
+            _required_operation(event["before"], legacy=True if legacy else None)
         if event["after"]["admission"] == "approved":
             _fail("approved operation is not a current approval failure")
 
@@ -500,8 +514,24 @@ def _sort_rows(rows):
 
 def _state(state, *, retained=False):
     value = _json_value(state)
-    _shape(value, STATE_KEYS)
-    _integer(value["schema"], 1, 1)
+    schema=value.get("schema")
+    if type(schema) is not int or schema not in {1,2}: _fail("unknown migration state schema")
+    legacy=schema==1
+    if legacy and not retained:_fail("recognized legacy state is historical provenance only")
+    _shape(value, STATE_KEYS if legacy else STATE_KEYS | {"current_dependency_status","current_dependency_events"})
+    from .model import CHECKER_VERSION,OPERATION_VERSION
+    if (value["checker"],value["operation_contract"]) != ((LEGACY_CHECKER,LEGACY_OPERATION) if legacy else (CHECKER_VERSION,OPERATION_VERSION)): _fail("unrecognized checker/inventory provenance")
+    if not legacy:
+        _integer(value["current_dependency_status"],0,2)
+        from .distribution import _declaration,dependency_context,validate_installed_receipt
+        _array(value["current_dependency_events"])
+        for event in value["current_dependency_events"]:
+            _shape(event,{"dependency","rule","reason_code","selector","required_by","input_status","source_status"})
+            dependency_context({k:event[k] for k in ("dependency","rule","reason_code","selector")} | {"site":"import","upstream":None})
+            _strings(event["required_by"])
+            for mod in event["required_by"]: _selector(mod,module=mod.startswith("module:"))
+            _integer(event["input_status"],0,2)
+            _integer(event["source_status"],0,2,nullable=True)
     if value["kind"] != "pyalamode-migration-state" or value["identity_version"] != IDENTITY_VERSION:
         _fail("incompatible migration state schema/identity")
     if value["target"] != "cpython-3.13.1" or value["edition"] != "python-v1":
@@ -519,7 +549,21 @@ def _state(state, *, retained=False):
         _fail("unsupported migration filesystem target")
     _integer(env["utf8_mode"], 0, 1)
     inputs = value["inputs"]
-    _shape(inputs, {"sources", "policy_sha256", "product_artifacts", "integration_inputs"})
+    _shape(inputs, {"sources", "policy_sha256", "product_artifacts", "integration_inputs"} | (set() if legacy else {"checked_dependencies"}))
+    if not legacy:
+        if type(inputs["checked_dependencies"]) is not dict: _fail("dependency inventory requires map")
+        for name,row in inputs["checked_dependencies"].items():
+            validate_installed_receipt(row)
+            if row["declaration"]["name"]!=name: _fail("dependency identity mismatch")
+        expected_status=max((max(r["input_status"],r["source_status"] or 0) for r in inputs["checked_dependencies"].values()),default=0)
+        if value["current_dependency_status"]!=expected_status or value["strict_status"]<expected_status: _fail("dependency source status laundered")
+        event_names=[]
+        for event in value["current_dependency_events"]:
+            name=event["dependency"]["name"];receipt=inputs["checked_dependencies"].get(name)
+            if receipt is None or event["dependency"]!={k:receipt["declaration"][k] for k in ("name","version","packages")} or (event["input_status"],event["source_status"])!=(receipt["input_status"],receipt["source_status"]) or max(receipt["input_status"],receipt["source_status"] or 0)==0:_fail("dependency event disagrees with actual receipt")
+            if event["rule"]!=("PAL372" if receipt["admission"]=="changed" else "PAL370" if receipt["admission"] in {"missing","stale","incompatible"} else "PAL371"):_fail("dependency event rule disagrees with admission")
+            event_names.append(name)
+        if len(event_names)!=len(set(event_names)) or set(event_names)!={n for n,r in inputs["checked_dependencies"].items() if max(r["input_status"],r["source_status"] or 0)}:_fail("dependency refusal events must cover actual refused receipts")
     _digest(inputs["policy_sha256"], nullable=True)
     for key in ("sources", "product_artifacts", "integration_inputs"):
         if type(inputs[key]) is not dict:
@@ -561,7 +605,7 @@ def _state(state, *, retained=False):
     _shape(value["coverage"], set("eligible_modules selected_modules checked_modules eligible_functions selected_functions checked_functions checked_exports selected_records selected_variants".split()))
     for count in value["coverage"].values():
         _integer(count)
-    _policy(value["policy"])
+    _policy(value["policy"],legacy=legacy)
     _array(value["boundaries"])
     logical_buckets = {}
     for row in value["boundaries"]:
@@ -620,6 +664,10 @@ def _state(state, *, retained=False):
         if unavailable:
             _shape(context, {"kind", "reason"})
             _text(context["reason"], nonempty=True)
+        elif context.get("kind")=="checked-dependency":
+            if legacy:_fail("historical schema cannot invent current dependency context")
+            from .distribution import dependency_context
+            dependency_context({k:v for k,v in context.items() if k!="kind"})
         else:
             _shape(context, {"kind", "ast"})
             if context["kind"] != "ast-statement" or type(context["ast"]) is not str or not context["ast"] or len(context["ast"]) > MAX_AST:
@@ -700,15 +748,29 @@ def _state(state, *, retained=False):
     value["unsafe_adapters"] = _sort_rows(value["unsafe_adapters"])
     _array(value["required_operations"], MAX_APPROVALS)
     for required in value["required_operations"]:
-        _required_operation(required, inputs["integration_inputs"])
+        _required_operation(required, inputs["integration_inputs"], legacy=legacy)
+    if not legacy:
+        for operation in value["required_operations"]:
+            for site in operation["required_by"]:
+                if "source_owner" not in site:_fail("current required-operation site needs explicit ownership")
+                owner=site["source_owner"]
+                if owner=="project":
+                    if site["path"] not in inputs["sources"]:_fail("project operation site is outside owned capture")
+                else:
+                    receipt=inputs["checked_dependencies"].get(owner["name"])
+                    if receipt is None or owner["version"]!=receipt["declaration"]["version"] or owner["package"] not in receipt["declaration"]["packages"] or site["path"] not in receipt["observed"]["authored_sources"]:_fail("dependency operation site lacks exact installed ownership")
     if len({r["operation"] for r in value["required_operations"]}) != len(value["required_operations"]):
         _fail("duplicate required operation groups")
     value["required_operations"] = _sort_rows(value["required_operations"])
-    _current_events(value["current_policy_events"], inputs["integration_inputs"])
+    _current_events(value["current_policy_events"], inputs["integration_inputs"], legacy=legacy)
+    if not legacy:
+        for event in value["current_policy_events"]["approval_failures"]:
+            for site in event["after"]["required_by"]:
+                if "source_owner" not in site:_fail("current approval event site needs explicit ownership")
     if value["strict_status"] != 2 and value["current_policy_status"] != 2:
         if set(scope["selected_paths"]) != set(inputs["sources"]) or not set(scope["displayed_paths"]) <= set(scope["selected_paths"]):
             _fail("migration scope must expose complete captured sources and a display subset")
-        if set(inputs["product_artifacts"]) != PRODUCTS:
+        if set(inputs["product_artifacts"]) != (LEGACY_PRODUCTS if legacy else PRODUCTS):
             _fail("migration product inventory must include every current approved product byte identity")
         for boundary in value["boundaries"]:
             if boundary["path"] not in inputs["sources"]:
@@ -739,6 +801,10 @@ def normalize_state(state: dict) -> dict:
 
 
 def finding_context(source: str, diagnostic: dict, boundary: dict) -> dict:
+    if diagnostic.get("dependency_context") is not None:
+        from .distribution import dependency_context
+        dependency_context(diagnostic["dependency_context"])
+        return {"kind":"checked-dependency",**diagnostic["dependency_context"]}
     """Position-free smallest authored statement, with no application execution."""
     if type(source) is not str or len(source.encode("utf-8", "surrogatepass")) > MAX_BYTES:
         _fail("finding context requires bounded captured source")
@@ -850,8 +916,11 @@ def _match_boundaries(old, new):
 
 def compare_states(reference: dict | None, current: dict) -> dict:
     """Compare independent dimensions; reference state must come from safe loading."""
-    new = _state(current)
+    new = _state(current,retained=type(current) is dict and current.get("schema")==1)
     old = _state(reference, retained=True) if reference is not None else None
+    if old is not None and old["schema"]==1:
+        old["policy"]={**old["policy"],"distribution":None,"checked_dependencies":[]}
+        old["inputs"]={**old["inputs"],"checked_dependencies":{}}
     out = {"schema": 1, "kind": "pyalamode-migration-comparison", "reference_observed": old is not None,
            **{name: [] for name in CATEGORIES}}
     out["lost_strict_coverage"] += copy.deepcopy(new["current_policy_events"]["required_exports"])
@@ -1077,6 +1146,9 @@ def _finding_fragment(row):
         _shape(context, {"kind", "ast"})
         if type(context["ast"]) is not str or len(context["ast"]) > MAX_AST:
             _fail("invalid finding AST")
+    elif context.get("kind") == "checked-dependency":
+        from .distribution import dependency_context
+        dependency_context({k:v for k,v in context.items() if k!="kind"})
     elif context.get("kind") == "unavailable":
         _shape(context, {"kind", "reason"})
         _text(context["reason"])
@@ -1204,7 +1276,7 @@ def _comparison(value):
                     _policy(default)
                 elif category == "inputs_changed":
                     _shape(row, {"input", "value"})
-                    if row["input"] not in {"sources", "policy_sha256", "product_artifacts", "integration_inputs", "exclusions"}:
+                    if row["input"] not in {"sources", "policy_sha256", "product_artifacts", "integration_inputs", "checked_dependencies", "exclusions"}:
                         _fail("unknown migration input comparison")
                     if row["input"] == "policy_sha256":
                         _digest(row["value"], nullable=True)
@@ -1212,6 +1284,12 @@ def _comparison(value):
                         for name, digest in row["value"].items():
                             _path(name)
                             _digest(digest)
+                    elif row["input"] == "checked_dependencies":
+                        from .distribution import validate_installed_receipt
+                        if type(row["value"]) is not dict: _fail("dependency input comparison map required")
+                        for name,item in row["value"].items():
+                            validate_installed_receipt(item)
+                            if item["declaration"]["name"]!=name: _fail("dependency identity mismatch")
                     elif row["input"] == "integration_inputs":
                         for operation, item in row["value"].items():
                             if operation not in OPERATIONS:
@@ -1240,7 +1318,7 @@ def _comparison(value):
 def _default_policy():
     return {"require_modules": [], "effect_bounds": {}, "explicit_cases": [],
             "external_trust": "deny", "integration_manifests": [], "integration_approvals": [],
-            "required_exports": [], "boundary_guards": "off", "guarded_exports": [],
+            "required_exports": [], "boundary_guards": "off", "guarded_exports": [], "distribution": None, "checked_dependencies": [],
             "migration": {"schema": 1, "baseline": ".pyalamode/baseline.json", **{gate: False for gate in GATES}}}
 
 

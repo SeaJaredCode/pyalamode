@@ -1,0 +1,10 @@
+[tool.pyalamode]
+boundary_guards = "exports"
+guarded_exports = ["checked_pricing.core:quote", "checked_pricing.core:encode_invoice", "checked_pricing.core:decode_invoice"]
+
+[tool.pyalamode.distribution]
+schema = 1
+name = "checked-pricing"
+version = "1.0.0"
+packages = ["checked_pricing"]
+exports = ["checked_pricing.core:Invoice", "checked_pricing.core:InvoiceStatus", "checked_pricing.core:quote", "checked_pricing.core:encode_invoice", "checked_pricing.core:decode_invoice"]

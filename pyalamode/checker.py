@@ -14,6 +14,7 @@ from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckRe
                     FunctionContract, SCALARS, diagnostic, foundation_identities, runtime_environment)
 from .standard_contracts import (STANDARD_NAMES, STANDARD_NATIVE, STANDARD_VERSION,
                                  SCALAR_SIGNATURES, operation_contract, setup_contract)
+from .encoding_contracts import ENCODING_NAMES, ENCODING_FOUNDATIONS, ENCODING_VERSION, operation_contract as encoding_contract
 from .integration_contracts import (INTEGRATION_NAMES, INTEGRATION_FOUNDATIONS,
                                     INTEGRATION_VERSION, integration_snapshot)
 
@@ -85,7 +86,7 @@ _UNKNOWN = object()
 def fingerprint(source: bytes, policy: dict | None = None) -> str:
     """Include source, edition, rules, target, policy, and operation identities."""
     metadata = json.dumps({"rules": CHECKER_VERSION, "edition": EDITION, "target": TARGET,
-                           "operations": OPERATION_VERSION, "policy": policy or {},
+                           "operations": OPERATION_VERSION, "policy": {k:v for k,v in (policy or {}).items() if not k.startswith("_")},
                            "dependencies": ["pyalamode.fun@0.1.0", "CPython3.13.1 scalar builtins"],
                            "product_artifacts": foundation_identities(), "runtime_environment": runtime_environment()},
                           sort_keys=True, separators=(",", ":")).encode()
@@ -213,6 +214,9 @@ class ScalarAnalyzer:
 
     def emit(self, rule: str, node: ast.AST, reason: str, *, first: int | None = None,
              origin: str = "static source") -> None:
+        if rule in {"PAL211","PAL230","PAL240"}:
+            start=(getattr(node,"lineno",1),getattr(node,"col_offset",0)+1);end=(getattr(node,"end_lineno",start[0]),getattr(node,"end_col_offset",start[1]-1)+1)
+            if any(d.rule=="PAL371" and d.dependency_context is not None and start<=(d.line,d.column)<=end for d in self.result.diagnostics):return
         self.result.diagnostics.append(diagnostic(
             rule, self.path, reason, line=getattr(node, "lineno", 1),
             column=getattr(node, "col_offset", 0) + 1, boundary=self.boundary, origin=origin,
@@ -927,9 +931,15 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
 class SourceGraph:
     """One closed source snapshot. Local imports never fall back to executing Python."""
 
+    _intrinsic_schema_outputs = False
+
     def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None,
                  candidate_selection: dict | None = None):
         self.root, self.policy = root, policy or {}
+        self.distributions = self.policy.get("_distribution_snapshot", {})
+        self.module_names = self.distributions.get("module_names", {})
+        self.resolved_modules = self.distributions.get("resolved_modules", {})
+        self.source_owners = self.distributions.get("source_owners", {})
         self.candidate_functions = set((candidate_selection or {}).get("functions", []))
         self.candidate_modules = set((candidate_selection or {}).get("modules", []))
         self.integration_snapshot = self.policy.get("_integration_snapshot") or integration_snapshot(self.policy, root)
@@ -946,13 +956,16 @@ class SourceGraph:
         for path, source in sources.items():
             analyzer = FunctionalAnalyzer(source, path, "audit" if audit else "strict", policy, self)
             self.analyzers[path] = analyzer
-            module = _module_name(path, root)
+            module = self.module_name(path)
             # Full-project discovery can select both name.py and name/__init__.py.
             # Match ordinary CPython package-before-module resolution rather than
             # allowing input ordering to choose an imported namespace.
-            resolved = _local_path(root, module)
+            resolved = self.resolve_module(module)
             if module not in self.modules or resolved == Path(path).resolve():
                 self.modules[module] = analyzer
+        for alias, original in self.distributions.get("aliases", {}).items():
+            if original in self.modules:
+                self.modules[alias] = self.modules[original]
         for analyzer in self.analyzers.values():
             analyzer.prepare()
             for error in self.integration_snapshot["errors"]:
@@ -1010,18 +1023,18 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.encoding", "module:pyalamode.encoding_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
                     elif reference in {"module:pyalamode", "module:pyalamode.collections"}:
                         self.replaced_foundations.add(("pyalamode", "*"))
-                    elif reference and reference.startswith("module:") and reference[len("module:"):] in self.modules:
-                        defined = self.modules[reference[len("module:"):]]
-                        self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
-                        self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
-                        self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
-                        self.replaced_foundations.add((reference[len("module:"):], "*"))
+                    elif reference and reference.startswith("module:"):
+                        for module, defined in self._module_writer_targets(reference[len("module:"):]):
+                            self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
+                            self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
+                            self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
+                            self.replaced_foundations.add((module, "*"))
                     elif reference and reference.startswith("foundation:"):
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
@@ -1046,18 +1059,18 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.encoding", "module:pyalamode.encoding_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
                     elif reference in {"module:pyalamode", "module:pyalamode.collections"}:
                         self.replaced_foundations.add(("pyalamode", "*"))
-                    elif reference and reference.startswith("module:") and reference[len("module:"):] in self.modules:
-                        defined = self.modules[reference[len("module:"):]]
-                        self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
-                        self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
-                        self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
-                        self.replaced_foundations.add((reference[len("module:"):], "*"))
+                    elif reference and reference.startswith("module:"):
+                        for module, defined in self._module_writer_targets(reference[len("module:"):]):
+                            self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
+                            self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
+                            self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
+                            self.replaced_foundations.add((module, "*"))
                     elif reference and reference.startswith("foundation:"):
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
@@ -1126,11 +1139,23 @@ class SourceGraph:
             self.replaced_foundations.update(("pyalamode", name) for name in STANDARD_NAMES)
             self.effect_dependency_replacements.add("pyalamode.standard.data_foundations")
             self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
+        encoding_replaced = bool(self.record_dependency_replacements | self.collection_dependency_replacements | self.domain_dependency_replacements)
+        for module, attributes in ENCODING_FOUNDATIONS.items():
+            if any((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations or any(a._attribute_changed(module, attribute) for a in self.analyzers.values()) for attribute in attributes):
+                encoding_replaced = True
+        if encoding_replaced:
+            self.replaced_foundations.update(("pyalamode", name) for name in ENCODING_NAMES)
         for module, attributes in INTEGRATION_FOUNDATIONS.items():
             for attribute in attributes:
                 if ((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations
                         or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
                     self.integration_dependency_replacements.add(module + "." + attribute)
+        self.distribution_dependency_replacements=set()
+        if self.distributions.get("receipts"):
+            for module,attributes in {"sys":{"path","meta_path","path_hooks","path_importer_cache","modules"},"builtins":{"__import__"},"importlib":{"import_module","util","machinery"},"importlib.machinery":{"PathFinder","FileFinder","SourceFileLoader"},"importlib.util":{"find_spec"}}.items():
+                for attribute in attributes:
+                    if (module,attribute) in self.replaced_foundations or (module,"*") in self.replaced_foundations or any(a._attribute_changed(module,attribute) for a in self.analyzers.values()):
+                        self.distribution_dependency_replacements.add(module+"."+attribute)
         for module in ("pyalamode.integrations", "pyalamode.integration_contracts"):
             if any(identity.startswith(module + ".") for identity in self.record_dependency_replacements) or any(m == module for m, _ in self.replaced_foundations):
                 self.integration_dependency_replacements.add(module + ".*")
@@ -1153,6 +1178,57 @@ class SourceGraph:
             info.analyzer.declare_effects(info)
         for info in self.functions.values():
             info.analyzer.signature(info)
+
+    def module_name(self, path):
+        return self.module_names.get(str(path), _module_name(str(path), self.root))
+
+    def resolve_module(self, name):
+        candidate = self.resolved_modules.get(name)
+        if candidate is not None:return Path(candidate)
+        local = _local_path(self.root,name)
+        if local is not None:return local
+        return Path(self.modules[name].path) if name in self.modules else None
+
+    def _module_writer_targets(self, module):
+        """Captured modules, or validated guard aliases below an absent parent."""
+        if module in self.modules:
+            return [(module, self.modules[module])]
+        targets = []
+        for alias, original in sorted(self.distributions.get("aliases", {}).items()):
+            defined = self.modules.get(alias)
+            if alias.startswith(module + ".") and defined is not None and defined is self.modules.get(original):
+                targets.append((alias, defined))
+        return targets
+
+    def export_allowed(self, analyzer, target, name, node, quiet):
+        owner = self.source_owners.get(target.path)
+        if owner is None or owner == self.source_owners.get(analyzer.path):
+            return True
+        reference = self.reference(target, ast.Name(id=name))
+        if reference and reference.startswith("module:"):
+            return True
+        if name not in target.symbols and self.module_name(target.path)+"."+name in self.modules:
+            return True
+        if reference in self.functions:
+            info = self.functions[reference]
+            target, name = info.analyzer, info.qualified
+        elif reference in self.records:
+            info = self.records[reference]
+            target, name = info.analyzer, info.node.name
+        elif reference in self.variants:
+            info = self.variants[reference]
+            target, name = info.analyzer, info.node.name
+        owner = self.source_owners.get(target.path)
+        if owner is None or owner == self.source_owners.get(analyzer.path):
+            return True
+        selector = self.module_name(target.path) + ":" + name
+        if selector in self.distributions.get("exports", {}).get(owner, []):
+            return True
+        if not quiet:
+            row=self.distributions["receipts"][owner]
+            context={"dependency":{k:row["declaration"][k] for k in ("name","version","packages")},"selector":selector,"rule":"PAL371","reason_code":"unpublished-export","site":"call","upstream":None}
+            analyzer.result.diagnostics.append(diagnostic("PAL371",analyzer.path,"installed boundary is not a published strict export: "+selector,line=getattr(node,"lineno",1),column=getattr(node,"col_offset",0)+1,boundary=analyzer.boundary,origin="installed checked dependency",dependency_context=context))
+        return False
 
     def reference(self, analyzer, node, aliases=None, seen=None):
         """Resolve source alias identity without executing or admitting its behavior."""
@@ -1188,8 +1264,8 @@ class SourceGraph:
                     return "foundation:integrations:" + name if name in INTEGRATION_NAMES else "module:" + module
                 if module == "pyalamode.effects" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + name if name in EFFECT_PRIMITIVES else "module:pyalamode.effects"
-                if module in {"pyalamode.standard", "pyalamode.standard_contracts"} and analyzer._foundation_available(module):
-                    return "foundation:pyalamode:" + name if name in STANDARD_NAMES else "module:" + module
+                if module in {"pyalamode.standard", "pyalamode.standard_contracts", "pyalamode.encoding", "pyalamode.encoding_contracts"} and analyzer._foundation_available(module):
+                    return "foundation:pyalamode:" + name if name in STANDARD_NAMES | ENCODING_NAMES else "module:" + module
                 if module in {"pyalamode.variants", "pyalamode.failures"} and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + name if name in DOMAIN_PRIMITIVES else "module:" + module
                 if module in {"pyalamode.records", "pyalamode.boundaries", "pyalamode.effects"} and analyzer._foundation_available(module):
@@ -1197,7 +1273,16 @@ class SourceGraph:
                 if module == "pyalamode.collections" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + (name if name in COLLECTIONS else "*")
                 target = self.modules.get(module)
-                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *INTEGRATION_FOUNDATIONS} else None
+                child = module + "." + name
+                original = self.distributions.get("aliases", {}).get(child)
+                if (target is None and original is not None and child in self.modules
+                        and original in self.modules and self.modules[child] is self.modules[original]):
+                    return "module:" + child
+                if (target and Path(target.path).name == "__init__.py" and name not in target.symbols
+                        and name not in target.global_writes and "*" not in target.global_writes
+                        and module + "." + name in self.modules):
+                    return "module:" + module + "." + name
+                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *ENCODING_FOUNDATIONS, *INTEGRATION_FOUNDATIONS} else None
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
                 namespace = self.reference(analyzer, node.func.value, aliases, seen)
@@ -1227,10 +1312,10 @@ class SourceGraph:
                 # shared by other helpers. Alias/dict writes taint that complete
                 # module, rather than only the spelling used to obtain the dict.
                 if owner in self.functions:
-                    return "module:" + _module_name(self.functions[owner].analyzer.path, self.root)
+                    return "module:" + self.module_name(self.functions[owner].analyzer.path)
                 if owner and owner.startswith("foundation:pyalamode:"):
                     name = owner.rsplit(":", 1)[-1]
-                    module = ("standard" if name in STANDARD_NAMES else "collections" if name in COLLECTIONS else
+                    module = ("encoding" if name in ENCODING_NAMES else "standard" if name in STANDARD_NAMES else "collections" if name in COLLECTIONS else
                               "records" if name in RECORD_PRIMITIVES else "boundaries" if name in BOUNDARY_PRIMITIVES else
                               "effects" if name in EFFECT_PRIMITIVES else "failures" if name in {"failure_value", "Failure"} else
                               "variants" if name in DOMAIN_PRIMITIVES else None)
@@ -1248,7 +1333,7 @@ class SourceGraph:
                 return str(case_info.schema) if case_info else owner
             if owner in self.records or owner in self.cases:
                 return owner
-            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | {"*"}:
+            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES | {"*"}:
                 return owner
             if owner and owner.startswith("module:"):
                 module = owner.split(":", 1)[1]
@@ -1256,9 +1341,9 @@ class SourceGraph:
                     return "foundation:integrations:" + node.attr if module == "pyalamode.integrations" and node.attr in INTEGRATION_NAMES else "module:" + module
                 if module == "pyalamode" and node.attr == "integrations" and analyzer._foundation_available("pyalamode.integrations"):
                     return "module:pyalamode.integrations"
-                if module in {"pyalamode.standard", "pyalamode.standard_contracts"}:
-                    return "foundation:pyalamode:" + node.attr if node.attr in STANDARD_NAMES else "module:" + module
-                if module == "pyalamode" and node.attr in {"collections", "records", "boundaries", "variants", "failures", "standard", "standard_contracts"} and analyzer._foundation_available("pyalamode." + node.attr):
+                if module in {"pyalamode.standard", "pyalamode.standard_contracts", "pyalamode.encoding", "pyalamode.encoding_contracts"}:
+                    return "foundation:pyalamode:" + node.attr if node.attr in STANDARD_NAMES | ENCODING_NAMES else "module:" + module
+                if module == "pyalamode" and node.attr in {"collections", "records", "boundaries", "variants", "failures", "standard", "standard_contracts", "encoding", "encoding_contracts"} and analyzer._foundation_available("pyalamode." + node.attr):
                     return "module:pyalamode." + node.attr
                 if module in {"pyalamode.variants", "pyalamode.failures"} and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + node.attr if node.attr in DOMAIN_PRIMITIVES else "module:" + module
@@ -1271,23 +1356,23 @@ class SourceGraph:
                     return self.reference(target, ast.Name(id=node.attr), None, seen)
                 if module + "." + node.attr in self.modules:
                     return "module:" + module + "." + node.attr
-                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *INTEGRATION_FOUNDATIONS}:
+                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *ENCODING_FOUNDATIONS, *INTEGRATION_FOUNDATIONS}:
                     return "foundation:" + module + ":" + node.attr
         return None
 
     def binding_context(self, path, dependencies):
         """Relevant analyzed replacements are cache inputs, even in ordinary writers."""
         analyzer = self.analyzers[path]
-        relevant = {(_module_name(p, self.root), "*") for p in {path} | set(dependencies)}
+        relevant = {(self.module_name(p), "*") for p in {path} | set(dependencies)}
         for name, symbol in analyzer.symbols.items():
             if symbol.kind == "import":
                 module, attribute = symbol.name.split(":", 1)
                 relevant.add((module, attribute))
-                if module in {"pyalamode.variants", "pyalamode.failures", "pyalamode.effects", "pyalamode.standard"} and attribute in DOMAIN_PRIMITIVES | EFFECT_PRIMITIVES | STANDARD_NAMES:
+                if module in {"pyalamode.variants", "pyalamode.failures", "pyalamode.effects", "pyalamode.standard", "pyalamode.encoding"} and attribute in DOMAIN_PRIMITIVES | EFFECT_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES:
                     relevant.add(("pyalamode", attribute))
             elif symbol.kind == "module":
                 relevant.add((symbol.name, "*"))
-                if symbol.name in {"pyalamode.variants", "pyalamode.failures", "pyalamode.standard", "pyalamode.standard_contracts"}:
+                if symbol.name in {"pyalamode.variants", "pyalamode.failures", "pyalamode.standard", "pyalamode.standard_contracts", "pyalamode.encoding", "pyalamode.encoding_contracts"}:
                     relevant.add(("pyalamode", "*"))
         if analyzer.tree:
             for node in ast.walk(analyzer.tree):
@@ -1315,7 +1400,7 @@ class SourceGraph:
             replacements.update(identity + ".<record/boundary dependency>" for identity in self.record_dependency_replacements)
         if any(("pyalamode", name) in relevant for name in EFFECT_PRIMITIVES) or ("pyalamode", "*") in relevant or ("pyalamode.effects", "*") in relevant:
             replacements.update(identity + ".<effect dependency>" for identity in self.effect_dependency_replacements)
-        if any(("pyalamode", name) in relevant for name in STANDARD_NAMES) or ("pyalamode", "*") in relevant or any(module in {"pyalamode.standard", "pyalamode.standard_contracts"} for module, _ in relevant):
+        if any(("pyalamode", name) in relevant for name in STANDARD_NAMES) or ("pyalamode", "*") in relevant or any(module in {"pyalamode.standard", "pyalamode.standard_contracts", "pyalamode.encoding", "pyalamode.encoding_contracts"} for module, _ in relevant):
             replacements.update(identity + ".<standard dependency>" for identity in self.standard_dependency_replacements)
         if any(module == "pyalamode.integrations" for module, _ in relevant):
             replacements.update(identity + ".<integration dependency>" for identity in self.integration_dependency_replacements)
@@ -1468,6 +1553,8 @@ class SourceGraph:
                     assumption = STANDARD_VERSION + ": finite exact data, manual decimal/UTF8, explicit eager callback/wrapper evidence and separately characterized ordinary setup"
                     if assumption not in info.contract.trust:
                         info.contract.trust.append(assumption)
+                if any(operation.startswith("encoding.") for operation in info.operations):
+                    info.contract.trust.append(ENCODING_VERSION + ": bounded canonical exact values, identity catalogs and direct native slot allocation; no restoration hooks")
                 for external in info.contract.external_assumptions:
                     assumption = "external " + external["identity"] + " contract=" + external["contract_sha256"] + " dependency=" + str(external["dependency_sha256"]) + " approval=" + external["admission"]
                     if assumption not in info.contract.trust:
@@ -1520,7 +1607,11 @@ class SourceGraph:
             if any(self.analyzers[path].result.diagnostics for path in analyzer.dependencies if path in self.analyzers):
                 if not any(d.origin == "dependency gate" for d in analyzer.result.diagnostics):
                     analyzer.result.diagnostics.append(diagnostic("PAL240", analyzer.path, "a resolved source dependency failed its participating gate", origin="dependency gate"))
+                failed={p for p in analyzer.dependencies if p in self.analyzers and self.analyzers[p].result.diagnostics}
+                local_failed=any(p not in self.source_owners for p in failed)
                 for contract in analyzer.result.contracts:
+                    info=next((i for i in analyzer.infos.values() if i.qualified==contract.name),None)
+                    if not local_failed and info and not (info.dependencies & failed):continue
                     contract.source_evidence = "unverified: dependency gate failed"
                     contract.freshness = "no successful checked claim"
                     contract.behavior = "unverified behavior; no certified effect bound"
@@ -1535,7 +1626,7 @@ class SourceGraph:
     def operation_contract(self, operation):
         if operation.startswith("integrations."):
             return json.loads(json.dumps(self.integrations[operation.split(".", 1)[1]]))
-        return operation_contract(operation)
+        return encoding_contract(operation) if operation.startswith("encoding.") else operation_contract(operation)
 
     @staticmethod
     def external_assumption(row):
@@ -1639,17 +1730,17 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 self.result.diagnostics.append(diagnostic("PAL121", self.path, "module directive must occur once in the module header after any docstring", line=token.start[0], column=token.start[1] + 1, column_encoding="unicode-codepoints"))
             else:
                 valid = True
-        relative = _module_name(self.path, self.graph.root)
+        relative = self.graph.module_name(self.path)
         try:
             source_relative = Path(self.path).resolve().relative_to(self.graph.root).as_posix()
         except ValueError:
             source_relative = self.path
         from pathlib import PurePosixPath
         import fnmatch
-        required = any(fnmatch.fnmatchcase(source_relative, pattern) or PurePosixPath(source_relative).match(pattern)
+        required = self.path not in self.graph.source_owners and any(fnmatch.fnmatchcase(source_relative, pattern) or PurePosixPath(source_relative).match(pattern)
                        or ("**/" in pattern and fnmatch.fnmatchcase(source_relative, pattern.replace("**/", "")))
                        for pattern in self.policy.get("require_modules", []))
-        self.module_mode = valid or required or self.path in self.graph.candidate_modules
+        self.module_mode = valid or required or self.path in self.graph.candidate_modules or self.path in self.graph.distributions.get("required_modules", [])
         self.result.module_mode = self.module_mode
         for node in tree.body:
             if isinstance(node, ast.Import):
@@ -1772,7 +1863,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 self.emit("PAL120", declaration, "@effects requires one or more unique unchanged product IO/State/Clock/Random/Environment tokens; Task and dynamic declarations are unsupported")
             else:
                 info.declared_effects.update(bound)
-        selection = _module_name(self.path, self.graph.root) + ":" + info.qualified
+        selection = self.graph.module_name(self.path) + ":" + info.qualified
         policy_bound = self.policy.get("effect_bounds", {}).get(selection)
         if policy_bound is not None and not info.declared_effects.issubset(policy_bound):
             self.emit("PAL310", info.node, "source effect declaration exceeds project entry bound: " + ", ".join(sorted(info.declared_effects - set(policy_bound))), origin="project effect policy")
@@ -1932,7 +2023,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return
         for node in self.tree.body:
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d, {"record"}) for d in node.decorator_list):
-                info = RecordInfo(node, self, _module_name(self.path, self.graph.root))
+                info = RecordInfo(node, self, self.graph.module_name(self.path))
                 self.graph.record_declarations.append(info)
                 if info.identity not in self.graph.records or self.graph.modules.get(info.module) is self:
                     self.graph.records[info.identity] = info
@@ -1946,7 +2037,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"case"}) for d in node.decorator_list):
                 self.emit("PAL120", node, "@case declarations are supported only inside a closed @variant domain")
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"variant"}) for d in node.decorator_list):
-                info = VariantInfo(node, self, _module_name(self.path, self.graph.root))
+                info = VariantInfo(node, self, self.graph.module_name(self.path))
                 self.graph.variant_declarations.append(info)
                 if info.identity not in self.graph.variants or self.graph.modules.get(info.module) is self:
                     self.graph.variants[info.identity] = info
@@ -2139,18 +2230,21 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return UNKNOWN
         if symbol.kind == "variant":
             info = self.graph.variants[symbol.name]
+            if not self.graph.export_allowed(self, info.analyzer, info.node.name, node, quiet): return UNKNOWN
             if not info.valid or info.identity in self.graph.replaced_variants:
                 return UNKNOWN
             self._depend(info.analyzer.path)
             return Value.exact("variant_class:" + info.identity)
         if symbol.kind == "record":
             info = self.graph.records[symbol.name]
+            if not self.graph.export_allowed(self, info.analyzer, info.node.name, node, quiet): return UNKNOWN
             if not info.valid or info.identity in self.graph.replaced_records or self.constant_limit is not None and symbol.node.lineno >= self.constant_limit:
                 return UNKNOWN
             self._depend(info.analyzer.path)
             return Value.exact("record_class:" + info.identity)
         if symbol.kind == "function":
             info = self.graph.functions[symbol.name]
+            if not self.graph.export_allowed(self, info.analyzer, info.qualified, node, quiet): return UNKNOWN
             if info.identity in self.graph.replaced_functions:
                 return UNKNOWN
             if self.constant_limit is not None and symbol.node.lineno >= self.constant_limit:
@@ -2167,7 +2261,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return Value.exact("module:pyalamode.integrations")
             if module == "pyalamode" and name in COLLECTIONS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("collection_class:" + name)
-            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES and self._foundation_available(module) and not self._module_changed(module, name) and not self._module_changed("pyalamode", name):
+            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard", "pyalamode.encoding"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES and self._foundation_available(module) and not self._module_changed(module, name) and not self._module_changed("pyalamode", name):
                 return Value.exact("primitive:" + name)
             if module == "builtins" and name in BUILTINS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("builtin:" + name)
@@ -2180,6 +2274,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return UNKNOWN
                 seen.add(key)
                 resolved = target.symbols.get(name)
+                if not self.graph.export_allowed(self,target,name,node,quiet): return UNKNOWN
                 if resolved and target._symbol_stable(name, resolved) and not self._module_changed(module, name):
                     return target._resolve_symbol(resolved, node, quiet, seen)
                 child = self.graph.modules.get(module + "." + name)
@@ -2246,12 +2341,12 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 reference = self.graph.reference(self, node)
                 variant_info = self.graph.variants.get(reference)
                 case_info = self.graph.cases.get(reference)
-                if variant_info and variant_info.valid and reference not in self.graph.replaced_variants:
+                if variant_info and variant_info.valid and reference not in self.graph.replaced_variants and self.graph.export_allowed(self,variant_info.analyzer,variant_info.node.name,node,True):
                     return "variant:" + variant_info.module + ":" + variant_info.node.name
-                if case_info and case_info.valid and reference not in self.graph.replaced_variants:
+                if case_info and case_info.valid and reference not in self.graph.replaced_variants and self.graph.export_allowed(self,case_info.analyzer,case_info.domain,node,True):
                     return case_info.schema.name
                 record_info = self.graph.records.get(reference)
-                if record_info and record_info.valid and reference not in self.graph.replaced_records and not self._module_changed(record_info.module, record_info.node.name):
+                if record_info and record_info.valid and reference not in self.graph.replaced_records and not self._module_changed(record_info.module, record_info.node.name) and self.graph.export_allowed(self,record_info.analyzer,record_info.node.name,node,True):
                     return record_info.schema.name
         if isinstance(node, ast.Name):
             if node.id in env_names:
@@ -2576,9 +2671,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if module == "pyalamode.integrations" or module == "pyalamode" and symbol.name == "pyalamode:integrations":
                 self.emit("PAL241", node, "external adapter import has ordinary native-loader IO setup; pure exports do not establish pure import initialization")
                 continue
-            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__", "pyalamode.standard"} and self._foundation_available(module):
+            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__", "pyalamode.standard", "pyalamode.encoding"} and self._foundation_available(module):
                 if symbol.kind == "import":
-                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES}, "types": {"NoneType"}, "pyalamode.variants": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
+                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode.encoding": ENCODING_NAMES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES, *ENCODING_NAMES}, "types": {"NoneType"}, "pyalamode.variants": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
                     if symbol.name.split(":", 1)[1] not in allowed.get(module, set()):
                         self.emit("PAL241", node, f"foundation import `{symbol.name}` has no supported contract")
                 continue
@@ -2797,6 +2892,29 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         self.graph.types[str(schema)] = schema
         return Value.exact(str(schema)).with_callable(callback)
 
+    def _encoding_call(self, node, env, quiet):
+        target = self._expr(node.func, env, quiet=True)
+        name = target.kind[len("primitive:"):] if target.kind and target.kind.startswith("primitive:") else None
+        if name not in ENCODING_NAMES:
+            return None
+        def reject(reason):
+            if not quiet:
+                self.emit("PAL221", node, reason)
+            return UNKNOWN
+        if not self.active or self.definition_mode or self.initializing or node.keywords or len(node.args) != 2 or any(isinstance(a, ast.Starred) for a in node.args):
+            return reject("value codecs require two positional arguments in a checked body")
+        if isinstance(node.args[1], ast.Constant) and node.args[1].value is not None:
+            return reject("codec schema must be an actual exact data annotation expression")
+        schema = self._annotation(node.args[1], extra_names=set(self.locals) - {name for name,b in env.items() if b.value.kind and b.value.kind.startswith(("collection_class:", "record_class:", "variant_class:", "case_class:"))})
+        if schema is None or not self._data_schema(self.graph.types.get(schema)):
+            return reject("codec schema must establish recursively exact admitted data")
+        expected = str(schema)
+        value = self._expr(node.args[0], env, quiet=quiet)
+        if not self.matches(value, expected if name == "value_encode" else "bytes"):
+            return reject("codec input does not establish its exact schema")
+        self._collection_operation("encoding." + name, node, quiet, ("ValueError", "RecursionError"))
+        return Value.exact("bytes" if name == "value_encode" else expected)
+
     def _standard_call(self, node, env, quiet):
         target = self._expr(node.func, env, quiet=True)
         name = target.kind[len("primitive:"):] if target.kind and target.kind.startswith("primitive:") else None
@@ -2900,7 +3018,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         if row["admission"] != "approved":
             if not quiet:
                 self.emit("PAL350", node, row["identity"] + " approval is " + row["admission"] + (": " + row["identity_error"] if row["identity_error"] else ""), origin="external operation policy")
-            return UNKNOWN
+            # Private source derivation retains refusal, but needs the fixed
+            # operation schema to validate generated bytes without permission.
+            if not self.graph._intrinsic_schema_outputs:
+                return UNKNOWN
         if node.keywords or len(node.args) != 1 or isinstance(node.args[0], ast.Starred):
             if not quiet:
                 self.emit("PAL221", node, name + " requires exactly one positional-only exact bytes argument")
@@ -3498,6 +3619,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if self.active and node.id in self.active.enclosing_names:
                 return reject("PAL240", f"captured binding `{node.id}` is not established as stable and initialized")
             symbol = self.symbols.get(node.id)
+            if symbol and symbol.kind=="import":
+                module,name=symbol.name.split(":",1)
+                target=self.graph.modules.get(module)
+                if target and not self.graph.export_allowed(self,target,name,node,quiet):return UNKNOWN
             if symbol and self._symbol_stable(node.id, symbol):
                 value = self._resolve_symbol(symbol, node, quiet)
                 if value.types:
@@ -3542,11 +3667,12 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return Value.exact("module:pyalamode.standard")
                 if module == "pyalamode" and node.attr in COLLECTIONS and self._foundation_available(module):
                     return Value.exact("collection_class:" + node.attr)
-                if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard"} and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES and self._foundation_available(module) and not self._module_changed("pyalamode", node.attr):
+                if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard", "pyalamode.encoding"} and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | ENCODING_NAMES and self._foundation_available(module) and not self._module_changed("pyalamode", node.attr):
                     return Value.exact("primitive:" + node.attr)
                 target = self.graph.modules.get(module)
                 if target:
                     symbol = target.symbols.get(node.attr)
+                    if not self.graph.export_allowed(self,target,node.attr,node,quiet): return UNKNOWN
                     if symbol and target._symbol_stable(node.attr, symbol):
                         self._depend(target.path)
                         return target._resolve_symbol(symbol, node, quiet)
@@ -3643,6 +3769,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             integration = self._integration_call(node, env, quiet)
             if integration is not None:
                 return integration
+            encoded = self._encoding_call(node, env, quiet)
+            if encoded is not None:
+                return encoded
             standard = self._standard_call(node, env, quiet)
             if standard is not None:
                 return standard
