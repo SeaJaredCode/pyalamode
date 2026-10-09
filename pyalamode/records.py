@@ -6,7 +6,7 @@ these definitions or forged private storage violates the dependency contract.
 
 import ast
 import sys
-from types import GenericAlias, ModuleType, GetSetDescriptorType
+from types import GenericAlias, ModuleType, GetSetDescriptorType, UnionType
 from . import collections as _collections
 
 __all__ = ["record", "replace"]
@@ -74,6 +74,11 @@ def _annotation_schema(annotation, namespace=None):
                 schema = (name, tuple(_annotation_schema(child, namespace) for child in arguments))
                 _check_schema(schema)
                 return schema
+    if type(annotation) is UnionType:
+        members = object.__getattribute__(annotation, "__args__")
+        if type(members) is not tuple:
+            _collections._invalid("annotation", "malformed union annotation")
+        return _union_schema(tuple(_annotation_schema(member, namespace) for member in members))
     if type(annotation) is str:
         try:
             expression = ast.parse(annotation, mode="eval").body
@@ -86,6 +91,8 @@ def _annotation_schema(annotation, namespace=None):
 def _annotation_node(node, namespace):
     if type(node) is ast.Constant and node.value is None:
         return "None"
+    if type(node) is ast.BinOp and type(node.op) is ast.BitOr:
+        return _union_schema((_annotation_node(node.left, namespace), _annotation_node(node.right, namespace)))
     if type(node) is ast.Name:
         # Builtin/collection names have meaning only if their actual binding is
         # absent or is the approved exact identity. Imported aliases are allowed.
@@ -135,12 +142,85 @@ def _annotation_binding(node, namespace):
     _collections._invalid("annotation", "unsupported record annotation namespace")
 
 
+def _union_classes(schema):
+    """Exact runtime classes occupied by one closed-union member schema."""
+    if type(schema) is str:
+        return tuple(kind for name, kind in _SCALARS if name == schema)
+    if type(schema) is tuple and len(schema) == 3 and schema[0] in ("record", "case"):
+        return (schema[1],)
+    if type(schema) is tuple and len(schema) == 3 and schema[0] == "variant" and type(schema[2]) is tuple:
+        return tuple(entry[0] for entry in schema[2] if type(entry) is tuple and len(entry) == 2)
+    _collections._invalid("schema", "union members are exact scalars, records, domains or cases")
+
+
+def _union_key(schema):
+    if type(schema) is str:
+        return (0, next(index for index, (name, _) in enumerate(_SCALARS) if name == schema), "", 0)
+    owner = schema[1]
+    return (1, type.__getattribute__(owner, "__module__"), type.__getattribute__(owner, "__qualname__"), id(owner))
+
+
+def _union_schema(members):
+    """Flatten, deduplicate and order closed-union members; overlap is refused."""
+    flat = []
+    for member in members:
+        if type(member) is tuple and member and member[0] == "union":
+            if len(member) != 2 or type(member[1]) is not tuple:
+                _collections._invalid("schema", "malformed union schema")
+            children = member[1]
+        else:
+            children = (member,)
+        for child in children:
+            if not any(child == seen for seen in flat):
+                flat.append(child)
+    occupied = []
+    for member in flat:
+        for kind in _union_classes(member):
+            if any(kind is seen for seen in occupied):
+                _collections._invalid("schema", "union members overlap by exact runtime class")
+            occupied.append(kind)
+    if any(kind is bool for kind in occupied) and any(kind is int for kind in occupied):
+        _collections._invalid("schema", "bool | int is refused because class patterns cannot separate them")
+    if len(flat) == 1:
+        return flat[0]
+    return ("union", tuple(sorted(flat, key=_union_key)))
+
+
+def _canonical(schema):
+    """Order union members inside a checker-produced schema; shape is checked later."""
+    if type(schema) is not tuple or not schema or type(schema[0]) is not str:
+        return schema
+    name = schema[0]
+    if name == "union" and len(schema) == 2 and type(schema[1]) is tuple:
+        return _union_schema(tuple(_canonical(child) for child in schema[1]))
+    if name in ("record", "case") and len(schema) == 3 and type(schema[2]) is tuple:
+        return (name, schema[1], tuple((field[0], _canonical(field[1])) if type(field) is tuple and len(field) == 2 else field
+                                       for field in schema[2]))
+    if name == "variant" and len(schema) == 3 and type(schema[2]) is tuple:
+        return (name, schema[1], tuple((entry[0], _canonical(("case", entry[0], entry[1]))[2])
+                                       if type(entry) is tuple and len(entry) == 2 and type(entry[1]) is tuple else entry
+                                       for entry in schema[2]))
+    if len(schema) >= 2 and type(schema[1]) is tuple:
+        return (name, tuple(_canonical(child) for child in schema[1]), *schema[2:])
+    return schema
+
+
 def _check_schema(schema):
     if type(schema) is str and any(schema == name for name, _ in _SCALARS):
         return
     if type(schema) is not tuple or not schema or type(schema[0]) is not str:
         _collections._invalid("schema", "unsupported exact data schema")
     name = schema[0]
+    if name == "union":
+        if len(schema) != 2 or type(schema[1]) is not tuple or len(schema[1]) < 2:
+            _collections._invalid("schema", "malformed union schema")
+        for child in schema[1]:
+            if type(child) is tuple and child and child[0] == "union":
+                _collections._invalid("schema", "union members are flat")
+            _check_schema(child)
+        if _union_schema(schema[1]) != schema:
+            _collections._invalid("schema", "union schema is not canonical")
+        return
     if _variants._check_schema(schema):
         return
     if name == "record":
@@ -179,6 +259,12 @@ def _validate_schema(value, schema, path="value", active=None):
             _collections._invalid(path, "expected exact " + schema)
         return
     name = schema[0]
+    if name == "union":
+        for member in schema[1]:
+            if any(kind is candidate for candidate in _union_classes(member)):
+                _validate_schema(value, member, path, active)
+                return
+        _collections._invalid(path, "expected exact member of closed union")
     if name in ("variant", "case", "Option", "Result", "Some", "Nothing", "Ok", "Err"):
         _variants._validate_schema(value, schema, path, active)
         return

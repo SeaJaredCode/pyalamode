@@ -22,6 +22,7 @@ def validate_data(value, schema, *, path="value"):
     """
     if type(path) is not str:
         _collections._invalid("path", "expected exact string")
+    schema = _records._canonical(schema)
     _records._check_schema(schema)
     _records._validate_schema(value, schema, path)
     return value

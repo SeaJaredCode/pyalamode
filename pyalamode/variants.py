@@ -8,7 +8,7 @@ from types import GenericAlias, GetSetDescriptorType
 from . import collections as _collections
 from . import records as _records
 
-__all__ = ["variant", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate"]
+__all__ = ["oneof", "variant", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate"]
 
 _CASES = ()
 _VARIANTS = ()
@@ -221,7 +221,7 @@ class _DomainType(type):
         raise AttributeError("closed domain namespace cannot be deleted")
 
 
-def variant(cls):
+def oneof(cls):
     """Seal a declaration-only namespace with its exact nested case set."""
     global _CASES, _VARIANTS
     attributes = _declaration(cls, "variant")
@@ -257,6 +257,10 @@ def variant(cls):
                    for entry in _CASES for kind, fields, defaults, family, old_identity, name in (entry,))
     _VARIANTS += ((product, identity, tuple(cases)),)
     return product
+
+
+# Transitional alias: the same object, so identities and envelopes are unchanged.
+variant = oneof
 
 
 class Option:

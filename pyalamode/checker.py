@@ -21,7 +21,8 @@ BUILTINS = frozenset({"abs", "min", "max", "len"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
 DOMAIN_TYPES = frozenset({"Option", "Result"})
 DOMAIN_CASES = frozenset({"Some", "Nothing", "Ok", "Err"})
-DOMAIN_PRIMITIVES = frozenset({"variant", "case", "accumulate", "failure_value", "Failure", *DOMAIN_TYPES, *DOMAIN_CASES})
+DOMAIN_DECORATORS = frozenset({"oneof", "variant"})
+DOMAIN_PRIMITIVES = frozenset({"oneof", "variant", "case", "accumulate", "failure_value", "Failure", *DOMAIN_TYPES, *DOMAIN_CASES})
 HANDLER_CATEGORIES = frozenset({"ZeroDivisionError", "IndexError", "KeyError", "ValueError", "RecursionError", "RuntimeError", "OSError", "UnicodeError"})
 HANDLER_COVERAGE = {category: frozenset({category}) for category in HANDLER_CATEGORIES}
 HANDLER_COVERAGE["ValueError"] |= {"UnicodeError"}
@@ -669,6 +670,8 @@ class TypeSpec:
     effect_bound: tuple[str, ...] = ()
 
     def __str__(self) -> str:
+        if self.name == "union":
+            return " | ".join(map(str, self.arguments))
         if self.name.startswith("variant:"):
             return "Variant[" + repr(self.name[len("variant:"):]) + "]"
         if self.name.startswith("case:"):
@@ -691,6 +694,12 @@ class TypeSpec:
 def _contract_type(text: str) -> TypeSpec:
     """Decode our canonical cache schema, never a user annotation or Python value."""
     def parse(node):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            members = []
+            for side in (node.left, node.right):
+                member = parse(side)
+                members.extend(member.arguments if member.name == "union" else (member,))
+            return TypeSpec("union", tuple(members))
         if isinstance(node, ast.Name) and node.id in SCALARS | CAPABILITIES.keys() | {"Nothing"}:
             return TypeSpec(node.id)
         if isinstance(node, ast.Constant) and node.value is None:
@@ -1944,8 +1953,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return
         for node in self.tree.body:
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"case"}) for d in node.decorator_list):
-                self.emit("PAL120", node, "@case declarations are supported only inside a closed @variant domain")
-            if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"variant"}) for d in node.decorator_list):
+                self.emit("PAL120", node, "@case declarations are supported only inside a closed @oneof domain")
+            if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, DOMAIN_DECORATORS) for d in node.decorator_list):
                 info = VariantInfo(node, self, _module_name(self.path, self.graph.root))
                 self.graph.variant_declarations.append(info)
                 if info.identity not in self.graph.variants or self.graph.modules.get(info.module) is self:
@@ -1974,8 +1983,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         node = info.node
         if self.graph.variants.get(info.identity) is not info:
             self.emit("PAL241", node, "closed domain declaration conflicts with the canonical package/module schema; shadowed nominal declarations are unverified", origin="nominal import resolution")
-        if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not self._primitive_identity(node.decorator_list[0], {"variant"}):
-            self.emit("PAL120", node, "domains require only @variant, nested fixed @case declarations and no bases/metaclass/generic behavior")
+        if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not self._primitive_identity(node.decorator_list[0], DOMAIN_DECORATORS):
+            self.emit("PAL120", node, "domains require only @oneof, nested fixed @case declarations and no bases/metaclass/generic behavior")
         if not self._symbol_stable(node.name, self.symbols[node.name]) or info.identity in self.graph.replaced_variants:
             self.emit("PAL240", node, "domain namespace or case behavior has an analyzed replacement")
         names = set()
@@ -2330,9 +2339,25 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     names.update(_written_names(parent.body))
                     names.update(a.arg for a in parent.args.posonlyargs + parent.args.args + parent.args.kwonlyargs)
                 parent = self.parents.get(id(parent))
+        union_reason = []
+
         def parse(expression):
             if isinstance(expression, ast.Constant) and expression.value is None:
                 return TypeSpec("None")
+            if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.BitOr):
+                members, pending = [], [expression]
+                while pending:
+                    item = pending.pop()
+                    if isinstance(item, ast.BinOp) and isinstance(item.op, ast.BitOr):
+                        pending += [item.right, item.left]
+                    else:
+                        members.append(parse(item))
+                if any(member is None for member in members):
+                    return None
+                union, reason = self.union_schema(members)
+                if reason:
+                    union_reason.append(reason)
+                return union
             identity = self._type_identity(expression, names) if expression is not None else None
             if identity in SCALARS | CAPABILITIES.keys():
                 return TypeSpec(identity)
@@ -2371,6 +2396,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         return TypeSpec(identity, tuple(args))
             return None
         schema = parse(node)
+        if schema is None and union_reason:
+            self.emit("PAL130", original, union_reason[0])
+            return None
         if schema is None:
             self.emit("PAL130", original or ast.Constant(value=None), "annotation must identify a closed exact scalar, recursive tuple/collection/record/domain/Option/Result, or fixed positional Callable contract; Map keys and Set elements use homogeneous exact scalars")
             return None
@@ -2407,7 +2435,52 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return Value(frozenset({kind}), capability=CapabilityValue(kind, tuple(sorted(CAPABILITY_OPERATIONS[kind])), "invocation obligation", "exact interface supplied by caller"))
         return Value.exact(kind) if schema else UNKNOWN
 
+    def union_classes(self, schema):
+        """Exact runtime classes a closed-union member occupies, or None if ineligible."""
+        if schema.name in SCALARS:
+            return {schema.name}
+        if schema.name.startswith(("record:", "case:")) and self._data_schema(schema):
+            return {str(schema)}
+        if schema.name.startswith("variant:") and self._data_schema(schema):
+            return {case.identity for case in self.graph.variants[str(schema)].cases.values()}
+        return None
+
+    def union_schema(self, members):
+        """Normalize closed-union members: flatten, deduplicate, refuse overlap, order canonically."""
+        flat = {}
+        for member in members:
+            for child in (member.arguments if member.name == "union" else (member,)):
+                flat[str(child)] = child
+        occupied = set()
+        for text, member in flat.items():
+            classes = self.union_classes(member)
+            if classes is None:
+                return None, "closed union members are exact None, bool, int, str, bytes, records, domains or cases; `" + text + "` is not admitted"
+            if classes & occupied:
+                return None, "closed union members must not overlap by exact runtime class; `" + text + "` overlaps another member"
+            occupied |= classes
+        if {"bool", "int"} <= occupied:
+            return None, "bool | int is refused because class patterns cannot separate bool from int"
+        if len(flat) == 1:
+            return next(iter(flat.values())), None
+        return TypeSpec("union", tuple(flat[text] for text in sorted(flat))), None
+
+    def union_tags(self, schema):
+        """Exact coverage tags: scalar classes (bool as True/False), records and cases."""
+        tags = set()
+        for member in schema.arguments:
+            classes = self.union_classes(member) or set()
+            tags |= {"True", "False"} if classes == {"bool"} else classes
+        return tags
+
+    def union_fingerprint(self, schema):
+        data = [(str(member), self.graph.variants[str(member)].fingerprint if member.name.startswith("variant:") else None)
+                for member in schema.arguments]
+        return hashlib.sha256(json.dumps(data, separators=(",", ":")).encode()).hexdigest()
+
     def _data_schema(self, schema):
+        if schema is not None and schema.name == "union":
+            return len(schema.arguments) > 1 and all(self._data_schema(member) for member in schema.arguments)
         return schema is not None and (schema.name in SCALARS or (schema.name == "record:pyalamode:Failure" or schema.name.startswith("record:") and str(schema) in self.graph.records and self.graph.records[str(schema)].valid or schema.name.startswith("variant:") and str(schema) in self.graph.variants and self.graph.variants[str(schema)].valid or schema.name.startswith("case:") and str(schema) in self.graph.cases and self.graph.cases[str(schema)].valid) or schema.name == "Nothing" or schema.name in {"tuple", *COLLECTIONS, *DOMAIN_TYPES, *DOMAIN_CASES} and all(self._data_schema(a) for a in schema.arguments))
 
     def _data_value(self, value):
@@ -2425,6 +2498,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         if expected in CAPABILITIES:
             evidence = value.capability
             return value.types == frozenset({expected}) and evidence is not None and evidence.lifetime in {"live", "invocation obligation", "borrowed"} and set(CAPABILITY_OPERATIONS[expected]).issubset(evidence.operations)
+        if schema.name == "union" or any(self.graph.types.get(kind) and self.graph.types[kind].name == "union" for kind in value.types):
+            if value.callable or value.capability:
+                return False
+            return all(self._schema_matches(self.graph.types.get(kind), schema) for kind in value.types)
         if schema.name == "tuple":
             if value.items is not None:
                 if schema.variadic:
@@ -2466,6 +2543,14 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         return False
 
     def _schema_matches(self, actual, expected):
+        if actual is not None and actual.name == "union":
+            return all(self._schema_matches(member, expected) for member in actual.arguments)
+        if expected.name == "union":
+            if any(self._schema_matches(actual, member) for member in expected.arguments):
+                return True
+            # A domain value fits when each of its exact cases is itself a member.
+            domain = self.graph.variants.get(str(actual)) if actual is not None and actual.name.startswith("variant:") else None
+            return bool(domain) and all(any(self._schema_matches(case.schema, member) for member in expected.arguments) for case in domain.cases.values())
         if expected.name in DOMAIN_TYPES or expected.name.startswith("variant:"):
             return self._domain_matches(actual, expected)
         if actual is None or actual.name != expected.name:
@@ -3264,6 +3349,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     self.emit("PAL330", pattern, "a pattern capture name appears twice")
                 captures[pattern.name] = self.annotation_value(str(schema))
             return None, True
+        if schema.name == "union":
+            return self._union_pattern(pattern, schema, captures)
         if isinstance(pattern, ast.MatchSingleton):
             kind = "None" if pattern.value is None else "bool"
             if schema.name != kind:
@@ -3297,6 +3384,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             for name, child in zip(names, children):
                 child_schema = self.graph.types[fields[name]]
                 child_tag, irrefutable = self._pattern(child, child_schema, captures)
+                # A narrowing pattern never exhausts a union-typed payload.
+                if child_schema.name == "union" and not (isinstance(child, ast.MatchAs) and child.pattern is None):
+                    irrefutable = False
                 # A full payload case does not exhaust its containing union.
                 if isinstance(child, ast.MatchClass):
                     if child_schema.name in DOMAIN_TYPES:
@@ -3308,13 +3398,74 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         self.emit("PAL330", pattern, "pattern has no characterized finite dispatch/binding contract")
         return None, False
 
+    def _union_pattern(self, pattern, schema, captures):
+        """Narrow one pattern to the closed-union member its exact runtime class selects."""
+        members = {str(member): member for member in schema.arguments}
+
+        def member_for(classes):
+            for member in schema.arguments:
+                if classes & (self.union_classes(member) or set()):
+                    return member
+            return None
+
+        if isinstance(pattern, ast.MatchSingleton):
+            kind = "None" if pattern.value is None else "bool"
+            if kind not in members:
+                self.emit("PAL330", pattern, "singleton pattern requires a matching None or bool union member")
+                return None, False
+            return repr(pattern.value), True
+        if isinstance(pattern, ast.MatchValue) and isinstance(pattern.value, (ast.Constant, ast.UnaryOp)):
+            value = self._expr(pattern.value, {}, quiet=True)
+            if value.kind not in {"int", "str", "bytes"} or value.kind not in members:
+                self.emit("PAL330", pattern, "literal pattern requires an exact same-type scalar union member")
+            return None, False
+        if isinstance(pattern, ast.MatchClass):
+            names, scope = set(), self.active.node if self.active else None
+            while scope is not None:
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.update(_written_names(scope.body))
+                    names.update(a.arg for a in scope.args.posonlyargs + scope.args.args + scope.args.kwonlyargs)
+                scope = self.parents.get(id(scope))
+            kind = self._type_identity(pattern.cls, names) if isinstance(pattern.cls, ast.Name) else None
+            if kind in {"bool", "int", "str", "bytes"}:
+                if kind not in members or pattern.kwd_patterns or len(pattern.patterns) > 1:
+                    self.emit("PAL330", pattern, "scalar class pattern requires a matching union member and at most one positional pattern for the subject itself")
+                    return None, False
+                complete = True
+                if pattern.patterns:
+                    _, complete = self._pattern(pattern.patterns[0], members[kind], captures)
+                return ("bool" if kind == "bool" else kind), complete
+            reference = self.graph.reference(self, pattern.cls)
+            case_info = self.graph.cases.get(reference)
+            record_info = self.graph.records.get(reference)
+            classes = {case_info.identity} if case_info else {record_info.identity} if record_info else {"Record['pyalamode:Failure']"} if reference == "foundation:pyalamode:Failure" else set()
+            member = member_for(classes)
+            if member is None:
+                self.emit("PAL330", pattern, "class pattern requires a resolved unchanged exact record or case that is a member of the closed union")
+                return None, False
+            return self._pattern(pattern, member, captures)
+        self.emit("PAL330", pattern, "pattern has no characterized finite dispatch/binding contract")
+        return None, False
+
     def _match_statement(self, node, env):
         subject = self._expr(node.subject, env)
         schema = self.graph.types.get(subject.kind)
-        if schema is None or schema.name not in DOMAIN_TYPES | DOMAIN_CASES | {"bool", "None"} and not schema.name.startswith(("variant:", "case:", "record:")):
-            self.emit("PAL330", node, "match requires one established closed domain/case, exact record, bool or None schema")
+        if schema is None and len(subject.types) > 1 and not subject.callable and not subject.capability:
+            # Merged branch values already carry a finite exact type set.
+            specs = [self.graph.types.get(kind) for kind in subject.types]
+            schema, _ = self.union_schema(specs) if all(specs) else (None, None)
+            if schema is not None:
+                self.graph.types[str(schema)] = schema
+        if schema is None or schema.name not in DOMAIN_TYPES | DOMAIN_CASES | {"bool", "None", "union"} and not schema.name.startswith(("variant:", "case:", "record:")):
+            self.emit("PAL330", node, "match requires one established closed domain/case/union, exact record, bool or None schema")
             return env
-        if schema.name.startswith("variant:"):
+        if schema.name == "union":
+            domain = None
+            expected = self.union_tags(schema)
+            identity, version = str(schema), self.union_fingerprint(schema)
+            member_domains = [self.graph.variants[str(member)] for member in schema.arguments if member.name.startswith("variant:")]
+            policy_domains = {info.module + ":" + info.node.name for info in member_domains}
+        elif schema.name.startswith("variant:"):
             domain = self.graph.variants[str(schema)]
             expected = {case.identity for case in domain.cases.values()}
             identity = domain.module + ":" + domain.node.name
@@ -3345,19 +3496,22 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     self.emit("PAL210", case.guard, "pattern guard requires exact bool")
                 guard_true = guard.literal is True
             if (complete or schema.name == "bool" and isinstance(case.pattern, ast.MatchSingleton)) and (not guarded or guard_true) and tag:
-                coverage.add(tag)
+                coverage.update({"True", "False"} if tag == "bool" else {tag})
             if is_wildcard and (not guarded or guard_true):
                 wildcard = True
                 if index != len(node.cases) - 1:
                     self.emit("PAL330", case.pattern, "deliberate wildcard must be final")
             continuing = self._merge(continuing, self._block(case.body, branch))
-        if domain and identity in self.policy.get("explicit_cases", []) and wildcard:
+        if schema.name != "union":
+            policy_domains = {identity} if domain else set()
+        policy_explicit = bool(policy_domains & set(self.policy.get("explicit_cases", [])))
+        if policy_explicit and wildcard:
             self.emit("PAL330", node, "project explicit_cases policy requires full explicit case coverage and forbids wildcard consumers")
         if not wildcard and expected - coverage:
             self.emit("PAL330", node, "match is not exhaustive; missing full case coverage: " + ", ".join(sorted(expected - coverage)))
         if self.active:
             self.active.patterns.append({"line": node.lineno, "schema": str(schema), "case_set": sorted(expected), "covered": sorted(coverage),
-                                         "wildcard": wildcard, "case_fingerprint": version, "policy_explicit": identity in self.policy.get("explicit_cases", [])})
+                                         "wildcard": wildcard, "case_fingerprint": version, "policy_explicit": policy_explicit})
         self._collection_operation("Pattern.dispatch", node, failures=("RecursionError",) if schema.name not in {"bool", "None"} else ())
         return continuing
 

@@ -144,7 +144,7 @@ class ScalarAcceptance(unittest.TestCase):
     def test_annotations_nonexecuted_whitelist(self):
         self.assertTrue(self.check("@fun\ndef f(x: 'int') -> 'int':\n    return x\n").verified)
         self.assertTrue(analyze_source("from types import NoneType\n" + PREFIX + "@fun\ndef f(x: NoneType) -> NoneType:\n    return x\n").verified)
-        for annotation in ["Any", "list[int]", "int | None", "'open(1)'", "float", "Child", "typing.Any"]:
+        for annotation in ["Any", "list[int]", "int | float", "bool | int", "'open(1)'", "float", "Child", "typing.Any"]:
             self.assertRule(f"@fun\ndef f(x: {annotation}) -> int:\n    return 1\n", "PAL130")
         self.assertRule("int = str\n@fun\ndef f(x: int) -> int:\n    return 1\n", "PAL130")
         self.assertRule("import types\nalias = types\nalias.NoneType = int\nfrom types import NoneType\n@fun\ndef f(x: NoneType) -> NoneType:\n    return None\n", "PAL130")

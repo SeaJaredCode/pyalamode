@@ -29,6 +29,8 @@ def supported_schema(text, records, seen=()):
         return False
     if schema.name in SCALARS:
         return True
+    if schema.name == "union":
+        return all(supported_schema(str(member), records, seen) for member in schema.arguments)
     if schema.name.startswith("variant:"):
         if text in seen or text not in records:
             return False
@@ -57,6 +59,8 @@ class Schemas:
         if schema.name in SCALARS:
             return repr(schema.name)
         children = "(" + ", ".join(self.code(str(t)) for t in schema.arguments) + ("," if len(schema.arguments) == 1 else "") + ")"
+        if schema.name == "union":
+            return "('union', " + children + ")"
         if schema.name == "tuple":
             return "('tuple', " + children + ", " + repr(schema.variadic) + ")"
         if schema.name.startswith("variant:"):

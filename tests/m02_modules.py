@@ -52,7 +52,7 @@ class ModuleContracts(unittest.TestCase):
         self.good(PREFIX + '@fun\ndef f(x: tuple[int, int]) -> tuple[int, ...]:return x\nf((1, 2))\n')
 
     def test_tuple_whitelist_excludes_protocols_and_callable_data(self):
-        for annotation in ['tuple', 'tuple[Any, ...]', 'tuple[int | str]', 'tuple[Callable[[int], int]]', 'list[int]', 'Sequence[int]', 'Callable[..., int]', 'Callable[[Any], int]']:
+        for annotation in ['tuple', 'tuple[Any, ...]', 'tuple[int | list[int]]', 'tuple[int] | str', 'tuple[Callable[[int], int]]', 'list[int]', 'Sequence[int]', 'Callable[..., int]', 'Callable[[Any], int]']:
             self.bad(PREFIX + f'@fun\ndef f(x: {annotation}) -> int:return 1\n', 'PAL130')
         self.bad(PREFIX + '@fun\ndef identity(x: int) -> int:return x\n@fun\ndef f() -> tuple[int]:return (identity,)\n', 'PAL221')
 
