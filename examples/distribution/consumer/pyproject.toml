@@ -1,0 +1,5 @@
+[[tool.pyalamode.checked_dependencies]]
+schema = 1
+name = "checked-pricing"
+version = "1.0.0"
+packages = ["checked_pricing"]

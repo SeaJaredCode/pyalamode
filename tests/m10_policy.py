@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from pyalamode.model import CHECKER_VERSION, OPERATION_VERSION
 from pyalamode import migration as m
 
 
@@ -56,14 +57,15 @@ def capture(specs=(("core", "f", 1),)):
                              "context": {"kind": "ast-statement", "ast": C101},
                              "origin": "static source", "count": count, "locations": locations, "review_required": False})
     paths = sorted({row["path"] for row in rows})
-    value = {"schema": 1, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
+    value = {"schema": 2, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
              "target": "cpython-3.13.1", "runtime_environment": {"filesystem_encoding": "utf-8", "filesystem_errors": "surrogateescape", "utf8_mode": 0},
-             "edition": "python-v1", "checker": "m10-fixture", "operation_contract": "inherited-fixture",
+             "edition": "python-v1", "checker": CHECKER_VERSION, "operation_contract": OPERATION_VERSION,
              "snapshot": "b" * 64, "freshness": "current disk snapshot", "strict_status": int(bool(findings)),
+             "current_dependency_status":0,"current_dependency_events":[],
              "current_policy_status": 0, "current_policy_events": {"required_exports": [], "expired_approvals": [], "approval_failures": []},
              "required_operations": [],
              "inputs": {"sources": {path: {"sha256": "c" * 64, "origin": "disk", "version": None, "disk_sha256": "c" * 64} for path in paths},
-                        "policy_sha256": None, "product_artifacts": {name: "d" * 64 for name in m.PRODUCTS}, "integration_inputs": {}},
+                        "policy_sha256": None, "product_artifacts": {name: "d" * 64 for name in m.PRODUCTS}, "integration_inputs": {},"checked_dependencies":{}},
              "scope": {"project_root": "/synthetic/project", "selected_paths": paths, "displayed_paths": paths, "exclusions": []},
              "coverage": {}, "boundaries": rows, "findings": findings, "policy": m._default_policy(), "approvals": [], "unsafe_adapters": []}
     recount(value)
@@ -212,7 +214,7 @@ class DetachedPolicyTests(unittest.TestCase):
         operation = "pyalamode.integrations.sha256_digest"
         inputs = {"contract_sha256": "a" * 64, "dependency_sha256": "b" * 64, "admission": "denied", "approval": None, "identity_error": None}
         state["inputs"]["integration_inputs"][operation] = inputs
-        state["required_operations"] = [{"operation": operation, "required_by": [{"boundary": "core:f", "path": "core.py", "line": 3, "via": "retained"}],
+        state["required_operations"] = [{"operation": operation, "required_by": [{"boundary": "core:f", "path": "core.py", "line": 3, "via": "retained", "source_owner": "project"}],
                                          "contract_sha256": inputs["contract_sha256"], "dependency_sha256": inputs["dependency_sha256"],
                                          "admission": "denied", "engine_status": 1, "engine_rule": "PAL350",
                                          "evidence": {"kind": "integration-input", "value": inputs}}]

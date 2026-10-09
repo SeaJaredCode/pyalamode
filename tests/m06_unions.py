@@ -269,5 +269,66 @@ class UnionRuntime(unittest.TestCase):
                 validate_data(3, schema)
 
 
+
+from pyalamode import record as _record, oneof as _oneof, case as _case
+
+
+@_record
+class EncodedLeft:
+    value: int | None
+
+
+@_record
+class EncodedRight:
+    value: int
+
+
+@_oneof
+class EncodedSlot:
+    @_case
+    class Filled:
+        n: int
+
+    @_case
+    class Empty:
+        pass
+
+
+class UnionEncoding(unittest.TestCase):
+    def test_round_trip_member_index_and_order_independence(self):
+        from pyalamode import value_encode, value_decode, Vector
+        Left, Right, Slot = EncodedLeft, EncodedRight, EncodedSlot
+        schema = Left | Right | Slot | None
+        for value in [Left(1), Left(None), Right(2), Slot.Filled(3), Slot.Empty(), None]:
+            decoded = value_decode(value_encode(value, schema), schema)
+            self.assertIs(type(decoded), type(value))
+            self.assertEqual(decoded, value)
+        # Two record members share the record wire tag; the member index separates them.
+        self.assertNotEqual(value_encode(Left(2), Left | Right)[-14:], value_encode(Right(2), Left | Right)[-14:])
+        self.assertEqual(value_encode(1, int | None), value_encode(1, None | int))
+        self.assertEqual(value_decode(value_encode(Vector.of(1, None), Vector[int | None]), Vector[int | None]), Vector.of(1, None))
+
+    def test_refusals(self):
+        from pyalamode import value_encode, value_decode
+        for value in [True, 'x', 1.5]:
+            with self.assertRaises(TypeError):
+                value_encode(value, int | None)
+        with self.assertRaises(TypeError):
+            value_encode(1, bool | int)
+        with self.assertRaises(ValueError):
+            value_decode(value_encode(1, int | None), int | str)
+        corrupted = bytearray(value_encode(None, int | None))
+        corrupted[-2] = 9
+        with self.assertRaises(ValueError):
+            value_decode(bytes(corrupted), int | None)
+
+    def test_checked_codec_accepts_union_schemas(self):
+        source = IMPORTS + 'from pyalamode import value_encode, value_decode\n@fun\ndef wire(v: int | None) -> bytes:\n    return value_encode(v, int | None)\n@fun\ndef back(b: bytes) -> int | None:\n    return value_decode(b, None | int)\n'
+        result = analyze_source(source, path='codec.py')
+        self.assertTrue(result.verified, '\n'.join(d.format() for d in result.diagnostics))
+        bad = analyze_source(source.replace('value_encode(v, int | None)', 'value_encode(v, int | str)'), path='codec.py')
+        self.assertFalse(bad.verified)
+
+
 if __name__ == '__main__':
     unittest.main()

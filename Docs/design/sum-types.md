@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stage 0 and stage 1 implemented on branch `sum-types`; stages 2 and 3 queued.
+Status: stages 0 and 1 implemented on branch `sum-types`, merged with M11 (`c668439`) including union encoding; stages 2 and 3 queued.
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -20,7 +20,7 @@ Open unions (structural "anything with this class" sets) stay unsupported. `Opti
 | Stage | Scope | Depends on | State |
 |---|---|---|---|
 | 0 | `oneof` becomes the canonical decorator; `variant` stays an identical transitional alias | M6 | Implemented on `sum-types` |
-| 1 | Closed unions in annotations, values, matches, records, cases and guards | M6; encoding follow-up needs M11 | Implemented on `sum-types` except the M11 encoding row |
+| 1 | Closed unions in annotations, values, matches, records, cases, guards and value encoding | M6, M11 | Implemented on `sum-types` |
 | 2 | Full internal rename: identifiers, explain topics, docs, messages, export envelope key, removal of the `variant` alias | M11 committed | Queued |
 | 3 | Open tagged `@oneof(open=True)` with a distribution-scoped case registry | M11 committed, stage 2 | Queued |
 
@@ -73,9 +73,17 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 - Validation selects the unique member whose exact class matches the value, then validates against that member. No member means an explicit invalid-data failure.
 - Generated facades and debug assertions encode union schemas the same way.
 
+### Encoding
+
+- PALV1 gains schema tag `0x29`: a member count followed by the member schemas in canonical order. Members are scalars, records (`0x20`), domains (`0x21`) or cases (`0x22`).
+- A union value is `0x29`, a 4-byte member index, then the member's ordinary encoding. The index is required: two record members both encode as `0x20` with fields only, because nominal identity lives in the schema descriptor, not in the value bytes.
+- `int | None` and `None | int` produce identical bytes, because the encoder reuses the runtime's canonical member order.
+- Decoding refuses an index outside the member list and any wire schema that differs from the selected one.
+- `ENCODING_VERSION` stays `pyalamode.encoding-v1`. The tag is an addition: existing bytes are unchanged, and a product without union support fails closed on `0x29` with "unsupported schema tag". Distribution compatibility already pins exact product file hashes.
+- Checked `value_encode(v, int | None)` and `value_decode(b, None | int)` use the ordinary annotation parser.
+
 ### Deferred within stage 1
 
-- **Encoding (M11).** `value_encode` must accept `("union", members)` schemas. Union values carry their member's own tag (scalar kind, record identity or `module:Domain.Case`), which is unambiguous because members never overlap. This lands when M11 merges, because `encoding.py` is not in the committed tree.
 - **Named aliases.** A stable module-level alias such as `Shape = Circle | Square` (or `type Shape = ...`) is not admitted yet. When added, the alias identity `module:Alias` becomes the `explicit_cases` selector for that union.
 - **Flow narrowing.** `if x is None:` does not narrow. `match` is the only discriminator.
 
@@ -102,8 +110,12 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 - Coverage: inside the defining distribution, explicit coverage works as for closed domains. Outside it, a final `_` is mandatory regardless of policy, and `explicit_cases` cannot select the domain.
 - Encoding: case identity is the declaring `module:Domain.Case`, which is already stable across the distribution.
 
+## Version strings
+
+`CHECKER_VERSION` and `OPERATION_VERSION` are not bumped on this branch. M10 baseline loading requires them to equal the current values, so a bump makes every M11-era reviewed baseline unsupported unless it is registered as legacy. Cache, evidence and distribution freshness do not depend on the bump, because they hash the exact product file bytes. Whether to bump, and how to treat existing baselines, is an orchestrator decision.
+
 ## Merge notes for the orchestrator
 
-- The `sum-types` branch starts at `9108a81` and does not include the uncommitted M11 tree.
-- After merging, add union support to `encoding.py` (see "Deferred within stage 1") and bump the checker and operation versions in `model.py`.
+- The `sum-types` branch started at `9108a81` and has merged M11 (`c668439`). Merge conflicts were three one-line edits in `pyalamode/__init__.py` and the checker's domain discovery.
+- One M11 test listed `int | str` among encoder schemas that must be refused. It now uses `Foreign | int`, `int | float` and `bool | int`, which remain refused without foreign hooks.
 - Add a ledger entry to `Docs/orchestrations/pyalamode.md` for each stage. The ledger was left untouched here because the M11 session is editing it.

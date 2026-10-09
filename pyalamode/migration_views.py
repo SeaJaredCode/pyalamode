@@ -58,7 +58,7 @@ def _policy(policy):
             "integration_approvals": copy.deepcopy(policy.get("integration_approvals", [])),
             "required_exports": list(policy.get("required_exports", [])),
             "boundary_guards": policy.get("boundary_guards", "off"),
-            "guarded_exports": list(policy.get("guarded_exports", [])), "migration": migration}
+            "guarded_exports": list(policy.get("guarded_exports", [])), "distribution":copy.deepcopy(policy.get("distribution")), "checked_dependencies":copy.deepcopy(policy.get("checked_dependencies",[])), "migration": migration}
 
 
 def inventory(root, paths=None):
@@ -172,6 +172,7 @@ def _operation_rows(snapshot):
     root = Path(snapshot.inputs["root"])
     sites = {}
     for owner in graph.functions.values():
+        if owner.analyzer.path not in snapshot.sources: continue
         pending = [(owner.identity, "direct")]
         seen = set()
         while pending:
@@ -183,8 +184,9 @@ def _operation_rows(snapshot):
             for operation, lines in info.external_operation_sites.items():
                 canonical = "pyalamode." + operation
                 for line in lines:
-                    row = {"boundary": _module_name(owner.analyzer.path, root) + ":" + owner.qualified,
-                           "path": _relative(info.analyzer.path, root), "line": line, "via": via}
+                    row = {"boundary": graph.module_name(owner.analyzer.path) + ":" + owner.qualified,
+                           "path": _relative(info.analyzer.path, root) if info.analyzer.path in snapshot.sources else next(m["authored_path"] for r in graph.distributions["receipts"].values() if r.get("_payload") for m in r["_payload"]["modules"] if m["module"]==graph.module_name(info.analyzer.path)), "line": line, "via": via,
+                           "source_owner": "project" if info.analyzer.path in snapshot.sources else next({"name":r["declaration"]["name"],"version":r["declaration"]["version"],"package":graph.module_name(info.analyzer.path).split(".")[0]} for r in graph.distributions["receipts"].values() if r["declaration"]["name"]==graph.source_owners[info.analyzer.path])}
                     sites.setdefault(canonical, {})[_canonical(row)] = row
             pending.extend((target_, "retained" if via == "retained" else "invoked") for target_ in info.calls)
             pending.extend((target_, "retained") for target_ in info.callable_dependencies)
@@ -215,6 +217,7 @@ def capture_state(snapshot, policy, inventory):
     files = {file.path: file for file in snapshot.result.results}
     if graph:
         for path, analyzer in graph.analyzers.items():
+            if path not in files: continue
             file = files[path]
             relative, module = _relative(path, root), _module_name(path, root)
             marker, required = _module_marker(analyzer), _required_module(relative, policy)
@@ -324,15 +327,16 @@ def capture_state(snapshot, policy, inventory):
             unsafe.append(row)
     modules = [row for row in boundaries if row["kind"] == "module"]
     functions = [row for row in boundaries if row["kind"] == "function"]
-    state = {"schema": 1, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
+    state = {"schema": 2, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
              "target": TARGET, "runtime_environment": runtime_environment(), "edition": EDITION, "checker": CHECKER_VERSION,
              "operation_contract": OPERATION_VERSION, "snapshot": snapshot.snapshot, "freshness": snapshot.freshness,
-             "strict_status": snapshot.result.source_status if snapshot.result.source_status is not None else snapshot.result.status,
+             "strict_status": max(snapshot.result.dependency_status,snapshot.result.source_status if snapshot.result.source_status is not None else snapshot.result.status),
              "current_policy_status": snapshot.result.current_policy_status, "current_policy_events": current_events,
+             "current_dependency_status":snapshot.result.dependency_status,"current_dependency_events":copy.deepcopy(snapshot.result.dependency_events),
              "required_operations": required_operations,
              "inputs": {"sources": {_relative(path, root): copy.deepcopy(row) for path, row in snapshot.inputs["sources"].items()},
                         "policy_sha256": snapshot.inputs["policy_sha256"], "product_artifacts": snapshot.inputs["product_artifacts"],
-                        "integration_inputs": snapshot.inputs["integration_inputs"]},
+                        "integration_inputs": snapshot.inputs["integration_inputs"], "checked_dependencies":copy.deepcopy(snapshot.result.distribution_inputs)},
              "scope": {"project_root": str(root), "selected_paths": sorted(_relative(path, root) for path in snapshot.sources),
                        "displayed_paths": _displayed(snapshot, inventory), "exclusions": inventory["exclusions"]},
              "coverage": {"eligible_modules": len(modules), "selected_modules": sum(row["selected"] for row in modules),
@@ -517,6 +521,7 @@ def _candidate_inventory(snapshot):
     supported, excluded = {}, []
     if snapshot.graph:
         for path, analyzer in snapshot.graph.analyzers.items():
+            if path not in snapshot.sources: continue
             if analyzer.tree is None:
                 continue
             names = {}
@@ -583,7 +588,7 @@ def ready_view(snapshot, state):
         members = [candidates[identity]["selector"] for identity in group]
         if not any(_relative(candidates[identity]["path"], root) in displayed for identity in group):
             continue
-        blockers, prerequisites, available = [], [], True
+        blockers, prerequisites, external_prerequisites, available = [], [], [], True
         for identity in group:
             item = candidates[identity]
             current_analyzer = snapshot.graph.analyzers[item["path"]]
@@ -609,7 +614,9 @@ def ready_view(snapshot, state):
                                 break
                             enclosing = enclosing.parent
                         if not follows_component:
-                            if target in disk_checked:
+                            if callee and callee.analyzer.path not in snapshot.sources and callee.analyzer.result.verified and not snapshot.result.dependency_status:
+                                external_prerequisites.append({"selector":graph.module_name(callee.analyzer.path)+":"+callee.qualified,"dependency":graph.source_owners[callee.analyzer.path],"source_evidence":callee.contract.source_evidence,"failures":list(callee.contract.failures),"trust":list(callee.contract.trust),"effect_bound":list(callee.contract.effect_bound),"required_effects":list(callee.contract.required_effects),"initialization":[{"module":module,"source_evidence":a.result.initialization_evidence,"effects":[] if a.module_mode and a.result.verified else None,"failures":list(a.result.initialization_failures) if a.module_mode and a.result.verified else None,"setup_observations":copy.deepcopy(a.result.setup_observations)} for count in range(1,len(graph.module_name(callee.analyzer.path).split("."))+1) if (module:=".".join(graph.module_name(callee.analyzer.path).split(".")[:count])) in graph.modules and (a:=graph.modules[module])] })
+                            elif target in disk_checked:
                                 prerequisites.append(target)
                             else:
                                 blockers.append({"selector": item["selector"], "reason": "prerequisite lacks current disk strict source proof", "prerequisite": target})
@@ -626,7 +633,7 @@ def ready_view(snapshot, state):
                 contract["freshness"] = "analysis-only candidate snapshot; current source selection is unchanged"
                 hypothetical_contracts.append(contract)
         groups.append({"id": index, "members": members, "physical_members": group, "recursive": len(group) > 1 or any(member in edges[member] for member in group),
-                       "current_selected": False, "hypothetical": True, "blockers": blockers, "checked_prerequisites": sorted(set(prerequisites)),
+                       "current_selected": False, "hypothetical": True, "blockers": blockers, "checked_prerequisites": sorted(set(prerequisites)),"external_prerequisites":external_prerequisites,
                        "predecessor_groups": sorted({component_of[target] for member in group for target in edges[member] if component_of[target] != index}),
                        "preview_available": available, "ready": not blockers,
                        "contracts": hypothetical_contracts})
@@ -790,7 +797,7 @@ def convert_preview(snapshot, state, target):
     blockers = []
     if candidate.freshness.startswith("stale"):
         blockers.append("candidate input snapshot is stale")
-    for key in ("policy_sha256", "product_artifacts", "integration_inputs"):
+    for key in ("policy_sha256", "product_artifacts", "integration_inputs", "checked_dependencies"):
         if candidate.inputs[key] != snapshot.inputs[key]:
             blockers.append("untargeted input changed: " + key)
     if set(candidate.inputs["sources"]) != set(snapshot.inputs["sources"]):

@@ -4,6 +4,7 @@ import argparse
 import json
 from .model import RULES, TARGET
 from .project import build_paths, check_paths
+from .encoding_contracts import ENCODING_VERSION, operation_catalog as codec_catalog, operation_contract as codec_contract
 from .standard_contracts import STANDARD_VERSION, operation_contract, operation_catalog
 from .integration_contracts import INTEGRATION_VERSION, operation_contract as external_contract, integration_snapshot
 
@@ -14,6 +15,8 @@ def _show(result, structured: bool) -> None:
         return
     for item in result.tooling:
         print(item.format())
+    for item in result.policy_diagnostics:
+        if not any(item in file.diagnostics for file in result.results):print(item.format())
     for file in result.results:
         for item in file.diagnostics:
             print(item.format())
@@ -88,6 +91,10 @@ def explain_symbol(symbol: str, *, root=None, snapshot=None) -> dict:
         lines.extend(external_snapshot["errors"])
         return {"symbol": symbol, "status": max(source_status, 2 if external_snapshot["errors"] or any(row["identity_error"] for row in rows) else 0),
                 "title": symbol, "text": "\n".join(lines), "contract": {"version": INTEGRATION_VERSION, "catalog": rows, "approvals": external_snapshot["approvals"], "errors": external_snapshot["errors"]}}
+    codec=codec_contract(symbol)
+    if symbol=="encoding" or codec is not None:
+        rows=codec_catalog() if codec is None else [codec]
+        return {"symbol":symbol,"status":0,"title":symbol,"text":"\n".join(r["identity"]+": "+r["signature"]+"\n"+r["behavior"] for r in rows),"contract":{"version":ENCODING_VERSION,"catalog":rows}}
     if symbol == "standard":
         text = STANDARD_VERSION + ": exact versioned standard operations; ordinary setup and invocation evidence are separate.\n"
         text += "\n".join(row["identity"] + ": " + row["signature"] for row in operation_catalog())
@@ -158,7 +165,8 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--audit", action="store_true", help="report findings without strict evidence")
             command.add_argument("--no-cache", action="store_true")
         else:
-            command.add_argument("--output", help="fresh output directory; default build/pyalamode")
+            command.add_argument("--output", help="fresh output directory or canonical wheel path")
+            command.add_argument("--wheel", action="store_true", help="build the finite ordinary checked source wheel")
     explanation = commands.add_parser("explain", help="describe a stable rule or scalar operation")
     explanation.add_argument("symbol")
     explanation.add_argument("--root", help="project root for current integration policy and identities")
@@ -260,6 +268,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         result = check_paths(args.paths, root=args.root, audit=args.audit, target=args.target, cache=not args.no_cache)
     else:
-        result = build_paths(args.paths, root=args.root, output=args.output, target=args.target)
+        result = build_paths(args.paths, root=args.root, output=args.output, target=args.target, artifact="wheel" if args.wheel else "tree")
     _show(result, args.json)
     return result.status
