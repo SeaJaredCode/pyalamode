@@ -158,6 +158,24 @@ Exhaustiveness inside the distribution is only sound if the checker sees every c
 
 ## Merge notes for the orchestrator
 
-- The `sum-types` branch started at `9108a81` and has merged M11 (`c668439`). Merge conflicts were three one-line edits in `pyalamode/__init__.py` and the checker's domain discovery.
-- One M11 test listed `int | str` among encoder schemas that must be refused. It now uses `Foreign | int`, `int | float` and `bool | int`, which remain refused without foreign hooks.
-- Add a ledger entry to `Docs/orchestrations/pyalamode.md` for each stage. The ledger was left untouched here because the M11 session is editing it.
+The `sum-types` branch started at `9108a81`, merged M11 (`c668439`), and then added the rename, open sums and `@tailrec`. M12 is in progress in the main working tree. It was rehearsed against a snapshot of that tree in a scratch clone: after the steps below, the combined tree passed all 550 tests on macOS, and the snapshot alone passed its 506.
+
+### Procedure (after M12 commits)
+
+1. On `sum-types`: `git -c merge.conflictStyle=diff3 merge main`.
+2. `python tools/rename_oneof.py --resolve`. This settles every conflict region where one side only renamed the base. In the rehearsal it cleared 25 of 32 hunks.
+3. Resolve the remaining regions by hand. In the rehearsal they were:
+   - `pyalamode/__init__.py` `__all__`: M12's list with `oneof` and `tailrec`.
+   - `pyalamode/model.py`: keep M12's new `FunctionContract` fields and `tail_recursive`.
+   - `pyalamode/checker.py`: keep both new `FunctionInfo` fields; add `"tailrec"` to M12's module-mode import allowance; take M12's extracted `_attribute_value(...)` call and apply the extension-case exclusion inside that new method.
+   - `pyalamode/project.py`: M12's contract-relation key line plus the `case` export kind branch.
+   - `pyalamode/migration.py`: `PRODUCTS = (M11_PRODUCTS - {"variants.py"}) | {"sums.py", "builders.py", "builder_contracts.py"}`, with `M11_PRODUCTS` left historical.
+4. `python tools/rename_oneof.py`. M12-only code merges in with the old spelling outside conflict regions; this renames it. The tool is idempotent on branch code and never renames the historical `variants.py`.
+5. Apply the M12-specific follow-ups the tool cannot decide:
+   - M12 reads M11 history through a `historical` flag. M11 history also spells `variant`, `selected_variants` and `variants.py`, so every legacy-spelling condition in `migration.py` becomes `legacy or historical`.
+   - `_FACADE_PUBLIC_BINDINGS` gains the markers: `... | MARKERS | {"unsafe"}`. M12's count assertion for it goes from 66 to 67.
+   - Quoted `"variants"` in M12 code can be a module name (becomes `"sums"`) or a result field (becomes `"oneofs"`). The tool picks `oneofs`; review module-name lists, as in M12's product child-module test.
+   - M12's simulated M11 wheel test must rename the `sums.py` artifact key to `variants.py` and drop `tail_recursive` from the contract, since genuine M11 evidence has neither.
+6. Run the full suite, then the Linux container suite.
+
+Version strings will conflict if M12 bumps them too; take the later milestone's numbering and keep the `sums-unions` and `union-ops` markers.
