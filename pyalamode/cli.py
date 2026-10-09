@@ -4,6 +4,7 @@ import argparse
 import json
 from .model import RULES, TARGET
 from .project import build_paths, check_paths
+from .standard_contracts import STANDARD_VERSION, operation_contract, operation_catalog
 
 
 def _show(result, structured: bool) -> None:
@@ -30,6 +31,9 @@ def _show(result, structured: bool) -> None:
             print("No participating functions were selected; module initialization coverage is reported separately.")
     if result.output:
         print(f"Built ordinary Python source: {result.output}")
+    for file in result.results:
+        for setup in file.setup_observations:
+            print(f"Ordinary setup {setup['identity']} at {file.path}:{setup['line']}: effects {setup['effects']}; {setup['phase']}; surrounding initialization/body unchecked.")
     for boundary in result.guarded_exports:
         state = "generated" if boundary["generated"] else "selected for build"
         print(f"Guarded public boundary {boundary['public_boundary']} ({state}); original {boundary['original_boundary']}: {boundary['original_protection']}.")
@@ -56,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
     explanation.add_argument("symbol")
     args = parser.parse_args(argv)
     if args.command == "explain":
+        if args.symbol == "standard":
+            print(STANDARD_VERSION + ": exact versioned standard operations; ordinary setup and invocation evidence are separate.")
+            for row in operation_catalog():
+                print(row["identity"] + ": " + row["signature"])
+            return 0
+        standard = operation_contract(args.symbol)
+        if standard is not None:
+            print(f"{standard['identity']} ({STANDARD_VERSION}): {standard['signature']}\n{standard['behavior']}\nEffects: {standard['effects']}; failures: {standard['failures']}.\nInitialization: {standard['initialization']['evidence']}\n{standard['aliases']}")
+            return 0
         symbol = args.symbol.upper()
         if symbol in RULES:
             title, remediation = RULES[symbol]
@@ -88,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
             "Effectful": "Effectful[[T1,...],R,Clock,...]: fixed positional callable upper bound; concrete target bounds must be subsets, conditional alternatives union their bounds and finite failures. Exact capability slots require the corresponding effect family; captures/defaults/results cannot retain capabilities. Pure Callable retains an empty effect bound.",
             "borrow": "with borrow(exact_local_capability) as fresh_name: one characterized logical lease; supports finite nested borrowing and invocation lending to exact checked capability slots. View invalidates on every exit, including return/body failure; it does not expose a persistent OS reader. Capabilities cannot be data, aliases, global constants, defaults, callable captures or stable returned values. Factory setup and resource ownership remain ordinary caller obligations.",
             "capabilities": "Finite exact interfaces: IOCapability.read_text(str)->str/write_text(str,str)->None; StateCapability.get()->int/set(int)->None; ClockCapability.now_ns()->int; RandomCapability.below(int)->int; EnvironmentCapability.get(str,str)->str. Each retains its family for live/recorded providers. IO whole-path operations use internal open/read-or-write/close; persistent readers, sessions, arbitrary dispatch and resource transfer remain unsupported. Provider/runtime/path/lifetime assumptions are published in the M5 runtime contract.",
-            "Callable": "typing/collections.abc Callable[[T1, T2], R]: fixed positional pure invocation, exact inputs/result and stable captures; failure upper bound IndexError, KeyError, ValueError, ZeroDivisionError and RecursionError. Analyzed callers supply resolved checked callable evidence; annotations do not prove actual callbacks pure.",
+            "Callable": "typing/collections.abc Callable[[T1, T2], R]: fixed positional pure invocation, exact inputs/result and stable captures; failure upper bound IndexError, KeyError, ValueError, UnicodeError, ZeroDivisionError and RecursionError. Analyzed callers supply resolved checked callable evidence; annotations do not prove actual callbacks pure.",
             "Vector": "Vector[T]: eager exact deep data. of(*explicit items), Vector[T].of() empty, int index/slice, appended(T), updated_at(int,T), concat(Vector[T]), map(checked bounded callback T->R), filter(checked bounded callback T->bool), fold(checked bounded callback (A,T)->A,A); invocation effects union into caller bounds. Retains prior versions; tuple-copy updates O(n); len/equality. IndexError and zero-step ValueError; callback failures propagate. GenericAlias types are runtime erased.",
             "OrderedMap": "OrderedMap[K,V]: exact homogeneous scalar keys and recursively admitted values; of(*exact pair tuples), typed empty, key lookup/get(key,V default)/contains, updated/without/merge, entries()/keys()/values() -> Vector. Replace preserves key position, new keys append; right merge wins; order participates in equivalence. Missing lookup KeyError; tuple-copy updates O(n).",
             "Map": "Map[K,V]: unordered exact homogeneous scalar keys; of(*exact pair tuples), typed empty, lookup/get/contains/updated/without/merge and extensional equality. ordered_entries()/ordered_keys()/ordered_values() -> Vector use scalar total order. No arbitrary traversal or callbacks; canonical representation; missing lookup KeyError; tuple-copy updates O(n).",

@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
-                    FunctionContract, SCALARS, diagnostic, foundation_identities)
+                    FunctionContract, SCALARS, diagnostic, foundation_identities, runtime_environment)
+from .standard_contracts import (STANDARD_NAMES, STANDARD_NATIVE, STANDARD_VERSION,
+                                 SCALAR_SIGNATURES, operation_contract, setup_contract)
 
 BUILTINS = frozenset({"abs", "min", "max", "len"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
@@ -35,12 +37,13 @@ CAPABILITY_OPERATIONS = {
 }
 PROVIDER_FACTORIES = {"live_io": "IOCapability", "recorded_io": "IOCapability", "state": "StateCapability", "live_clock": "ClockCapability", "recorded_clock": "ClockCapability", "live_random": "RandomCapability", "recorded_random": "RandomCapability", "live_environment": "EnvironmentCapability", "recorded_environment": "EnvironmentCapability"}
 EFFECT_PRIMITIVES = frozenset({"effects", "borrow", "Effectful", *EFFECT_FAMILIES, *CAPABILITIES, *PROVIDER_FACTORIES})
-CALLABLE_FAILURES = frozenset({"ZeroDivisionError", "RecursionError", "IndexError", "KeyError", "ValueError"})
+CALLABLE_FAILURES = frozenset({"ZeroDivisionError", "RecursionError", "IndexError", "KeyError", "ValueError", "UnicodeError"})
 # Trusted foundation inventory only; these names are not application call admission.
 EFFECT_FOUNDATIONS = {
     "builtins": frozenset({"type", "object", "tuple", "list", "dict", "set", "len", "any", "all", "enumerate", "next", "str", "int", "bool", "bytes", "open", "range", "min", "getattr", "repr", "isinstance", "classmethod", "staticmethod", "ValueError", "TypeError", "RuntimeError", "AttributeError", "OSError", "UnicodeError", "PermissionError", "IndexError", "KeyError", "FileNotFoundError", "NotADirectoryError", "BytesWarning", "__build_class__", "__import__"}),
     "types": frozenset({"GenericAlias"}),
     "time": frozenset({"time_ns"}),
+    "sys": frozenset({"getfilesystemencoding", "getfilesystemencodeerrors", "flags"}),
     "os": frozenset({"environ", "_Environ", "urandom", "fspath", "fsencode", "fsdecode", "getcwd", "getcwdb", "stat", "lstat", "readlink", "path"}),
     "posixpath": frozenset({"_get_sep", "join", "isabs", "normpath", "realpath", "abspath", "commonpath", "split", "splitdrive", "islink", "isdir", "_joinrealpath", "normcase", "exists", "lexists", "sep", "curdir", "pardir", "os", "stat", "genericpath"}),
     "genericpath": frozenset({"isdir", "_check_arg_types", "os", "stat"}),
@@ -82,7 +85,7 @@ def fingerprint(source: bytes, policy: dict | None = None) -> str:
     metadata = json.dumps({"rules": CHECKER_VERSION, "edition": EDITION, "target": TARGET,
                            "operations": OPERATION_VERSION, "policy": policy or {},
                            "dependencies": ["pyalamode.fun@0.1.0", "CPython3.13.1 scalar builtins"],
-                           "product_artifacts": foundation_identities()},
+                           "product_artifacts": foundation_identities(), "runtime_environment": runtime_environment()},
                           sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(metadata + b"\0" + source).hexdigest()
 
@@ -547,7 +550,9 @@ class ScalarAnalyzer:
                             self._record_call(call)
                         else:
                             self.result.analyzed_call_sites += 1
-                        if resolved_info:
+                        if isinstance(resolved_info, Value):
+                            self._wrapper_inputs(call, resolved_info.callable, env, False)
+                        elif resolved_info:
                             self._checked_inputs(call, resolved_info, env)
                         else:
                             self._call_inputs(call, self.contracts[target], env)
@@ -712,6 +717,11 @@ class CallableValue:
     captures: tuple[tuple[str, str], ...] = ()
     conditional: bool = False
     effect_bound: tuple[str, ...] = ()
+    wrapper: str | None = None
+    components: tuple[CallableValue, ...] = ()
+    bound_arguments: tuple[tuple[str, str], ...] = ()
+    obligation: str | None = None
+    captured_callbacks: tuple[tuple[str, CallableValue], ...] = ()
 
 
 @dataclass
@@ -760,7 +770,8 @@ class FunctionInfo:
         kind = str(schema)
         self.analyzer.graph.types[kind] = schema
         return Value.exact(kind).with_callable(CallableValue(
-            positional, self.returns, (self.identity,), tuple((n, self.captures[n].kind or "unknown") for n in sorted(self.capture_uses)), effect_bound=tuple(sorted(self.declared_effects))))
+            positional, self.returns, (self.identity,), tuple((n, self.captures[n].kind or "unknown") for n in sorted(self.capture_uses)), effect_bound=tuple(sorted(self.declared_effects)),
+            captured_callbacks=tuple((n, self.captures[n].callable) for n in sorted(self.capture_uses) if self.captures[n].callable)))
 
 
 @dataclass(frozen=True)
@@ -857,7 +868,7 @@ def _local_path(root: Path, name: str) -> Path | None:
 
 
 def _product_source(name: str, path: Path) -> bool:
-    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py", "pyalamode.variants": "variants.py", "pyalamode.failures": "failures.py"}
+    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py", "pyalamode.variants": "variants.py", "pyalamode.failures": "failures.py", "pyalamode.standard": "standard.py", "pyalamode.standard_contracts": "standard_contracts.py"}
     return name in files and path == Path(__file__).resolve().parent / files[name]
 
 
@@ -930,6 +941,7 @@ class SourceGraph:
         self.collection_dependency_replacements: set[str] = set()
         self.record_dependency_replacements: set[str] = set()
         self.effect_dependency_replacements: set[str] = set()
+        self.standard_dependency_replacements: set[str] = set()
         for analyzer in self.analyzers.values():
             if analyzer.tree is None:
                 continue
@@ -949,8 +961,8 @@ class SourceGraph:
                 targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else []
                 for target in targets:
                     owner = target.value if isinstance(target, ast.Attribute) else None
-                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute) and target.value.attr == "__dict__":
-                        owner = target.value.value
+                    if isinstance(target, ast.Subscript):
+                        owner = target.value
                     reference = self.reference(analyzer, owner, aliases) if owner else None
                     if reference in self.functions:
                         self.replaced_functions.add(reference)
@@ -965,12 +977,18 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES)
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts"}:
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
-                    elif reference == "module:pyalamode.collections":
+                    elif reference in {"module:pyalamode", "module:pyalamode.collections"}:
                         self.replaced_foundations.add(("pyalamode", "*"))
+                    elif reference and reference.startswith("module:") and reference[len("module:"):] in self.modules:
+                        defined = self.modules[reference[len("module:"):]]
+                        self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
+                        self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
+                        self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
+                        self.replaced_foundations.add((reference[len("module:"):], "*"))
                     elif reference and reference.startswith("foundation:"):
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
@@ -991,12 +1009,18 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES)
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts"}:
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
-                    elif reference == "module:pyalamode.collections":
+                    elif reference in {"module:pyalamode", "module:pyalamode.collections"}:
                         self.replaced_foundations.add(("pyalamode", "*"))
+                    elif reference and reference.startswith("module:") and reference[len("module:"):] in self.modules:
+                        defined = self.modules[reference[len("module:"):]]
+                        self.replaced_functions.update(info.identity for info in self.functions.values() if info.analyzer is defined)
+                        self.replaced_records.update(info.identity for info in self.records.values() if info.analyzer is defined)
+                        self.replaced_variants.update(info.identity for info in [*self.variants.values(), *self.cases.values()] if info.analyzer is defined)
+                        self.replaced_foundations.add((reference[len("module:"):], "*"))
                     elif reference and reference.startswith("foundation:"):
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
@@ -1021,6 +1045,20 @@ class SourceGraph:
                         or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
                     self.effect_dependency_replacements.add(module + "." + attribute)
                     self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
+        for module, attributes in STANDARD_NATIVE.items():
+            for attribute in attributes:
+                if ((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations
+                        or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
+                    self.standard_dependency_replacements.add(module + "." + attribute)
+        # Standard helpers recursively read the inherited exact-data machinery.
+        self.standard_dependency_replacements.update(self.collection_dependency_replacements | self.record_dependency_replacements | self.domain_dependency_replacements)
+        if self.standard_dependency_replacements:
+            self.replaced_foundations.update(("pyalamode", name) for name in STANDARD_NAMES)
+        # Binary IO now depends on both manual Unicode converters and their exact
+        # scalar/helper foundations; a writer cannot reopen an implicit callback.
+        if self.standard_dependency_replacements or any(("pyalamode", name) in self.replaced_foundations for name in {"utf8_encode", "utf8_decode"}):
+            self.effect_dependency_replacements.add("pyalamode.standard.manual_utf8")
+            self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
         for identity in self.record_dependency_replacements | self.collection_dependency_replacements | self.effect_dependency_replacements:
             self.domain_dependency_replacements.add(identity)
         for module, attributes in {"builtins": HANDLER_CATEGORIES | {"UnicodeDecodeError", "UnicodeEncodeError", "UnicodeTranslateError", "BlockingIOError", "ChildProcessError", "ConnectionError", "BrokenPipeError", "ConnectionAbortedError", "ConnectionRefusedError", "ConnectionResetError", "FileExistsError", "FileNotFoundError", "InterruptedError", "IsADirectoryError", "NotADirectoryError", "PermissionError", "ProcessLookupError", "TimeoutError"}}.items():
@@ -1029,6 +1067,16 @@ class SourceGraph:
                     self.domain_dependency_replacements.add(module + "." + attribute)
         if self.domain_dependency_replacements:
             self.replaced_foundations.update(("pyalamode", name) for name in DOMAIN_PRIMITIVES)
+            self.standard_dependency_replacements.update(self.domain_dependency_replacements)
+            self.replaced_foundations.update(("pyalamode", name) for name in STANDARD_NAMES)
+        inherited_data = COLLECTIONS | RECORD_PRIMITIVES | DOMAIN_PRIMITIVES
+        changed_data = {name for name in inherited_data if ("pyalamode", name) in self.replaced_foundations or
+                        any(analyzer._attribute_changed(module, name) for module in ("pyalamode", "pyalamode.collections", "pyalamode.records", "pyalamode.variants", "pyalamode.failures") for analyzer in self.analyzers.values())}
+        if changed_data:
+            self.standard_dependency_replacements.update("pyalamode." + name for name in changed_data)
+            self.replaced_foundations.update(("pyalamode", name) for name in STANDARD_NAMES)
+            self.effect_dependency_replacements.add("pyalamode.standard.data_foundations")
+            self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
         # Schema families depend on every contained exact case, even when a
         # receiving function only returns its input without matching it.
         for family, cases in {"Option": ("Some", "Nothing"), "Result": ("Ok", "Err")}.items():
@@ -1079,6 +1127,8 @@ class SourceGraph:
                 module, name = symbol.name.split(":", 1)
                 if module == "pyalamode.effects" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + name if name in EFFECT_PRIMITIVES else "module:pyalamode.effects"
+                if module in {"pyalamode.standard", "pyalamode.standard_contracts"} and analyzer._foundation_available(module):
+                    return "foundation:pyalamode:" + name if name in STANDARD_NAMES else "module:" + module
                 if module in {"pyalamode.variants", "pyalamode.failures"} and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + name if name in DOMAIN_PRIMITIVES else "module:" + module
                 if module in {"pyalamode.records", "pyalamode.boundaries", "pyalamode.effects"} and analyzer._foundation_available(module):
@@ -1086,23 +1136,58 @@ class SourceGraph:
                 if module == "pyalamode.collections" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + (name if name in COLLECTIONS else "*")
                 target = self.modules.get(module)
-                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS} else None
+                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE} else None
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
+                namespace = self.reference(analyzer, node.func.value, aliases, seen)
+                if namespace and namespace.startswith("module:"):
+                    return namespace
+            producer = self.reference(analyzer, node.func, aliases, seen)
+            if producer in {"foundation:pyalamode:compose", "foundation:pyalamode:partial_first"}:
+                return "module:pyalamode.standard"
         if isinstance(node, ast.Subscript):
             reference = self.reference(analyzer, node.value, aliases, seen)
+            if reference and reference.startswith("module:"):
+                return reference
             if reference and reference.startswith("foundation:pyalamode:") and reference.rsplit(":", 1)[-1] in COLLECTIONS:
                 return reference
         if isinstance(node, ast.Attribute):
             owner = self.reference(analyzer, node.value, aliases, seen)
+            if node.attr == "__dict__" and owner in self.functions:
+                return owner
+            if node.attr == "__globals__":
+                # A function's globals belong to its defining module and are
+                # shared by other helpers. Alias/dict writes taint that complete
+                # module, rather than only the spelling used to obtain the dict.
+                if owner in self.functions:
+                    return "module:" + _module_name(self.functions[owner].analyzer.path, self.root)
+                if owner and owner.startswith("foundation:pyalamode:"):
+                    name = owner.rsplit(":", 1)[-1]
+                    module = ("standard" if name in STANDARD_NAMES else "collections" if name in COLLECTIONS else
+                              "records" if name in RECORD_PRIMITIVES else "boundaries" if name in BOUNDARY_PRIMITIVES else
+                              "effects" if name in EFFECT_PRIMITIVES else "failures" if name in {"failure_value", "Failure"} else
+                              "variants" if name in DOMAIN_PRIMITIVES else None)
+                    return "module:pyalamode" + ("." + module if module else "")
+                if owner and owner.startswith("module:pyalamode"):
+                    return owner
+                if isinstance(node.value, ast.Call):
+                    producer = self.reference(analyzer, node.value.func, aliases, seen)
+                    if producer and (producer.startswith("foundation:pyalamode:") or producer in self.functions):
+                        # Ordinary reflected factory output can expose a product
+                        # wrapper's defining globals; uncertain output fails closed.
+                        return "module:pyalamode"
             if owner in self.variants:
                 case_info = self.variants[owner].cases.get(node.attr)
                 return str(case_info.schema) if case_info else owner
             if owner in self.records or owner in self.cases:
                 return owner
-            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | {"*"}:
+            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES | {"*"}:
                 return owner
             if owner and owner.startswith("module:"):
                 module = owner.split(":", 1)[1]
-                if module == "pyalamode" and node.attr in {"collections", "records", "boundaries", "variants", "failures"} and analyzer._foundation_available("pyalamode." + node.attr):
+                if module in {"pyalamode.standard", "pyalamode.standard_contracts"}:
+                    return "foundation:pyalamode:" + node.attr if node.attr in STANDARD_NAMES else "module:" + module
+                if module == "pyalamode" and node.attr in {"collections", "records", "boundaries", "variants", "failures", "standard", "standard_contracts"} and analyzer._foundation_available("pyalamode." + node.attr):
                     return "module:pyalamode." + node.attr
                 if module in {"pyalamode.variants", "pyalamode.failures"} and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + node.attr if node.attr in DOMAIN_PRIMITIVES else "module:" + module
@@ -1115,7 +1200,7 @@ class SourceGraph:
                     return self.reference(target, ast.Name(id=node.attr), None, seen)
                 if module + "." + node.attr in self.modules:
                     return "module:" + module + "." + node.attr
-                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS}:
+                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE}:
                     return "foundation:" + module + ":" + node.attr
         return None
 
@@ -1127,11 +1212,11 @@ class SourceGraph:
             if symbol.kind == "import":
                 module, attribute = symbol.name.split(":", 1)
                 relevant.add((module, attribute))
-                if module in {"pyalamode.variants", "pyalamode.failures", "pyalamode.effects"} and attribute in DOMAIN_PRIMITIVES | EFFECT_PRIMITIVES:
+                if module in {"pyalamode.variants", "pyalamode.failures", "pyalamode.effects", "pyalamode.standard"} and attribute in DOMAIN_PRIMITIVES | EFFECT_PRIMITIVES | STANDARD_NAMES:
                     relevant.add(("pyalamode", attribute))
             elif symbol.kind == "module":
                 relevant.add((symbol.name, "*"))
-                if symbol.name in {"pyalamode.variants", "pyalamode.failures"}:
+                if symbol.name in {"pyalamode.variants", "pyalamode.failures", "pyalamode.standard", "pyalamode.standard_contracts"}:
                     relevant.add(("pyalamode", "*"))
         if analyzer.tree:
             for node in ast.walk(analyzer.tree):
@@ -1159,6 +1244,8 @@ class SourceGraph:
             replacements.update(identity + ".<record/boundary dependency>" for identity in self.record_dependency_replacements)
         if any(("pyalamode", name) in relevant for name in EFFECT_PRIMITIVES) or ("pyalamode", "*") in relevant or ("pyalamode.effects", "*") in relevant:
             replacements.update(identity + ".<effect dependency>" for identity in self.effect_dependency_replacements)
+        if any(("pyalamode", name) in relevant for name in STANDARD_NAMES) or ("pyalamode", "*") in relevant or any(module in {"pyalamode.standard", "pyalamode.standard_contracts"} for module, _ in relevant):
+            replacements.update(identity + ".<standard dependency>" for identity in self.standard_dependency_replacements)
         for identity in self.replaced_variants:
             info = self.variants.get(identity) or self.cases.get(identity)
             if info.analyzer.path in {path} | set(dependencies):
@@ -1191,18 +1278,30 @@ class SourceGraph:
                     info.definition_failures = set(info.contract.definition_failures)
                     info.capture_uses = set(info.contract.captures)
                     for name, kind in info.contract.captures.items():
+                        if kind in {"unknown", "<unknown>"}:
+                            info.captures[name] = UNKNOWN
+                            continue
                         if kind not in self.types:
                             self.types[kind] = _contract_type(kind)
                         value = analyzer.annotation_value(kind)
                         evidence = info.contract.callable_capture_evidence.get(name)
                         if evidence and value.callable:
-                            value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(evidence["targets"]), tuple(tuple(c) for c in evidence["captures"]), evidence["conditional"], tuple(evidence["effect_bound"])))
+                            value = value.with_callable(analyzer._restore_callable(evidence))
                         info.captures[name] = value
                     evidence = info.contract.return_callable_evidence
                     if evidence:
                         value = analyzer.annotation_value(info.returns)
                         if value.callable:
-                            info.return_value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(evidence["targets"]), tuple(tuple(c) for c in evidence["captures"]), evidence["conditional"], tuple(evidence["effect_bound"])))
+                            info.return_value = value.with_callable(analyzer._restore_callable(evidence))
+                    for name, kind in info.contract.defaults.items():
+                        if kind in {"unknown", "<unknown>"}:
+                            info.defaults[name] = UNKNOWN
+                            continue
+                        if kind not in self.types:
+                            self.types[kind] = _contract_type(kind)
+                        value = analyzer.annotation_value(kind)
+                        evidence = info.contract.callable_default_evidence.get(name)
+                        info.defaults[name] = value.with_callable(analyzer._restore_callable(evidence)) if evidence else value
                     info.analyzed = True
         self._initialization_cycles()
         for analyzer in self.analyzers.values():
@@ -1251,6 +1350,7 @@ class SourceGraph:
                 info.contract.callable_arguments = {n: sorted(targets) for n, targets in info.callable_arguments.items()}
                 info.contract.callable_operations = sorted({op for target in info.callable_dependencies for op in self.functions[target].operations})
                 info.contract.operations = sorted(info.operations)
+                info.contract.operation_contracts = [entry for op in sorted(info.operations) if (entry := operation_contract(op)) is not None]
                 info.contract.required_effects = sorted(info.required_effects)
                 info.contract.effect_origins = {effect: sorted(paths) for effect, paths in info.effect_origins.items()}
                 missing = info.required_effects - info.declared_effects
@@ -1272,6 +1372,10 @@ class SourceGraph:
                         info.contract.trust.append(assumption)
                 if any(operation.startswith("Record.") for operation in info.operations) or any("Record[" in kind for kind in schemas):
                     assumption = "pyalamode records-v1: exact fixed fields, deep schema validation and type-sensitive value equivalence"
+                    if assumption not in info.contract.trust:
+                        info.contract.trust.append(assumption)
+                if any(operation.startswith("standard.") for operation in info.operations):
+                    assumption = STANDARD_VERSION + ": finite exact data, manual decimal/UTF8, explicit eager callback/wrapper evidence and separately characterized ordinary setup"
                     if assumption not in info.contract.trust:
                         info.contract.trust.append(assumption)
                 info.analyzer.dependencies.update(info.dependencies)
@@ -1665,6 +1769,18 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         # full-operation evidence. Setup behavior and external state are unchecked.
         kind = PROVIDER_FACTORIES[name]
         self.graph.types[kind] = TypeSpec(kind)
+        parent = self.parents.get(id(node))
+        phase = "ordinary module initialization"
+        while parent is not None and not isinstance(parent, ast.Module):
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                phase = "ordinary function setup; not performed by import alone"
+                break
+            parent = self.parents.get(id(parent))
+        observation = {**setup_contract(name), "path": self.path, "line": node.lineno, "column": node.col_offset + 1,
+                       "phase": phase, "inputs": [value.kind for value in values], "input_evidence": "exact established source expressions; surrounding shell remains unchecked",
+                       "output": kind, "allowed_operations": list(operations)}
+        if observation not in self.result.setup_observations:
+            self.result.setup_observations.append(observation)
         return Value(frozenset({kind}), capability=CapabilityValue(kind, tuple(sorted(operations)), "live", name + "@" + self.path + ":" + str(node.lineno) + ":" + str(node.col_offset)))
 
     def _primitive_identity(self, node, admitted):
@@ -1906,7 +2022,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             module, name = symbol.name.split(":", 1)
             if module == "pyalamode" and name in COLLECTIONS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("collection_class:" + name)
-            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES and self._foundation_available(module) and not self._module_changed(module, name) and not self._module_changed("pyalamode", name):
+            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES and self._foundation_available(module) and not self._module_changed(module, name) and not self._module_changed("pyalamode", name):
                 return Value.exact("primitive:" + name)
             if module == "builtins" and name in BUILTINS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("builtin:" + name)
@@ -2312,9 +2428,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if not self._symbol_stable(name, symbol):
                 self.emit("PAL101", node, f"import binding `{name}` has another initialization", first=self.global_writes[name][0].lineno)
             module = symbol.name.split(":", 1)[0]
-            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__"} and self._foundation_available(module):
+            if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__", "pyalamode.standard"} and self._foundation_available(module):
                 if symbol.kind == "import":
-                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES}, "types": {"NoneType"}, "pyalamode.variants": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
+                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES}, "types": {"NoneType"}, "pyalamode.variants": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
                     if symbol.name.split(":", 1)[1] not in allowed.get(module, set()):
                         self.emit("PAL241", node, f"foundation import `{symbol.name}` has no supported contract")
                 continue
@@ -2380,7 +2496,13 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             info.captures = {name: b.value for name, b in info.enclosing.items() if b.definite and b.value.types}
         local_writes = _written_names(node.body)
         self.locals = set(local_writes) | set(info.parameters)
-        env = {name: Binding(self.annotation_value(kind), (node.lineno,)) for name, kind in info.parameters.items()}
+        env = {}
+        for name, kind in info.parameters.items():
+            value = self.annotation_value(kind)
+            if value.callable:
+                callback = value.callable
+                value = value.with_callable(CallableValue(callback.parameters, callback.returns, conditional=True, effect_bound=callback.effect_bound, obligation=info.identity + ":" + name))
+            env[name] = Binding(value, (node.lineno,))
         positional = node.args.posonlyargs + node.args.args
         default_nodes = {arg.arg: value for arg, value in zip(positional[-len(node.args.defaults):] if node.args.defaults else [], node.args.defaults)}
         default_nodes.update({arg.arg: value for arg, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None})
@@ -2414,6 +2536,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                                     captures={n: info.captures[n].kind or "unknown" for n in info.capture_uses},
                                     callable_targets={n: list(info.captures[n].callable.targets) for n in info.capture_uses if info.captures[n].callable},
                                     callable_defaults={n: list(v.callable.targets) for n, v in info.defaults.items() if v.callable},
+                                    callable_default_evidence={n: self._callable_evidence(v.callable) for n, v in info.defaults.items() if v.callable},
                                     return_callable_targets=list(info.return_value.callable.targets) if info.return_value and info.return_value.callable else [],
                                     callable_capture_evidence={n: self._callable_evidence(info.captures[n].callable) for n in info.capture_uses if info.captures[n].callable},
                                     return_callable_evidence=self._callable_evidence(info.return_value.callable) if info.return_value and info.return_value.callable else None,
@@ -2428,7 +2551,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         contract.caller_obligations = [f"{name}: exact {kind}; recursively admitted contents and checked callable/capture evidence where applicable" for name, kind in info.parameters.items()]
         contract.caller_obligations.extend(["Resolved constant, callable, capture, marker, annotation and builtin bindings remain unchanged during execution.",
                                             "Callable inputs satisfy their finite invocation effect bound with stable captures; annotations alone do not establish actual evidence. Capability inputs have the exact supported interface, allowed operations and live invocation lifetime; no retention or transfer.",
-                                            "Pure Callable invocation failure upper bound: IndexError, KeyError, ValueError, ZeroDivisionError and RecursionError. Effectful conditional callbacks additionally propagate the finite operation failure bounds of their declared families; concrete target failures propagate separately.",
+                                            "Pure Callable invocation failure upper bound: IndexError, KeyError, ValueError, UnicodeError, ZeroDivisionError and RecursionError. Effectful conditional callbacks additionally propagate the finite operation failure bounds of their declared families; concrete target failures propagate separately.",
                                             "Ordinary callers receive no runtime guards; unchecked import initialization has no purity claim.",
                                             "Handler tokens are actual mutable Python exceptions: only direct finite failure_value conversion is admitted; exact approved builtin failure universe and unchanged operation dependencies are preconditions.",
                                             "Matching assumes exact characterized case tags and payload schemas; capture-free guards do not establish full case coverage unless literal True.",
@@ -2465,7 +2588,11 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                                      tuple(sorted(set(a.callable.targets + b.callable.targets))),
                                      tuple(sorted(set(a.callable.captures + b.callable.captures))),
                                      a.callable.conditional or b.callable.conditional,
-                                     tuple(sorted(set(a.callable.effect_bound + b.callable.effect_bound))))
+                                     tuple(sorted(set(a.callable.effect_bound + b.callable.effect_bound))),
+                                     wrapper="choice" if a.callable != b.callable else a.callable.wrapper,
+                                     components=(a.callable, b.callable) if a.callable != b.callable else a.callable.components,
+                                     obligation=a.callable.obligation if a.callable.obligation == b.callable.obligation else None,
+                                     captured_callbacks=a.callable.captured_callbacks + b.callable.captured_callbacks)
         capability = a.capability if a.capability == b.capability else None
         types = a.types | b.types
         if callback:
@@ -2499,6 +2626,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         if not quiet:
             self._ready_callable(callback, env, node)
             evidence = callback.callable
+            self._add_failures(self._wrapper_validation_failures(evidence))
+            for operation in self._wrapper_operations(evidence):
+                self._collection_operation(operation, node)
             if evidence.conditional:
                 self._add_failures(self._callable_failures(evidence.effect_bound))
             for identity in evidence.targets:
@@ -2508,6 +2638,97 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     self.active.dependencies.update(info.dependencies)
                 self._depend(info.analyzer.path)
         return True
+
+    def _wrapper_value(self, name, parameters, returned, components, bound=()):
+        effects = tuple(sorted({effect for part in components for effect in part.effect_bound}))
+        callback = CallableValue(tuple(parameters), returned,
+                                 tuple(sorted({target for part in components for target in part.targets})),
+                                 tuple(sorted({capture for part in components for capture in part.captures})),
+                                 any(part.conditional for part in components), effects, name, tuple(components), tuple(bound))
+        schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in parameters), self.graph.types[returned], effect_bound=effects)
+        self.graph.types[str(schema)] = schema
+        return Value.exact(str(schema)).with_callable(callback)
+
+    def _standard_call(self, node, env, quiet):
+        target = self._expr(node.func, env, quiet=True)
+        name = target.kind[len("primitive:"):] if target.kind and target.kind.startswith("primitive:") else None
+        if name not in STANDARD_NAMES:
+            return None
+        def reject(reason):
+            if not quiet:
+                self.emit("PAL221", node, reason)
+            return UNKNOWN
+        if node.keywords or any(isinstance(arg, ast.Starred) for arg in node.args):
+            return reject("standard operations require exactly their published positional-only signature")
+        values = [self._expr(arg, env, quiet=quiet) for arg in node.args]
+        if name in SCALAR_SIGNATURES:
+            parameters, returned, failures = SCALAR_SIGNATURES[name]
+            if returned not in self.graph.types:
+                self.graph.types[returned] = _contract_type(returned)
+            for parameter in parameters:
+                if parameter not in self.graph.types:
+                    self.graph.types[parameter] = _contract_type(parameter)
+            if len(values) != len(parameters) or any(not self.matches(value, expected) for value, expected in zip(values, parameters)):
+                return reject(name + " requires exact " + str(parameters))
+            self._collection_operation("standard." + name, node, quiet, failures)
+            return self.annotation_value(returned)
+        if self.definition_mode or self.initializing or not self.active:
+            return reject("higher-order standard operations and wrapper construction are confined to checked function bodies")
+        if name in {"compose", "partial_first"}:
+            if len(values) != 2:
+                return reject(name + " requires exactly two arguments")
+            callbacks = [value.callable for value in values] if name == "compose" else [values[0].callable]
+            if any(callback is None or not callback.targets and not callback.conditional for callback in callbacks):
+                return reject(name + " requires actual resolved callable/capture evidence")
+            for value in values if name == "compose" else values[:1]:
+                callback = value.callable
+                schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in callback.parameters), self.graph.types[callback.returns], effect_bound=callback.effect_bound)
+                self.graph.types[str(schema)] = schema
+                if not self.matches(value, str(schema)):
+                    return reject("wrapper callback must have its exact fixed positional signature")
+                if not quiet:
+                    self._ready_callable(value, env, node)
+            if name == "compose":
+                outer, inner = callbacks
+                if len(outer.parameters) != 1 or len(inner.parameters) != 1 or inner.returns != outer.parameters[0] or not self._data_schema(self.graph.types.get(inner.returns)) or not self._data_schema(self.graph.types.get(outer.returns)) or not (inner.parameters[0] in CAPABILITIES or self._data_schema(self.graph.types.get(inner.parameters[0]))):
+                    return reject("compose requires unary outer B->R and inner A->B, admitted data B/R, and data or exact capability input A")
+                result = self._wrapper_value(name, inner.parameters, outer.returns, callbacks)
+                failures = ()
+            else:
+                callback = callbacks[0]
+                bound_schema = self.graph.types.get(callback.parameters[0]) if callback.parameters else None
+                if len(callback.parameters) != 2 or not self._data_schema(bound_schema) or not self.matches(values[1], str(bound_schema)) or not self._data_schema(self.graph.types.get(callback.returns)) or not (callback.parameters[1] in CAPABILITIES or self._data_schema(self.graph.types.get(callback.parameters[1]))):
+                    return reject("partial_first requires (A,B)->R with admitted data A/R and exact stable bound A; capabilities/callables cannot be bound")
+                result = self._wrapper_value(name, callback.parameters[1:], callback.returns, callbacks,
+                                             ((str(bound_schema), ast.dump(node.args[1], include_attributes=False)),))
+                failures = self._nested_validation_failures(bound_schema)
+            self._collection_operation("standard." + name, node, quiet, failures)
+            return result
+        if len(values) != (3 if name == "vector_scan" else 2):
+            return reject(name + " has the published fixed eager Vector signature")
+        schema = self.graph.types.get(values[0].kind)
+        callback = values[1].callable
+        if schema is None or schema.name != "Vector" or callback is None:
+            return reject(name + " requires exact ordered Vector and resolved checked callback")
+        element = schema.arguments[0]
+        returned = self.graph.types.get(callback.returns)
+        if name == "vector_scan":
+            accumulator = self.graph.types.get(callback.parameters[0]) if len(callback.parameters) == 2 else None
+            if not self._data_schema(accumulator) or not self.matches(values[2], str(accumulator)) or not self._collection_callback(values[1], (accumulator, element), accumulator, node.args[1], env, quiet):
+                return reject("vector_scan requires (Vector[T], (A,T)->A, exact admitted A initial)")
+            result = self._value_schema("Vector", (accumulator,))
+        elif name == "vector_group_by":
+            if returned is None or returned.name not in SCALARS or not self._collection_callback(values[1], (element,), returned, node.args[1], env, quiet):
+                return reject("vector_group_by requires T->K with one exact scalar key schema")
+            group = self._value_schema("Vector", (element,))
+            result = self._value_schema("OrderedMap", (returned, self.graph.types[group.kind]))
+        else:
+            if returned is None or returned.name != "Result" or not self._collection_callback(values[1], (element,), returned, node.args[1], env, quiet):
+                return reject("result_traverse requires T->Result[U,E] with admitted U/E schemas")
+            successes = self._value_schema("Vector", (returned.arguments[0],))
+            result = self._value_schema("Result", (self.graph.types[successes.kind], returned.arguments[1]))
+        self._collection_operation("standard." + name, node, quiet, ("RecursionError",))
+        return result
 
     def _collection_call(self, node, env, quiet):
         """Finite resolved direct methods; no arbitrary attribute dispatch or protocols."""
@@ -3128,9 +3349,11 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return reject("PAL240", f"resolved dependency `{module}.{node.attr}` has an analyzed replacement")
                 if module == "builtins" and node.attr in BUILTINS:
                     return Value.exact("builtin:" + node.attr)
+                if module == "pyalamode" and node.attr == "standard" and self._foundation_available("pyalamode.standard"):
+                    return Value.exact("module:pyalamode.standard")
                 if module == "pyalamode" and node.attr in COLLECTIONS and self._foundation_available(module):
                     return Value.exact("collection_class:" + node.attr)
-                if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures"} and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES and self._foundation_available(module) and not self._module_changed("pyalamode", node.attr):
+                if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard"} and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES and self._foundation_available(module) and not self._module_changed("pyalamode", node.attr):
                     return Value.exact("primitive:" + node.attr)
                 target = self.graph.modules.get(module)
                 if target:
@@ -3228,6 +3451,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return reject("PAL210", "conditional expression requires exact bool")
             return self.merge_values(yes, no)
         if isinstance(node, ast.Call):
+            standard = self._standard_call(node, env, quiet)
+            if standard is not None:
+                return standard
             domain_value = self._domain_call(node, env, quiet)
             if domain_value is not None:
                 return domain_value
@@ -3272,6 +3498,17 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 self._record_call(node)
                 self._ready_callable(target, env, node)
                 self._require_effects(callback.effect_bound, node, "callable invocation")
+            if callback.wrapper:
+                self._wrapper_inputs(node, callback, env, quiet)
+                parameters = tuple(self.graph.types[k] for k in callback.parameters)
+                returned = self.graph.types[callback.returns]
+                if not self._collection_callback(target, parameters, returned, node, env, quiet):
+                    return reject("PAL221", "wrapper invocation requires its exact characterized callable contract")
+                if not quiet:
+                    self._add_failures(self._nested_validation_failures(returned))
+                    for identity in self._wrapper_operations(callback):
+                        self._collection_operation(identity, node)
+                return self.annotation_value(callback.returns)
             if callback.targets:
                 if callback.conditional:
                     if node.keywords or len(node.args) != len(callback.parameters) or any(isinstance(a, ast.Starred) for a in node.args):
@@ -3294,7 +3531,11 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     if info.parent is None and not info.analyzed and not info.analyzing:
                         info.analyzer.function(info)
                     if info.return_value and info.return_value.callable:
-                        return info.return_value
+                        bindings = self._callable_bindings(node, info, env)
+                        specialized = self._specialize_callable(info.return_value.callable, bindings)
+                        schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in specialized.parameters), self.graph.types[specialized.returns], effect_bound=specialized.effect_bound)
+                        self.graph.types[str(schema)] = schema
+                        return Value.exact(str(schema)).with_callable(specialized)
                 return self.annotation_value(next(iter(returns))) if len(returns) == 1 else UNKNOWN
             if callback.conditional:
                 if node.keywords or len(node.args) != len(callback.parameters) or any(isinstance(a, ast.Starred) for a in node.args):
@@ -3344,18 +3585,89 @@ class FunctionalAnalyzer(ScalarAnalyzer):
 
     def _ordinary_resolved_info(self, expression, env):
         value = self._expr(expression, env, quiet=True)
+        if value.callable and value.callable.wrapper:
+            return value
         if value.callable and len(value.callable.targets) == 1:
             return self.graph.functions[value.callable.targets[0]]
         return None
 
     @staticmethod
     def _callable_evidence(callback):
-        return {"targets": list(callback.targets), "captures": [list(c) for c in callback.captures], "conditional": callback.conditional, "effect_bound": list(callback.effect_bound)}
+        return {"parameters": list(callback.parameters), "returns": callback.returns,
+                "targets": list(callback.targets), "captures": [list(c) for c in callback.captures], "conditional": callback.conditional, "effect_bound": list(callback.effect_bound),
+                "wrapper": callback.wrapper, "components": [FunctionalAnalyzer._callable_evidence(part) for part in callback.components],
+                "bound_arguments": [list(bound) for bound in callback.bound_arguments], "obligation": callback.obligation,
+                "captured_callbacks": [[name, FunctionalAnalyzer._callable_evidence(part)] for name, part in callback.captured_callbacks]}
+
+    @staticmethod
+    def _restore_callable(evidence):
+        return CallableValue(tuple(evidence["parameters"]), evidence["returns"], tuple(evidence["targets"]), tuple(tuple(c) for c in evidence["captures"]), evidence["conditional"], tuple(evidence["effect_bound"]),
+                             evidence.get("wrapper"), tuple(FunctionalAnalyzer._restore_callable(part) for part in evidence.get("components", [])),
+                             tuple(tuple(bound) for bound in evidence.get("bound_arguments", [])), evidence.get("obligation"),
+                             tuple((name, FunctionalAnalyzer._restore_callable(part)) for name, part in evidence.get("captured_callbacks", [])))
+
+    def _wrapper_inputs(self, node, callback, env, quiet):
+        if node.keywords or len(node.args) != len(callback.parameters) or any(isinstance(arg, ast.Starred) for arg in node.args):
+            if not quiet:
+                self.emit("PAL221", node, "wrapper invocation requires exactly its fixed positional signature")
+            return
+        for arg, expected in zip(node.args, callback.parameters):
+            if not self.matches(self._expr(arg, env, quiet=quiet), expected) and not quiet:
+                self.emit("PAL221", arg, "wrapper argument requires exact " + expected)
+
+    def _callable_bindings(self, node, info, env):
+        positional = [name for name, kind in info.kinds.items() if kind != "keyword_only"]
+        supplied = dict(zip(positional, node.args))
+        supplied.update((kw.arg, kw.value) for kw in node.keywords if kw.arg in info.parameters)
+        bindings = {}
+        for name in info.parameters:
+            value = self._expr(supplied[name], env, quiet=True) if name in supplied else info.defaults.get(name, UNKNOWN)
+            if value.callable:
+                bindings[info.identity + ":" + name] = value.callable
+        return bindings
+
+    def _specialize_callable(self, callback, bindings):
+        if callback.obligation in bindings:
+            return bindings[callback.obligation]
+        parts = tuple(self._specialize_callable(part, bindings) for part in callback.components)
+        captured = tuple((name, self._specialize_callable(part, bindings)) for name, part in callback.captured_callbacks)
+        if parts:
+            return CallableValue(callback.parameters, callback.returns,
+                                 tuple(sorted({target for part in parts for target in part.targets})),
+                                 tuple(sorted({capture for part in parts for capture in part.captures})),
+                                 any(part.conditional for part in parts), tuple(sorted({effect for part in parts for effect in part.effect_bound})),
+                                 callback.wrapper, parts, callback.bound_arguments, captured_callbacks=captured)
+        return CallableValue(callback.parameters, callback.returns, callback.targets, callback.captures, callback.conditional, callback.effect_bound,
+                             callback.wrapper, parts, callback.bound_arguments, callback.obligation, captured)
+
+    @staticmethod
+    def _wrapper_operations(callback):
+        own = {"standard." + callback.wrapper + ".invoke"} if callback.wrapper in {"compose", "partial_first"} else set()
+        return own | {operation for part in callback.components for operation in FunctionalAnalyzer._wrapper_operations(part)}
+
+    def _wrapper_validation_failures(self, callback):
+        failures = set()
+        if callback.wrapper == "compose":
+            for kind in (callback.components[1].returns, callback.returns):
+                failures.update(self._nested_validation_failures(self.graph.types.get(kind)))
+        elif callback.wrapper == "partial_first":
+            failures.update(self._nested_validation_failures(self.graph.types.get(callback.returns)))
+        for part in callback.components:
+            failures.update(self._wrapper_validation_failures(part))
+        return failures
 
     def _ready_callable(self, value, env, node, seen=None):
         if not value.callable or not self.active:
             return
         seen = set() if seen is None else seen
+        for part in value.callable.components:
+            schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in part.parameters), self.graph.types[part.returns], effect_bound=part.effect_bound)
+            self.graph.types[str(schema)] = schema
+            self._ready_callable(Value.exact(str(schema)).with_callable(part), env, node, seen)
+        for _, part in value.callable.captured_callbacks:
+            schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in part.parameters), self.graph.types[part.returns], effect_bound=part.effect_bound)
+            self.graph.types[str(schema)] = schema
+            self._ready_callable(Value.exact(str(schema)).with_callable(part), env, node, seen)
         for target in value.callable.targets:
             if target in seen:
                 continue

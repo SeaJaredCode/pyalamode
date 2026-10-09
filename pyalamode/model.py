@@ -4,19 +4,25 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 import hashlib
 from pathlib import Path
+import sys
 
-CHECKER_VERSION = "domains-failures-6.0"
+CHECKER_VERSION = "standard-operations-7.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-ops-6"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-ops-7"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
+
+
+def runtime_environment() -> dict:
+    return {"filesystem_encoding": sys.getfilesystemencoding(), "filesystem_errors": sys.getfilesystemencodeerrors(),
+            "utf8_mode": sys.flags.utf8_mode}
 
 
 def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
+            for name in ("__init__.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -100,6 +106,8 @@ class FunctionContract:
     direct_failures: list[str] = field(default_factory=list)
     patterns: list[dict] = field(default_factory=list)
     handlers: list[dict] = field(default_factory=list)
+    operation_contracts: list[dict] = field(default_factory=list)
+    callable_default_evidence: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -120,6 +128,7 @@ class CheckResult:
     binding_context: list[str] = field(default_factory=list)
     records: list[dict] = field(default_factory=list)
     variants: list[dict] = field(default_factory=list)
+    setup_observations: list[dict] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:

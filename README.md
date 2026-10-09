@@ -1,8 +1,8 @@
 # Pyalamode
 
-Pyalamode checks a functional core in ordinary Python. The current M6 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, and characterized failure handlers. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
+Pyalamode checks a functional core in ordinary Python. The current M7 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, characterized failure handlers, and a bounded standard toolkit for text, integers, UTF-8/hex, eager scan/grouping, composition, partial application and Result traversal. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
-The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux** (`cpython-3.13.1`). Other patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Installation under another Python 3.13 patch does not establish compatibility.
+The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux**, with native filesystem encoding `utf-8` and errors `surrogateescape` (`cpython-3.13.1`). Reports/cache inputs record the observed encoding, error mode and UTF-8 mode. Other native filesystem configurations, patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Ordinary live IO/environment setup checks the same filesystem condition. Installation under another Python 3.13 patch does not establish compatibility.
 
 ## Install and run
 
@@ -23,6 +23,8 @@ pyalamode check examples/effects --no-cache
 python -m examples.effects.demo
 pyalamode check examples/domains --no-cache
 python -m examples.domains.demo
+pyalamode check examples/standard --no-cache
+python -m examples.standard.demo
 ```
 
 The scalar example prints `1300` and `0`. The module example prints `1500`, `6`, `6`, and `2`. Its checked core uses stable imports, defaults, a closure, a recursive calculation, and tuple inputs; its ordinary demo prints those results without receiving a purity claim.
@@ -225,6 +227,33 @@ In an ordinary shell, `freeze(raw, exclusive=True, schema=Vector[int])` recursiv
 
 `dataclass_adapter(Source, Customer)` or `namedtuple_adapter(Source, Customer)` can qualify a finite exact generated source class for `freeze(source, exclusive=True, adapter=adapter, schema=Customer)`. Source field order/storage/generated behavior and stable defaults must qualify; custom getters/constructors/methods, factories and subclasses fail. The target is a concrete product record with exact nested schema validation. `frozen=True` alone certifies neither behavior nor nested data. The [record demo](examples/records/demo.py) shows source mutation after snapshotting and export mutation without changing retained records.
 
+## Bounded standard operations
+
+```python
+from pyalamode import Vector, fun, text_split, integer_parse_decimal, vector_scan
+
+@fun
+def parse_item(text: str) -> int:
+    return integer_parse_decimal(text)
+
+@fun
+def add(total: int, value: int) -> int:
+    return total + value
+
+@fun
+def running_prices(text: str) -> Vector[int]:
+    values = text_split(text, ",").map(parse_item)
+    return vector_scan(values, add, 0)
+```
+
+`pyalamode.standard-v1` publishes exact positional-only contracts for twelve text/integer/encoding operations and five eager helpers. Decimal conversion admits `[+-]?[0-9]{1,4096}` and canonical output, using manual arithmetic independent of CPython's ambient decimal formatting limit. UTF-8 uses manual exact conversion and builtin Unicode failures; registered codecs/error handlers cannot run. Hex decoding accepts even ASCII pairs without whitespace. No float/context, general formatter, dynamic codec, JSON, pickle or foreign restoration is admitted.
+
+Scans include the initial accumulator; grouping preserves first-key and within-group input order; Result traversal stops at the first Err. `compose(outer, inner)` supports fixed unary callbacks; `partial_first(binary_callback, stable_first_argument)` returns a fixed unary callback. Construction invokes neither callback, while later invocation preserves actual targets, captures, effects, failures and trust. Bound arguments must be stable data; an unbound wrapper input can be data or an exact capability slot. Callable values remain outside data containers and selected data guards.
+
+Existing rooted whole-file IO, Clock and Environment interfaces have versioned entries in the same report catalog. Live IO uses binary read/write plus manual UTF-8, closes on failure, and preserves newlines. A write opens/truncates before encoding, so encoding/OS failure can leave truncated or partial output. Roots, relative paths and environment names reject surrogate code points before native conversion. Filesystem stability/permission and lifetime preconditions remain explicit. Controlled providers retain effects. Recognized ordinary provider setup has separate per-file observations; a pure export does not certify surrounding import initialization, and strict modules refuse imports with ordinary setup.
+
+The [standard workflow](examples/standard/core.py) and [ordinary demo](examples/standard/demo.py) cover parsing to Result/Failure, running totals, grouping, adjusted values, UTF-8/hex and separately effectful providers. `pyalamode explain compose`, `integer_parse_decimal`, `utf8_decode` and `IOCapability.read_text` describe their contracts. Structured check/build reports include `standard_catalog`, used `operation_contracts`, recursive callable evidence and `setup_observations`. [The M7 contract](Docs/milestones/07-standard.md) and [runtime inventory](Docs/evidence/m07-runtime-contract.md) publish signatures, ordering, failures, aliases, initialization and costs. Target-user usefulness remains **UNMEASURED**; the representative tasks and measurement protocol do not imply completed user validation.
+
 ## Optional guards
 
 ```toml
@@ -262,8 +291,8 @@ Disposable `.pyalamode-cache` entries include source bytes, target, policy, prod
 ## Verification and handoff
 
 ```sh
-python -m unittest discover -s tests -p 'm0*.py' -v
+python -m unittest discover -s tests -p 'm*.py' -v
 python benchmarks/m01_scalar.py --output /tmp/pyalamode-m01.json
 ```
 
-The M6 suite adds case-set freshness and explicit-case policy, full/guarded/nested pattern coverage, opaque exception cleanup/collision gates, per-call failure masks preserving effects, ordered immutable error accumulation, supported variant guards and nonexecuting ordinary builds. The M5 suite adds finite operation/declared/required effect unions, concrete and conditional higher-order capability slots, data/alias/capture/lifetime escape refusals, controlled providers, whole-path IO cleanup, permission gates, partial warm callable evidence, and current source/policy/product/writer fingerprints. The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.
+The M7 suite adds exact standard signatures/identities, nested composition/partial evidence, eager ordering, conditional Unicode failures, per-occurrence wrapper validation masks, cold/full/partial cache equality, separate ordinary setup/import evidence, shared native/helper/globals writer refusals, supported filesystem configuration and real off/exports/debug workflows. The M6 suite adds case-set freshness and explicit-case policy, full/guarded/nested pattern coverage, opaque exception cleanup/collision gates, per-call failure masks preserving effects, ordered immutable error accumulation, supported variant guards and nonexecuting ordinary builds. The M5 suite adds finite operation/declared/required effect unions, concrete and conditional higher-order capability slots, data/alias/capture/lifetime escape refusals, controlled providers, whole-path IO cleanup, permission gates, partial warm callable evidence, and current source/policy/product/writer fingerprints. The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.

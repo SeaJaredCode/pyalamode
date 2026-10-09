@@ -19,7 +19,8 @@ from pathlib import Path
 from .checker import SourceGraph, analyze_file, analyze_source, fingerprint, load_sources, _import_name, _local_path, _module_name
 import ast
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
-                    Diagnostic, FunctionContract, diagnostic, foundation_identities)
+                    Diagnostic, FunctionContract, diagnostic, foundation_identities, runtime_environment)
+from .standard_contracts import STANDARD_VERSION, operation_catalog
 
 _EXCLUDED = frozenset({".git", ".venv", "__pycache__", "build", "dist", ".pyalamode-cache"})
 
@@ -47,6 +48,8 @@ class ProjectResult:
         from dataclasses import asdict
         return {"schema": 1, "edition": EDITION, "checker": CHECKER_VERSION, "target": TARGET,
                 "operation_contract": OPERATION_VERSION, "product_artifacts": foundation_identities(),
+                "runtime_environment": runtime_environment(),
+                "standard_operation_version": STANDARD_VERSION, "standard_catalog": operation_catalog(),
                 "mode": "audit" if self.audit else "strict",
                 "verified": self.verified, "status": self.status,
                 "elapsed_seconds": self.elapsed_seconds, "output": self.output,
@@ -71,6 +74,9 @@ def runtime_error(target: str = TARGET) -> str | None:
         return f"unsupported platform {sys.platform}; supported platforms are macOS and Linux"
     if sysconfig_free_threaded():
         return "free-threaded CPython builds are outside the supported target"
+    environment = runtime_environment()
+    if environment["filesystem_encoding"] != "utf-8" or environment["filesystem_errors"] != "surrogateescape":
+        return "unsupported native filesystem configuration; use UTF-8 encoding with surrogateescape errors"
     return None
 
 
@@ -119,7 +125,7 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
                 if len(set(value)) != len(value):
                     return policy, "guarded_exports contains duplicate selections"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 6 configuration"
+                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 7 configuration"
         if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
             return policy, "guarded_exports conflicts with boundary_guards=off"
         if policy.get("boundary_guards") == "exports" and not policy.get("guarded_exports"):
@@ -165,7 +171,8 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
-                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), variants=payload.get("variants", []))
+                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), variants=payload.get("variants", []),
+                             setup_observations=payload.get("setup_observations", []))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
         if payload["mode"] != result.mode:
             return None

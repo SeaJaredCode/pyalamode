@@ -11,8 +11,10 @@ import stat
 import time
 import typing
 import collections.abc
+import sys
 from types import GenericAlias
 from . import records as _records
+from . import standard as _standard
 
 IO = "IO"
 State = "State"
@@ -34,6 +36,19 @@ def _invalid(path, reason):
 def _exact(value, kind, path):
     if type(value) is not kind:
         _invalid(path, "unsupported exact input type")
+
+
+def _scalar_text(value, path):
+    _exact(value, str, path)
+    for character in value:
+        if 0xD800 <= ord(character) <= 0xDFFF:
+            raise ValueError(path + " requires Unicode scalar values without surrogates")
+    return value
+
+
+def _filesystem_runtime():
+    if sys.getfilesystemencoding() != "utf-8" or sys.getfilesystemencodeerrors() != "surrogateescape":
+        raise RuntimeError("live providers require utf-8 filesystem encoding with surrogateescape errors")
 
 
 def _families(values):
@@ -102,8 +117,8 @@ class IOCapability(_Capability):
                     return text
             raise KeyError(path)
         location = _location(provider, path)
-        with open(location, "r", encoding="utf-8", errors="strict", newline="") as stream:
-            return stream.read()
+        with open(location, "rb") as stream:
+            return _standard.utf8_decode(stream.read())
 
     def write_text(self, path, text):
         provider = _live(self, IO)
@@ -119,8 +134,8 @@ class IOCapability(_Capability):
             object.__setattr__(provider, "data", entries + ((path, text),))
             return None
         location = _location(provider, path)
-        with open(location, "w", encoding="utf-8", errors="strict", newline="") as stream:
-            stream.write(text)
+        with open(location, "wb") as stream:
+            stream.write(_standard.utf8_encode(text))
         return None
 
 
@@ -258,7 +273,7 @@ def _live(capability, family=None):
     if actual == IO:
         _allowed(allowed)
         if mode == "live":
-            _exact(root, str, "IO root")
+            _scalar_text(root, "IO root")
     elif type(allowed) is not tuple or allowed or root is not None:
         _invalid("capability", "unexpected provider metadata")
     visited = ()
@@ -350,14 +365,14 @@ def _integers(values, path):
 
 
 def _environment_name(name):
-    _exact(name, str, "name")
+    _scalar_text(name, "name")
     if not name or "=" in name or "\x00" in name:
         raise ValueError("environment name must be nonempty without '=' or NUL")
     return name
 
 
 def _relative(path):
-    _exact(path, str, "path")
+    _scalar_text(path, "path")
     if not path or "\x00" in path or "\\" in path or any(part in {"", ".", ".."} for part in path.split("/")):
         raise ValueError("path must contain nonempty relative components without dot/dotdot, backslash or NUL")
     return path
@@ -419,11 +434,13 @@ def _location(provider, relative):
 
 def live_io(root, *, allowed_ops):
     """Rooted whole-file UTF-8 operations; symlink/TOCTOU limits are explicit."""
-    _exact(root, str, "root")
+    _scalar_text(root, "root")
+    _filesystem_runtime()
     allowed = _allowed(allowed_ops)
     if not root or "\x00" in root:
         raise ValueError("root must be a nonempty filesystem path without NUL")
     canonical = os.path.realpath(root)
+    _scalar_text(canonical, "canonical root")
     if not os.path.isdir(canonical):
         raise NotADirectoryError("IO root must name an existing directory")
     return _new(IO, "live", root=canonical, allowed=allowed)
@@ -455,6 +472,7 @@ def recorded_random(values):
 
 
 def live_environment():
+    _filesystem_runtime()
     return _new(Environment, "live")
 
 
