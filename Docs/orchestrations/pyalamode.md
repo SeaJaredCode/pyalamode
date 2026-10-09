@@ -39,13 +39,13 @@
   - Task: /root/m04_records; runtime helper /root/m04_runtime; independent reviewer /root/m04_review
   - Depends on: 3
   - Acceptance: A14–A16, A34–A35; independent snapshots/exports and selected guard coverage.
-  - Evidence: Frozen149-test suite passes macOS2.491s/Linux7.591s; root39 CLI/ordinary execution/failed-build gates and3 shipped negative fixture no-output builds clean. Independent93 literal sources,99 runtime assertions,49 guard assertions and42 project layouts/168 assertions pass on both actual platforms with unchanged/cross-platform source maps. Actual generated guard counts0/2/28 over8 direct internal leaf calls;10 runtime conditions/30 intervals/750 calls per platform and all9 current product digests independently inspected. Final conformance/handoff/cost documentation inspected. Commitpending.
-- [ ] 5. Checked effectful shells
-  - State: queued
-  - Task: not started
+  - Evidence: Frozen149-test suite passes macOS2.491s/Linux7.591s; root39 CLI/ordinary execution/failed-build gates and3 shipped negative fixture no-output builds clean. Independent93 literal sources,99 runtime assertions,49 guard assertions and42 project layouts/168 assertions pass on both actual platforms with unchanged/cross-platform source maps. Actual generated guard counts0/2/28 over8 direct internal leaf calls;10 runtime conditions/30 intervals/750 calls per platform and all9 current product digests independently inspected. Final conformance/handoff/cost documentation inspected. Commit7c201ab.
+- [x] 5. Checked effectful shells
+  - State: complete
+  - Task: /root/m05_effects; runtime helper /root/m04_records; independent reviewer /root/m05_review
   - Depends on: 4
   - Acceptance: A17–A18; finite effects, capability lifetime, unknown-operation rejection and provider classification.
-  - Evidence: pending
+  - Evidence: Frozen194 suite passes native3.259s/Linux10.087s. Root installed-CLI all-five-family unchanged-artifact execution, explicit capability HOF/borrow and failed-build gates pass; three shipped negatives each1/nooutput. Root independently reran all175 published literal cases (36admit/139refuse) and reconciled26 checkout hashes. Reviewer332focused assertions perplatform plus194suite and35-entry source maps pass; actual Linux package/CLI installed. Runtime20rows/60intervals/1500calls perplatform, ten product/four support identities current/crossplatform/beforeafter identical. Contracts, final conformance, README and costs inspected; milestone commit pending.
 - [ ] 6. Domain alternatives and failure
   - State: queued
   - Task: not started
@@ -161,3 +161,10 @@
 - M3transitivefoundationfix: finiteactualbackendbuiltin/types inventory, knownanalyzedwritersinvalidatecollectionclasses+warmcontext; unrelatedscalarstridentity retainsproof/cache. Latestchecker7791b1ae028218413af16d02f956bb434f6cb8e7b073d4369ad6ba1b83683539, runtimec0a4738ae85c1048b44c160a19f2d425c2872a5b601dcd352989903ad4102ab6. Combined93-tests passmacOS1.508s/Linux3.646s. Finalfocusedconformance andfinalmetrics againsttheseidentities running.
 
 - M3allworkerterminalreadiness inspected; Docs/milestones/03-collections.md andDocs/evidence/m03-runtime-measurements.md complete. Finalsrc/productidentities matchbothrawplatformmeasurements; sourceunchangedgatespass.
+
+- M5 plan approved: finite source effect bounds, actual declared/conditional callback unions, explicit capability parameter lending and fixed Effectful signatures; whole-path rooted IO cleanup plus logical lexical borrow views, without persistent readers or capability captures. Live and recorded providers keep identical effect families. Strict unknown operations remain refusal. Fresh runtime helper dispatch hit client agent thread limit; completed M4 main task reused with a curated, disjoint runtime-only unit. Root owns gates and commits.
+
+- M5 interim root verification:191 tests pass native2.873s after runtime26 added; earlier165 pass native3.270s/Linux9.398s. Actual installed CLI all-five-family check/build preserves source; stock Python artifact returns ('Ada','input',107,4), rooted IO writes saved:input and state advances4→5. Explicit capability-slot HOF and borrow pass. Three failed builds (undeclared IO, expired view, unknown operation) and narrowed entry policy each refuse/no artifact; six explain commands pass. Final frozen two-platform review/measurements pending.
+- M5 review fixes: unused nested capability tuple refused; correct nested TOML effect-bound table; actual effects-function/submodule name collision modeled; imported private borrow-class method writers rejected. Ambient secrets/random import setup removed in favor of a finite direct OS-entropy operation; recorded provider classifications remain unchanged.
+
+- M5 final gate observed against frozen checker5.1/runtime31d3ee92: all workers terminal, named final conformance corpus rerun by root, full source maps and actual generated-artifact measurements reconciled. Human measurements remain unmeasured; full-interface capability permission restriction, no captures/data/transfer, rooted IO TOCTOU assumptions and logical lease limits are published. No required engineering gate remains for M5.

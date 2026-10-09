@@ -5,10 +5,10 @@ from typing import Any
 import hashlib
 from pathlib import Path
 
-CHECKER_VERSION = "records-boundaries-4.0"
+CHECKER_VERSION = "effects-capabilities-5.1"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-ops-4"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-ops-5"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -16,7 +16,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
+            for name in ("__init__.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -34,6 +34,8 @@ RULES = {
     "PAL230": ("call target unknown or unsupported", "Use a resolved checked callable or an unchanged approved builtin with its supported signature."),
     "PAL240": ("dependency binding is not approved", "Use statically established stable values/callables and leave dependency bindings unchanged."),
     "PAL241": ("module initialization is not characterized", "Use supported stable initialization and import only characterized foundations or checked functional modules."),
+    "PAL310": ("effect bound exceeded", "Declare the characterized effect at the receiving boundary within project policy, or pass stable data to a pure calculation. Effect names never authorize unknown operations."),
+    "PAL320": ("capability lifetime or escape unsupported", "Use an exact capability parameter or the finite borrow scope; lend it only to checked capability slots. Capabilities cannot be data, aliases, defaults, captures or returned values."),
     "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
 }
 
@@ -81,6 +83,17 @@ class FunctionContract:
     definition_failures: list[str] = field(default_factory=list)
     operations: list[str] = field(default_factory=list)
     data_assertions: list[dict] = field(default_factory=list)
+    callable_capture_evidence: dict[str, dict] = field(default_factory=dict)
+    return_callable_evidence: dict | None = None
+    invoked_targets: list[str] = field(default_factory=list)
+    callable_dependencies: list[str] = field(default_factory=list)
+    callable_arguments: dict[str, list[str]] = field(default_factory=dict)
+    callable_operations: list[str] = field(default_factory=list)
+    effect_bound: list[str] = field(default_factory=list)
+    required_effects: list[str] = field(default_factory=list)
+    effect_origins: dict[str, list[str]] = field(default_factory=dict)
+    capability_parameters: dict[str, dict] = field(default_factory=dict)
+    borrow_scopes: list[dict] = field(default_factory=list)
 
 
 @dataclass

@@ -92,11 +92,20 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
             return {}, "tool.pyalamode must be a table"
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
-                    "require_modules": [], "guarded_exports": []}
+                    "require_modules": [], "guarded_exports": [], "effect_bounds": {}}
         for key, value in policy.items():
             if key == "require_modules":
                 if type(value) is not list or any(type(pattern) is not str or not pattern or pattern.startswith("/") or ".." in Path(pattern).parts or "\\" in pattern for pattern in value):
                     return policy, "require_modules must be a list of nonempty project-relative glob patterns"
+            elif key == "effect_bounds":
+                from .checker import EFFECT_FAMILIES
+                if type(value) is not dict:
+                    return policy, "effect_bounds must be a table of exact module:function selections to finite family lists"
+                for selection, bound in value.items():
+                    if type(selection) is not str or selection.count(":") != 1 or any(not part.isidentifier() for part in selection.split(":", 1)[0].split(".")) or any(not part.isidentifier() for part in selection.split(":", 1)[1].split(".")):
+                        return policy, "effect_bounds selectors must be exact module:function identities"
+                    if type(bound) is not list or any(type(effect) is not str or effect not in EFFECT_FAMILIES for effect in bound) or len(set(bound)) != len(bound):
+                        return policy, "effect_bounds requires unique IO/State/Clock/Random/Environment family lists; Task is reserved"
             elif key == "boundary_guards":
                 if type(value) is not str or value not in {"off", "exports", "debug"}:
                     return policy, "boundary_guards must be off, exports or debug"
@@ -106,7 +115,7 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
                 if len(set(value)) != len(value):
                     return policy, "guarded_exports contains duplicate selections"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 4 configuration"
+                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 5 configuration"
         if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
             return policy, "guarded_exports conflicts with boundary_guards=off"
         if policy.get("boundary_guards") == "exports" and not policy.get("guarded_exports"):
@@ -225,6 +234,10 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         if cache and path not in cached:
             _cache_write(cache_path, analyzed)
         result.results.append(analyzed)
+    selected = {_module_name(file.path, project_root) + ":" + contract.name for file in result.results for contract in file.contracts}
+    for selection in policy.get("effect_bounds", {}):
+        if selection not in selected:
+            result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"effect bound selection `{selection}` does not resolve to a selected function", origin="project effect policy"))
     _guard_plan(result, policy, project_root, graph)
     result.elapsed_seconds = time.perf_counter() - started
     return result
@@ -256,7 +269,7 @@ def _guard_plan(result, policy, root, graph):
             result.tooling.append(diagnostic("PAL001", str(root), f"guard selection `{selection}` does not resolve to a selected top-level public function", origin="guard selection"))
             continue
         if not all(supported_schema(kind, records) for kind in [*contract.parameters.values(), contract.returns]):
-            result.tooling.append(diagnostic("PAL001", contract.path, f"guard selection `{selection}` requires unsupported schema; M4 guards validate exact data and refuse Callable boundaries", line=contract.line, origin="guard coverage"))
+            result.tooling.append(diagnostic("PAL001", contract.path, f"guard selection `{selection}` requires unsupported schema; guards validate exact data and refuse Callable, Effectful and live capability boundaries", line=contract.line, origin="guard coverage"))
             continue
         result.guarded_exports.append({"selection": selection, "public_boundary": "pyalamode_exports." + module + ":" + name,
                                        "original_boundary": selection, "original_protection": "unguarded" if mode == "exports" else "debug data assertions",
@@ -271,6 +284,7 @@ def _guard_plan(result, policy, root, graph):
                                               "returns": contract.returns if supported_schema(contract.returns, records) else None,
                                               "locals": [item for item in contract.data_assertions if supported_schema(item["schema"], records)],
                                               "callable_validation": "excluded; caller evidence obligations remain",
+                                              "capability_validation": "excluded; exact interface, allowed operation and lifetime obligations remain",
                                               "generated": False})
 
 

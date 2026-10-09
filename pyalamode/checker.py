@@ -17,7 +17,34 @@ BUILTINS = frozenset({"abs", "min", "max", "len"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
 RECORD_PRIMITIVES = frozenset({"record", "replace"})
 BOUNDARY_PRIMITIVES = frozenset({"freeze", "thaw", "dataclass_adapter", "namedtuple_adapter"})
+EFFECT_FAMILIES = frozenset({"IO", "State", "Clock", "Random", "Environment"})
+CAPABILITIES = {"IOCapability": "IO", "StateCapability": "State", "ClockCapability": "Clock", "RandomCapability": "Random", "EnvironmentCapability": "Environment"}
+CAPABILITY_OPERATIONS = {
+    "IOCapability": {"read_text": (("str",), "str", ("OSError", "UnicodeError", "ValueError", "RuntimeError", "KeyError")), "write_text": (("str", "str"), "None", ("OSError", "UnicodeError", "ValueError", "RuntimeError", "KeyError"))},
+    "StateCapability": {"get": ((), "int", ("RuntimeError",)), "set": (("int",), "None", ("RuntimeError",))},
+    "ClockCapability": {"now_ns": ((), "int", ("RuntimeError", "OSError", "IndexError"))},
+    "RandomCapability": {"below": (("int",), "int", ("RuntimeError", "ValueError", "OSError", "IndexError"))},
+    "EnvironmentCapability": {"get": (("str", "str"), "str", ("RuntimeError", "ValueError", "OSError", "UnicodeError"))},
+}
+PROVIDER_FACTORIES = {"live_io": "IOCapability", "recorded_io": "IOCapability", "state": "StateCapability", "live_clock": "ClockCapability", "recorded_clock": "ClockCapability", "live_random": "RandomCapability", "recorded_random": "RandomCapability", "live_environment": "EnvironmentCapability", "recorded_environment": "EnvironmentCapability"}
+EFFECT_PRIMITIVES = frozenset({"effects", "borrow", "Effectful", *EFFECT_FAMILIES, *CAPABILITIES, *PROVIDER_FACTORIES})
 CALLABLE_FAILURES = frozenset({"ZeroDivisionError", "RecursionError", "IndexError", "KeyError", "ValueError"})
+# Trusted foundation inventory only; these names are not application call admission.
+EFFECT_FOUNDATIONS = {
+    "builtins": frozenset({"type", "object", "tuple", "list", "dict", "set", "len", "any", "all", "enumerate", "next", "str", "int", "bool", "bytes", "open", "range", "min", "getattr", "repr", "isinstance", "classmethod", "staticmethod", "ValueError", "TypeError", "RuntimeError", "AttributeError", "OSError", "UnicodeError", "PermissionError", "IndexError", "KeyError", "FileNotFoundError", "NotADirectoryError", "BytesWarning", "__build_class__", "__import__"}),
+    "types": frozenset({"GenericAlias"}),
+    "time": frozenset({"time_ns"}),
+    "os": frozenset({"environ", "_Environ", "urandom", "fspath", "fsencode", "fsdecode", "getcwd", "getcwdb", "stat", "lstat", "readlink", "path"}),
+    "posixpath": frozenset({"_get_sep", "join", "isabs", "normpath", "realpath", "abspath", "commonpath", "split", "splitdrive", "islink", "isdir", "_joinrealpath", "normcase", "exists", "lexists", "sep", "curdir", "pardir", "os", "stat", "genericpath"}),
+    "genericpath": frozenset({"isdir", "_check_arg_types", "os", "stat"}),
+    "io": frozenset({"open", "TextIOWrapper", "FileIO", "BufferedReader", "BufferedWriter"}),
+    "_io": frozenset({"open", "TextIOWrapper", "FileIO", "BufferedReader", "BufferedWriter"}),
+    "stat": frozenset({"S_ISLNK", "S_IFMT", "S_IFLNK", "S_ISDIR", "S_IFDIR"}),
+    "typing": frozenset({"_CallableGenericAlias"}),
+    "collections.abc": frozenset({"_CallableGenericAlias", "Callable"}),
+    "_collections_abc": frozenset({"Mapping", "MutableMapping"}),
+}
+
 RETURN_ONLY_UPDATES = frozenset({"appended", "updated_at", "concat", "updated", "without", "merge", "added", "union", "intersection", "difference"})
 # Actual explicit/implicit foundation reads of the shipped collections-v1
 # backend, including its declaration/import initialization. This is a closed
@@ -54,11 +81,21 @@ def fingerprint(source: bytes, policy: dict | None = None) -> str:
 
 
 @dataclass(frozen=True)
+class CapabilityValue:
+    """Static interface/permission/lifetime evidence; never a runtime registry."""
+    interface: str
+    operations: tuple[str, ...]
+    lifetime: str
+    provider: str
+
+
+@dataclass(frozen=True)
 class Value:
     types: frozenset[str]
     literal: object = _UNKNOWN
     items: tuple[Value, ...] | None = None
     callable: CallableValue | None = None
+    capability: CapabilityValue | None = None
 
     @classmethod
     def exact(cls, kind: str, literal: object = _UNKNOWN) -> Value:
@@ -69,7 +106,7 @@ class Value:
         return next(iter(self.types)) if len(self.types) == 1 else None
 
     def with_callable(self, callback: CallableValue) -> Value:
-        return Value(self.types, self.literal, self.items, callback)
+        return Value(self.types, self.literal, self.items, callback, self.capability)
 
 
 UNKNOWN = Value(frozenset())
@@ -537,6 +574,8 @@ class ScalarAnalyzer:
                             env[statement.name] = Binding(self._resolve_symbol(symbol, statement, True), (statement.lineno,))
                     continue
                 calls(statement)
+                if hasattr(self, "_ordinary_capability_writes"):
+                    self._ordinary_capability_writes(statement, env)
                 if isinstance(statement, (ast.Import, ast.ImportFrom)) and hasattr(self, "symbols") and module:
                     for name, symbol in self.symbols.items():
                         if symbol.node is statement and self._symbol_stable(name, symbol):
@@ -560,6 +599,9 @@ class ScalarAnalyzer:
                 elif isinstance(statement, ast.Match):
                     for case in statement.cases:
                         block(case.body, {}, lexical_writes, boundary, dict(aliases), external, module)
+                elif isinstance(statement, ast.With) and len(statement.items) == 1 and hasattr(self, "_ordinary_borrow_env"):
+                    borrowed = self._ordinary_borrow_env(statement, env)
+                    block(statement.body, borrowed or {}, lexical_writes, boundary, dict(aliases), external, module)
                 elif hasattr(statement, "body"):
                     block(statement.body, {}, lexical_writes, boundary, dict(aliases), external, module)
                     if hasattr(statement, "orelse"):
@@ -603,6 +645,7 @@ class TypeSpec:
     arguments: tuple[TypeSpec, ...] = ()
     result: TypeSpec | None = None
     variadic: bool = False
+    effect_bound: tuple[str, ...] = ()
 
     def __str__(self) -> str:
         if self.name.startswith("record:"):
@@ -612,6 +655,8 @@ class TypeSpec:
                 return "tuple[()]"
             return "tuple[" + ", ".join(map(str, self.arguments)) + (", ..." if self.variadic else "") + "]"
         if self.name == "Callable":
+            if self.effect_bound:
+                return "Effectful[[" + ", ".join(map(str, self.arguments)) + "], " + str(self.result) + ", " + ", ".join(self.effect_bound) + "]"
             return "Callable[[" + ", ".join(map(str, self.arguments)) + "], " + str(self.result) + "]"
         if self.name in COLLECTIONS:
             return self.name + "[" + ", ".join(map(str, self.arguments)) + "]"
@@ -621,7 +666,7 @@ class TypeSpec:
 def _contract_type(text: str) -> TypeSpec:
     """Decode our canonical cache schema, never a user annotation or Python value."""
     def parse(node):
-        if isinstance(node, ast.Name) and node.id in SCALARS:
+        if isinstance(node, ast.Name) and node.id in SCALARS | CAPABILITIES.keys():
             return TypeSpec(node.id)
         if isinstance(node, ast.Constant) and node.value is None:
             return TypeSpec("None")
@@ -632,8 +677,8 @@ def _contract_type(text: str) -> TypeSpec:
             if node.value.id == "tuple":
                 variadic = len(parts) == 2 and isinstance(parts[-1], ast.Constant) and parts[-1].value is Ellipsis
                 return TypeSpec("tuple", tuple(parse(p) for p in (parts[:-1] if variadic else parts)), variadic=variadic)
-            if node.value.id == "Callable" and len(parts) == 2 and isinstance(parts[0], ast.List):
-                return TypeSpec("Callable", tuple(parse(p) for p in parts[0].elts), parse(parts[1]))
+            if node.value.id in {"Callable", "Effectful"} and len(parts) >= 2 and isinstance(parts[0], ast.List):
+                return TypeSpec("Callable", tuple(parse(p) for p in parts[0].elts), parse(parts[1]), effect_bound=tuple(p.id for p in parts[2:]))
             if node.value.id in COLLECTIONS:
                 return TypeSpec(node.value.id, tuple(parse(p) for p in parts))
         raise ValueError("invalid serialized exact type contract")
@@ -648,6 +693,7 @@ class CallableValue:
     targets: tuple[str, ...] = ()
     captures: tuple[tuple[str, str], ...] = ()
     conditional: bool = False
+    effect_bound: tuple[str, ...] = ()
 
 
 @dataclass
@@ -674,6 +720,12 @@ class FunctionInfo:
     return_value: Value | None = None
     operations: set[str] = field(default_factory=set)
     data_assertions: list[dict] = field(default_factory=list)
+    declared_effects: set[str] = field(default_factory=set)
+    required_effects: set[str] = field(default_factory=set)
+    effect_origins: dict[str, set[str]] = field(default_factory=dict)
+    borrow_scopes: list[dict] = field(default_factory=list)
+    callable_dependencies: set[str] = field(default_factory=set)
+    callable_arguments: dict[str, set[str]] = field(default_factory=dict)
 
     @property
     def identity(self) -> str:
@@ -682,11 +734,11 @@ class FunctionInfo:
     def value(self) -> Value:
         positional = tuple(self.parameters[n] for n in self.parameters if self.kinds[n] != "keyword_only")
         schema = TypeSpec("Callable", tuple(self.analyzer.graph.types.get(t, TypeSpec("<unknown>")) for t in positional),
-                          self.analyzer.graph.types.get(self.returns))
+                          self.analyzer.graph.types.get(self.returns), effect_bound=tuple(sorted(self.declared_effects)))
         kind = str(schema)
         self.analyzer.graph.types[kind] = schema
         return Value.exact(kind).with_callable(CallableValue(
-            positional, self.returns, (self.identity,), tuple((n, self.captures[n].kind or "unknown") for n in sorted(self.capture_uses))))
+            positional, self.returns, (self.identity,), tuple((n, self.captures[n].kind or "unknown") for n in sorted(self.capture_uses)), effect_bound=tuple(sorted(self.declared_effects))))
 
 
 @dataclass(frozen=True)
@@ -755,7 +807,7 @@ def _local_path(root: Path, name: str) -> Path | None:
 
 
 def _product_source(name: str, path: Path) -> bool:
-    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py"}
+    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py"}
     return name in files and path == Path(__file__).resolve().parent / files[name]
 
 
@@ -821,6 +873,7 @@ class SourceGraph:
         self.replaced_foundations: set[tuple[str, str]] = set()
         self.collection_dependency_replacements: set[str] = set()
         self.record_dependency_replacements: set[str] = set()
+        self.effect_dependency_replacements: set[str] = set()
         for analyzer in self.analyzers.values():
             if analyzer.tree is None:
                 continue
@@ -847,8 +900,16 @@ class SourceGraph:
                         self.replaced_functions.add(reference)
                     elif reference in self.records:
                         self.replaced_records.add(reference)
+                    elif reference == "module:pyalamode.effects":
+                        # Private imports can alias record/collection helpers as
+                        # well as capability machinery. Conservatively gate the
+                        # whole product after any such behavioral replacement.
+                        self.replaced_foundations.add(("pyalamode", "*"))
+                        self.record_dependency_replacements.add("pyalamode.effects.*")
+                        self.effect_dependency_replacements.add("pyalamode.effects.*")
                     elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS)
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES)
+                        self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
                     elif reference == "module:pyalamode.collections":
                         self.replaced_foundations.add(("pyalamode", "*"))
@@ -863,8 +924,16 @@ class SourceGraph:
                         self.replaced_functions.add(reference)
                     elif reference in self.records:
                         self.replaced_records.add(reference)
+                    elif reference == "module:pyalamode.effects":
+                        # Private imports can alias record/collection helpers as
+                        # well as capability machinery. Conservatively gate the
+                        # whole product after any such behavioral replacement.
+                        self.replaced_foundations.add(("pyalamode", "*"))
+                        self.record_dependency_replacements.add("pyalamode.effects.*")
+                        self.effect_dependency_replacements.add("pyalamode.effects.*")
                     elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries"}:
-                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS)
+                        self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES)
+                        self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
                     elif reference == "module:pyalamode.collections":
                         self.replaced_foundations.add(("pyalamode", "*"))
@@ -886,10 +955,18 @@ class SourceGraph:
                         or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
                     self.record_dependency_replacements.add(module + "." + attribute)
                     self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES)
+        for module, attributes in EFFECT_FOUNDATIONS.items():
+            for attribute in attributes:
+                if ((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations
+                        or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
+                    self.effect_dependency_replacements.add(module + "." + attribute)
+                    self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
         # Replacement identities must be established before annotation admission;
         # all signatures still precede bodies, including recursive components.
         for record_info in self.records.values():
             record_info.analyzer.prepare_record(record_info)
+        for info in self.functions.values():
+            info.analyzer.declare_effects(info)
         for info in self.functions.values():
             info.analyzer.signature(info)
 
@@ -914,17 +991,23 @@ class SourceGraph:
             if symbol.kind == "record":
                 return symbol.name
             if symbol.kind == "module":
+                # __init__ exports an effects function under the submodule name:
+                # Python's import pyalamode.effects as alias binds that function.
+                if symbol.name == "pyalamode.effects":
+                    return "foundation:pyalamode:effects"
                 return "module:" + symbol.name
             if symbol.kind == "constant":
                 return self.reference(analyzer, symbol.node.value, aliases, seen)
             if symbol.kind == "import":
                 module, name = symbol.name.split(":", 1)
-                if module in {"pyalamode.records", "pyalamode.boundaries"} and analyzer._foundation_available(module):
+                if module == "pyalamode.effects" and analyzer._foundation_available(module):
+                    return "foundation:pyalamode:" + name if name in EFFECT_PRIMITIVES else "module:pyalamode.effects"
+                if module in {"pyalamode.records", "pyalamode.boundaries", "pyalamode.effects"} and analyzer._foundation_available(module):
                     return "module:" + module
                 if module == "pyalamode.collections" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + (name if name in COLLECTIONS else "*")
                 target = self.modules.get(module)
-                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS} else None
+                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS} else None
         if isinstance(node, ast.Subscript):
             reference = self.reference(analyzer, node.value, aliases, seen)
             if reference and reference.startswith("foundation:pyalamode:") and reference.rsplit(":", 1)[-1] in COLLECTIONS:
@@ -933,13 +1016,13 @@ class SourceGraph:
             owner = self.reference(analyzer, node.value, aliases, seen)
             if owner in self.records:
                 return owner
-            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | {"*"}:
+            if owner and owner.startswith("foundation:pyalamode:") and owner.rsplit(":", 1)[-1] in COLLECTIONS | EFFECT_PRIMITIVES | {"*"}:
                 return owner
             if owner and owner.startswith("module:"):
                 module = owner.split(":", 1)[1]
                 if module == "pyalamode" and node.attr in {"collections", "records", "boundaries"} and analyzer._foundation_available("pyalamode." + node.attr):
                     return "module:pyalamode." + node.attr
-                if module in {"pyalamode.records", "pyalamode.boundaries"} and analyzer._foundation_available(module):
+                if module in {"pyalamode.records", "pyalamode.boundaries", "pyalamode.effects"} and analyzer._foundation_available(module):
                     return "module:" + module
                 if module == "pyalamode.collections" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + (node.attr if node.attr in COLLECTIONS else "*")
@@ -948,7 +1031,7 @@ class SourceGraph:
                     return self.reference(target, ast.Name(id=node.attr), None, seen)
                 if module + "." + node.attr in self.modules:
                     return "module:" + module + "." + node.attr
-                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS}:
+                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS}:
                     return "foundation:" + module + ":" + node.attr
         return None
 
@@ -986,6 +1069,8 @@ class SourceGraph:
             replacements.update(identity + ".<collection dependency>" for identity in self.collection_dependency_replacements)
         if any(("pyalamode", name) in relevant for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES) or ("pyalamode", "*") in relevant or self.policy.get("boundary_guards", "off") != "off" or any(symbol.kind == "record" for symbol in analyzer.symbols.values()):
             replacements.update(identity + ".<record/boundary dependency>" for identity in self.record_dependency_replacements)
+        if any(("pyalamode", name) in relevant for name in EFFECT_PRIMITIVES) or ("pyalamode", "*") in relevant or ("pyalamode.effects", "*") in relevant:
+            replacements.update(identity + ".<effect dependency>" for identity in self.effect_dependency_replacements)
         return sorted(replacements)
 
     def analyze(self, cached: dict[str, CheckResult] | None = None) -> dict[str, CheckResult]:
@@ -996,9 +1081,14 @@ class SourceGraph:
             for info in analyzer.infos.values():
                 info.contract = next((c for c in result.contracts if c.name == info.qualified), None)
                 if info.contract:
-                    info.calls = {d for d in info.contract.dependencies if d in self.functions}
+                    info.calls = set(info.contract.invoked_targets)
+                    info.callable_dependencies = set(info.contract.callable_dependencies)
+                    info.callable_arguments = {n: set(targets) for n, targets in info.contract.callable_arguments.items()}
                     info.dependencies = {d for d in info.contract.dependencies if d in self.analyzers}
                     info.failures = set(info.contract.failures)
+                    info.required_effects = set(info.contract.required_effects)
+                    info.effect_origins = {e: set(paths) for e, paths in info.contract.effect_origins.items()}
+                    info.borrow_scopes = list(info.contract.borrow_scopes)
                     info.operations = set(info.contract.operations)
                     info.definition_failures = set(info.contract.definition_failures)
                     info.capture_uses = set(info.contract.captures)
@@ -1006,14 +1096,15 @@ class SourceGraph:
                         if kind not in self.types:
                             self.types[kind] = _contract_type(kind)
                         value = analyzer.annotation_value(kind)
-                        targets = info.contract.callable_targets.get(name)
-                        if targets and value.callable:
-                            value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(targets)))
+                        evidence = info.contract.callable_capture_evidence.get(name)
+                        if evidence and value.callable:
+                            value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(evidence["targets"]), tuple(tuple(c) for c in evidence["captures"]), evidence["conditional"], tuple(evidence["effect_bound"])))
                         info.captures[name] = value
-                    if info.contract.return_callable_targets:
+                    evidence = info.contract.return_callable_evidence
+                    if evidence:
                         value = analyzer.annotation_value(info.returns)
                         if value.callable:
-                            info.return_value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(info.contract.return_callable_targets)))
+                            info.return_value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(evidence["targets"]), tuple(tuple(c) for c in evidence["captures"]), evidence["conditional"], tuple(evidence["effect_bound"])))
                     info.analyzed = True
         self._initialization_cycles()
         for analyzer in self.analyzers.values():
@@ -1033,17 +1124,35 @@ class SourceGraph:
             for info in self.functions.values():
                 for target in info.calls:
                     callee = self.functions[target]
-                    before = (len(info.failures), len(info.dependencies), len(info.operations))
+                    before = (len(info.failures), len(info.dependencies), len(info.operations), len(info.required_effects), len(info.callable_dependencies))
                     info.failures.update(callee.failures)
                     info.dependencies.update(callee.dependencies)
                     info.operations.update(callee.operations)
-                    if before != (len(info.failures), len(info.dependencies), len(info.operations)):
+                    info.callable_dependencies.update(callee.callable_dependencies)
+                    info.required_effects.update(callee.declared_effects | callee.required_effects)
+                    for effect in callee.declared_effects | callee.required_effects:
+                        info.effect_origins.setdefault(effect, set()).add(info.qualified + " -> " + callee.qualified)
+                    if before != (len(info.failures), len(info.dependencies), len(info.operations), len(info.required_effects), len(info.callable_dependencies)):
                         changed = True
         for info in self.functions.values():
             if info.contract:
                 info.contract.failures = sorted(info.failures)
-                info.contract.dependencies = sorted(info.dependencies | info.calls)
+                info.contract.dependencies = sorted(info.dependencies | info.calls | info.callable_dependencies)
+                info.contract.invoked_targets = sorted(info.calls)
+                info.contract.callable_dependencies = sorted(info.callable_dependencies)
+                info.contract.callable_arguments = {n: sorted(targets) for n, targets in info.callable_arguments.items()}
+                info.contract.callable_operations = sorted({op for target in info.callable_dependencies for op in self.functions[target].operations})
                 info.contract.operations = sorted(info.operations)
+                info.contract.required_effects = sorted(info.required_effects)
+                info.contract.effect_origins = {effect: sorted(paths) for effect, paths in info.effect_origins.items()}
+                missing = info.required_effects - info.declared_effects
+                if missing and not any(d.rule == "PAL310" and d.boundary == info.qualified for d in info.analyzer.result.diagnostics):
+                    info.analyzer.boundary = info.qualified
+                    info.analyzer.emit("PAL310", info.node, "transitive invocation requires undeclared " + ", ".join(sorted(missing)), origin="finite effect graph")
+                if info.declared_effects or any(kind in CAPABILITIES or "Effectful[" in kind for kind in [*info.parameters.values(), info.returns or ""]):
+                    assumption = "pyalamode effects-v1: opaque exact interfaces, finite operations, logical lease lifetime, stock CPython/OS trusted providers; controlled providers retain interface effects"
+                    if assumption not in info.contract.trust:
+                        info.contract.trust.append(assumption)
                 schemas = [*info.parameters.values(), info.returns or "", *info.contract.captures.values()]
                 if any(operation.split(".", 1)[0] in COLLECTIONS for operation in info.operations) or any(name + "[" in kind for name in COLLECTIONS for kind in schemas):
                     assumption = "pyalamode collections-v1: exact deep-data façade, CPython tuple-copy storage and canonical scalar ordering"
@@ -1054,6 +1163,21 @@ class SourceGraph:
                     if assumption not in info.contract.trust:
                         info.contract.trust.append(assumption)
                 info.analyzer.dependencies.update(info.dependencies)
+        # Callable values retain their target assumptions even when the receiving
+        # function does not invoke them. This does not add invocation effects.
+        changed = True
+        while changed:
+            changed = False
+            for info in self.functions.values():
+                if not info.contract:
+                    continue
+                trust = set(info.contract.trust)
+                for target in info.calls | info.callable_dependencies:
+                    if self.functions[target].contract:
+                        trust.update(self.functions[target].contract.trust)
+                updated = sorted(trust)
+                changed |= updated != info.contract.trust
+                info.contract.trust = updated
         # A source dependency carries its own dependencies and initializer assumptions.
         changed = True
         while changed:
@@ -1085,6 +1209,7 @@ class SourceGraph:
                 for contract in analyzer.result.contracts:
                     contract.source_evidence = "unverified: dependency gate failed"
                     contract.freshness = "no successful checked claim"
+                    contract.behavior = "unverified behavior; no certified effect bound"
                 for record in analyzer.result.records:
                     record["source_evidence"] = "unverified: dependency gate failed"
                     record["freshness"] = "no successful checked claim"
@@ -1232,7 +1357,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             for node in body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self.result.eligible_functions += 1
-                    selected = strict or any(self._marker_like(d) for d in node.decorator_list)
+                    selected = strict or any(self._marker_like(d) or self._effects_like(d) for d in node.decorator_list)
                     qualified = prefix + node.name
                     info = None
                     if selected:
@@ -1254,6 +1379,176 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     for handler in getattr(node, "handlers", []):
                         visit(handler.body, parent, prefix, strict)
         visit(self.tree.body, strict=self.module_mode)
+
+    def _effects_like(self, node):
+        if not isinstance(node, ast.Call):
+            return self.graph.reference(self, node) == "foundation:pyalamode:effects"
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr == "effects"
+        if isinstance(node.func, ast.Name):
+            return node.func.id == "effects" or self.graph.reference(self, node.func) == "foundation:pyalamode:effects"
+        return False
+
+    def _effect_identity(self, node, names=()):
+        identity = self._type_identity(node, set(names))
+        return identity if identity in EFFECT_FAMILIES else None
+
+    def declare_effects(self, info):
+        previous = self.active, self.boundary, self.definition_mode, self.constant_limit, self.locals
+        self.active, self.boundary = info, info.qualified
+        self.definition_mode = True
+        self.constant_limit = info.node.lineno if info.parent is None else None
+        names = set()
+        parent = info.parent
+        while parent:
+            names.update(parent.parameters)
+            names.update(a.arg for a in parent.node.args.posonlyargs + parent.node.args.args + parent.node.args.kwonlyargs)
+            names.update(_written_names(parent.node.body))
+            parent = parent.parent
+        self.locals = names
+        declarations = [d for d in info.node.decorator_list if self._effects_like(d)]
+        if len(declarations) > 1:
+            self.emit("PAL120", info.node, "only one finite @effects declaration is supported")
+        for declaration in declarations:
+            if not isinstance(declaration, ast.Call):
+                self.emit("PAL120", declaration, "effects is a finite declaration factory; use @effects(Clock,...) with supported tokens")
+                continue
+            bound = [self._effect_identity(arg, names) for arg in declaration.args]
+            if not self._primitive_identity(declaration.func, {"effects"}) or declaration.keywords or not bound or any(e is None for e in bound) or len(set(bound)) != len(bound):
+                self.emit("PAL120", declaration, "@effects requires one or more unique unchanged product IO/State/Clock/Random/Environment tokens; Task and dynamic declarations are unsupported")
+            else:
+                info.declared_effects.update(bound)
+        selection = _module_name(self.path, self.graph.root) + ":" + info.qualified
+        policy_bound = self.policy.get("effect_bounds", {}).get(selection)
+        if policy_bound is not None and not info.declared_effects.issubset(policy_bound):
+            self.emit("PAL310", info.node, "source effect declaration exceeds project entry bound: " + ", ".join(sorted(info.declared_effects - set(policy_bound))), origin="project effect policy")
+        self.active, self.boundary, self.definition_mode, self.constant_limit, self.locals = previous
+
+    @staticmethod
+    def _callable_failures(effects):
+        failures = set(CALLABLE_FAILURES)
+        for kind, family in CAPABILITIES.items():
+            if family in effects:
+                for _, _, bound in CAPABILITY_OPERATIONS[kind].values():
+                    failures.update(bound)
+        return failures
+
+    def _require_effects(self, effects, node, origin):
+        if not self.active:
+            return
+        for effect in effects:
+            self.active.required_effects.add(effect)
+            self.active.effect_origins.setdefault(effect, set()).add(self.active.qualified + " -> " + origin)
+        missing = set(effects) - self.active.declared_effects
+        if missing:
+            self.emit("PAL310", node, "boundary requires undeclared " + ", ".join(sorted(missing)), origin=self.active.qualified + " -> " + origin)
+
+    def _capability_call(self, node, env, quiet):
+        if not isinstance(node.func, ast.Attribute):
+            return None
+        owner = self._expr(node.func.value, env, quiet=True)
+        if owner.kind not in CAPABILITIES:
+            return None
+        operation = CAPABILITY_OPERATIONS[owner.kind].get(node.func.attr)
+        def reject(rule, reason):
+            if not quiet:
+                self.emit(rule, node, reason)
+            return UNKNOWN
+        if self.definition_mode or self.initializing or not self.active:
+            return reject("PAL230", "capability invocation belongs to a checked effectful function body")
+        if self._module_changed("pyalamode", owner.kind) or not self._foundation_available("pyalamode.effects"):
+            return reject("PAL240", "capability interface or trusted implementation dependencies have an analyzed replacement")
+        if operation is None:
+            return reject("PAL230", "capability operation is outside its finite allowed operation set")
+        parameters, returned, failures = operation
+        values = [self._expr(arg, env, quiet=quiet) for arg in node.args]
+        if node.keywords or len(values) != len(parameters) or any(isinstance(a, ast.Starred) for a in node.args) or any(not self.matches(v, t) for v, t in zip(values, parameters)):
+            return reject("PAL221", owner.kind + "." + node.func.attr + " requires its exact fixed positional signature")
+        if not quiet:
+            identity = owner.kind + "." + node.func.attr
+            self._collection_operation(identity, node, failures=failures)
+            self._require_effects((CAPABILITIES[owner.kind],), node, identity)
+        return self.annotation_value(returned)
+
+    def _ordinary_capability_writes(self, statement, env):
+        expressions = [statement.value] if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)) and statement.value is not None else []
+        if isinstance(statement, (ast.If, ast.With, ast.For, ast.While, ast.Try, ast.Match)):
+            expressions = [statement]
+        for expression in expressions:
+            for call in ast.walk(expression):
+                if not isinstance(call, ast.Call):
+                    continue
+                names = [call.func.value.id] if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) else []
+                target = self._expr(call.func, env, quiet=True)
+                checked = target.callable and all(identity in self.graph.functions for identity in target.callable.targets) and bool(target.callable.targets)
+                primitive = target.kind and target.kind.startswith(("primitive:", "builtin:"))
+                if not checked and not primitive:
+                    names += list(env)
+                    names += [arg.id for arg in call.args if isinstance(arg, ast.Name)]
+                    names += [keyword.value.id for keyword in call.keywords if isinstance(keyword.value, ast.Name)]
+                for name in names:
+                    binding = env.get(name)
+                    if binding and binding.value.capability:
+                        cap = binding.value.capability
+                        # Even known shell methods may affect lifetime through
+                        # unchecked surrounding behavior; subsequent lending needs
+                        # a new provider or supported borrow. No dynamic evaluation.
+                        value = Value(binding.value.types, capability=CapabilityValue(cap.interface, cap.operations, "unestablished after shell operation", cap.provider))
+                        for alias, candidate in list(env.items()):
+                            if candidate.value.capability and candidate.value.capability.provider == cap.provider:
+                                env[alias] = Binding(Value(candidate.value.types, capability=CapabilityValue(cap.interface, cap.operations, "unestablished after shell operation", cap.provider)), candidate.first, candidate.definite)
+
+    def _ordinary_borrow_env(self, node, env):
+        item = node.items[0]
+        call = item.context_expr
+        if not isinstance(call, ast.Call) or len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Name) or not isinstance(item.optional_vars, ast.Name):
+            return None
+        target = self._expr(call.func, env, quiet=True)
+        binding = env.get(call.args[0].id)
+        if target.kind != "primitive:borrow" or not binding or not self.matches(binding.value, binding.value.kind):
+            return None
+        cap = binding.value.capability
+        if cap is None:
+            return None
+        borrowed = dict(env)
+        borrowed[item.optional_vars.id] = Binding(Value(binding.value.types, capability=CapabilityValue(cap.interface, cap.operations, "borrowed", cap.provider)), (node.lineno,))
+        return borrowed
+
+    def _provider_call(self, node, env, quiet):
+        target = self._expr(node.func, env, quiet=True)
+        name = target.kind[len("primitive:"):] if target.kind and target.kind.startswith("primitive:") else None
+        if name not in PROVIDER_FACTORIES:
+            return None
+        if self.active or self.definition_mode or self.initializing:
+            if not quiet:
+                self.emit("PAL230", node, "provider construction is ordinary unchecked setup, distinct from checked capability invocation")
+            return UNKNOWN
+        if any(isinstance(a, ast.Starred) for a in node.args):
+            return UNKNOWN
+        operations = tuple(sorted(CAPABILITY_OPERATIONS[PROVIDER_FACTORIES[name]]))
+        if name in {"live_io", "recorded_io"}:
+            if len(node.keywords) != 1 or node.keywords[0].arg != "allowed_ops":
+                return UNKNOWN
+            permitted = self._expr(node.keywords[0].value, env, quiet=True)
+            if permitted.items is None or not permitted.items or any(v.kind != "str" or v.literal not in operations for v in permitted.items):
+                return UNKNOWN
+            operations = tuple(v.literal for v in permitted.items)
+            if len(set(operations)) != len(operations):
+                return UNKNOWN
+        elif node.keywords:
+            return UNKNOWN
+        values = [self._expr(arg, env, quiet=True) for arg in node.args]
+        parameters = {"live_io": ("str",), "recorded_io": ("tuple[tuple[str, str], ...]",), "state": ("int",), "live_clock": (), "recorded_clock": ("tuple[int, ...]",), "live_random": (), "recorded_random": ("tuple[int, ...]",), "live_environment": (), "recorded_environment": ("tuple[tuple[str, str], ...]",)}[name]
+        for expected in parameters:
+            if expected not in self.graph.types:
+                self.graph.types[expected] = _contract_type(expected)
+        if len(values) != len(parameters) or any(not self.matches(v, t) for v, t in zip(values, parameters)):
+            return UNKNOWN
+        # Only the finite full-interface factory signature establishes live,
+        # full-operation evidence. Setup behavior and external state are unchecked.
+        kind = PROVIDER_FACTORIES[name]
+        self.graph.types[kind] = TypeSpec(kind)
+        return Value(frozenset({kind}), capability=CapabilityValue(kind, tuple(sorted(operations)), "live", name + "@" + self.path + ":" + str(node.lineno) + ":" + str(node.col_offset)))
 
     def _primitive_identity(self, node, admitted):
         reference = self.graph.reference(self, node)
@@ -1383,7 +1678,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             module, name = symbol.name.split(":", 1)
             if module == "pyalamode" and name in COLLECTIONS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("collection_class:" + name)
-            if module == "pyalamode" and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES and self._foundation_available(module) and not self._module_changed(module, name):
+            if module in {"pyalamode", "pyalamode.effects"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("primitive:" + name)
             if module == "builtins" and name in BUILTINS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("builtin:" + name)
@@ -1403,6 +1698,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return Value.exact("module:" + module + "." + name)
             return UNKNOWN
         if symbol.kind == "module":
+            if symbol.name == "pyalamode.effects":
+                return Value.exact("primitive:effects") if self._foundation_available(symbol.name) and not self._module_changed("pyalamode", "effects") else UNKNOWN
             return Value.exact("module:" + symbol.name)
         return UNKNOWN
 
@@ -1437,6 +1734,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     if not quiet:
                         self.emit("PAL210", symbol.node, f"constant `{name}` requires {expected}; found {self._describe(value)}")
                     value = UNKNOWN
+            if value.kind in CAPABILITIES:
+                if not quiet:
+                    self.emit("PAL320", symbol.node, "capabilities cannot be stable global constants")
+                value = UNKNOWN
             if value.types:
                 self.constants[name] = value
             return value
@@ -1471,7 +1772,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return "None"
                 if module in {"typing", "collections.abc"} and name == "Callable":
                     return "Callable"
-                if module == "pyalamode" and name in COLLECTIONS:
+                if module in {"pyalamode", "pyalamode.effects"} and name in COLLECTIONS | EFFECT_PRIMITIVES:
                     return name
         if isinstance(node, ast.Attribute):
             symbol = self.symbols.get(node.value.id) if isinstance(node.value, ast.Name) and node.value.id not in env_names else None
@@ -1482,7 +1783,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return None
                 if symbol.name in {"typing", "collections.abc"} and node.attr == "Callable":
                     return "Callable"
-                if symbol.name == "pyalamode" and node.attr in COLLECTIONS:
+                if symbol.name == "pyalamode" and node.attr in COLLECTIONS | EFFECT_PRIMITIVES:
                     return node.attr
                 if symbol.name == "types" and node.attr == "NoneType":
                     return "None"
@@ -1536,7 +1837,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if isinstance(expression, ast.Constant) and expression.value is None:
                 return TypeSpec("None")
             identity = self._type_identity(expression, names) if expression is not None else None
-            if identity in SCALARS:
+            if identity in SCALARS | CAPABILITIES.keys():
                 return TypeSpec(identity)
             if identity and identity.startswith("record:"):
                 return TypeSpec(identity)
@@ -1548,13 +1849,16 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         return TypeSpec("tuple")
                     variadic = len(parts) == 2 and isinstance(parts[-1], ast.Constant) and parts[-1].value is Ellipsis
                     args = [parse(p) for p in (parts[:-1] if variadic else parts)]
-                    if args and all(a is not None and a.name != "Callable" for a in args):
+                    if args and all(self._data_schema(a) for a in args):
                         return TypeSpec("tuple", tuple(args), variadic=variadic)
-                if identity == "Callable" and len(parts) == 2 and isinstance(parts[0], ast.List):
+                if identity in {"Callable", "Effectful"} and len(parts) >= 2 and isinstance(parts[0], ast.List):
+                    bound = tuple(self._effect_identity(p, names) for p in parts[2:])
+                    if identity == "Callable" and len(parts) != 2 or identity == "Effectful" and (not bound or any(e not in EFFECT_FAMILIES for e in bound) or len(set(bound)) != len(bound)):
+                        return None
                     args = [parse(p) for p in parts[0].elts]
                     result = parse(parts[1])
-                    if all(a is not None for a in args) and result is not None:
-                        return TypeSpec("Callable", tuple(args), result)
+                    if all(a is not None and (a.name not in CAPABILITIES or CAPABILITIES[a.name] in bound) for a in args) and result is not None and result.name not in CAPABILITIES:
+                        return TypeSpec("Callable", tuple(args), result, effect_bound=tuple(sorted(bound)))
                 if identity in COLLECTIONS:
                     args = [parse(p) for p in parts]
                     arity = 2 if identity in {"Map", "OrderedMap"} else 1
@@ -1585,12 +1889,19 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             info.parameters[arg.arg] = annotation or "<unknown>"
             info.kinds[arg.arg] = ("positional_only" if arg in node.args.posonlyargs else "keyword_only" if arg in node.args.kwonlyargs else "positional_or_keyword")
         info.returns = self._annotation(node.returns)
+        if info.returns in CAPABILITIES:
+            self.emit("PAL320", node.returns, "live capabilities cannot be returned as stable results")
+        for name, kind in info.parameters.items():
+            if kind in CAPABILITIES and CAPABILITIES[kind] not in info.declared_effects:
+                self.emit("PAL310", node, f"capability parameter `{name}` requires declared {CAPABILITIES[kind]}", origin="capability invocation borrow")
         self.active, self.boundary = previous
 
     def annotation_value(self, kind):
         schema = self.graph.types.get(kind)
         if schema and schema.name == "Callable":
-            return Value.exact(kind).with_callable(CallableValue(tuple(map(str, schema.arguments)), str(schema.result), conditional=True))
+            return Value.exact(kind).with_callable(CallableValue(tuple(map(str, schema.arguments)), str(schema.result), conditional=True, effect_bound=schema.effect_bound))
+        if kind in CAPABILITIES:
+            return Value(frozenset({kind}), capability=CapabilityValue(kind, tuple(sorted(CAPABILITY_OPERATIONS[kind])), "invocation obligation", "exact interface supplied by caller"))
         return Value.exact(kind) if schema else UNKNOWN
 
     def _data_schema(self, schema):
@@ -1608,6 +1919,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         schema = self.graph.types.get(expected)
         if schema is None or not value.types:
             return False
+        if expected in CAPABILITIES:
+            evidence = value.capability
+            return value.types == frozenset({expected}) and evidence is not None and evidence.lifetime in {"live", "invocation obligation", "borrowed"} and set(CAPABILITY_OPERATIONS[expected]).issubset(evidence.operations)
         if schema.name == "tuple":
             if value.items is not None:
                 if schema.variadic:
@@ -1619,6 +1933,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if callback is None or (not callback.targets and not callback.conditional):
                 return False
             if callback.parameters != tuple(map(str, schema.arguments)) or callback.returns != str(schema.result):
+                return False
+            if not set(callback.effect_bound).issubset(schema.effect_bound):
                 return False
             for target in callback.targets:
                 info = self.graph.functions[target]
@@ -1730,9 +2046,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if not self._symbol_stable(name, symbol):
                 self.emit("PAL101", node, f"import binding `{name}` has another initialization", first=self.global_writes[name][0].lineno)
             module = symbol.name.split(":", 1)[0]
-            if module in {"pyalamode", "types", "builtins", "typing", "collections", "collections.abc", "__future__"} and self._foundation_available(module):
+            if module in {"pyalamode", "pyalamode.effects", "types", "builtins", "typing", "collections", "collections.abc", "__future__"} and self._foundation_available(module):
                 if symbol.kind == "import":
-                    allowed = {"pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES}, "types": {"NoneType"}, "builtins": BUILTINS | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
+                    allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES}, "types": {"NoneType"}, "builtins": BUILTINS | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
                     if symbol.name.split(":", 1)[1] not in allowed.get(module, set()):
                         self.emit("PAL241", node, f"foundation import `{symbol.name}` has no supported contract")
                 continue
@@ -1771,8 +2087,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         if info.identity in self.graph.replaced_functions:
             self.emit("PAL240", node, f"checked callable `{info.qualified}` has an analyzed attribute/behavior replacement")
         decorators = node.decorator_list
-        if decorators and (len(decorators) != 1 or not self._marker_valid(decorators[0])):
-            self.emit("PAL120", node, "only one unchanged pyalamode.fun identity declaration is supported")
+        ordinary = [d for d in decorators if not self._effects_like(d)]
+        if ordinary and (len(ordinary) != 1 or not self._marker_valid(ordinary[0])):
+            self.emit("PAL120", node, "only one unchanged @fun and one finite @effects declaration are supported")
         if not decorators and not (self.module_mode or info.parent):
             self.emit("PAL120", node, "function is not selected by module mode or a resolved marker")
         if info.parent:
@@ -1810,6 +2127,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             self.constant_limit = node.lineno
         for name, value_node in default_nodes.items():
             value = self._expr(value_node, default_env)
+            if info.parameters[name] in CAPABILITIES:
+                self.emit("PAL320", value_node, "capabilities cannot have definition-time defaults")
             if not self.matches(value, info.parameters[name]):
                 self.emit("PAL221", value_node, f"default `{name}` does not establish {info.parameters[name]}", origin="definition-time default")
             info.defaults[name] = value
@@ -1827,12 +2146,19 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                                     callable_targets={n: list(info.captures[n].callable.targets) for n in info.capture_uses if info.captures[n].callable},
                                     callable_defaults={n: list(v.callable.targets) for n, v in info.defaults.items() if v.callable},
                                     return_callable_targets=list(info.return_value.callable.targets) if info.return_value and info.return_value.callable else [],
+                                    callable_capture_evidence={n: self._callable_evidence(info.captures[n].callable) for n in info.capture_uses if info.captures[n].callable},
+                                    return_callable_evidence=self._callable_evidence(info.return_value.callable) if info.return_value and info.return_value.callable else None,
                                     definition_failures=sorted(info.definition_failures), operations=sorted(info.operations),
-                                    data_assertions=list(info.data_assertions))
+                                    data_assertions=list(info.data_assertions),
+                                    effect_bound=sorted(info.declared_effects), required_effects=sorted(info.required_effects),
+                                    effect_origins={e: sorted(paths) for e, paths in info.effect_origins.items()},
+                                    capability_parameters={n: {"interface": k, "effect": CAPABILITIES[k], "operations": sorted(CAPABILITY_OPERATIONS[k]), "lifetime": "invocation borrow; no retention or transfer", "permissions": "full interface operation set required; minimal callee permissions are not inferred"} for n, k in info.parameters.items() if k in CAPABILITIES},
+                                    borrow_scopes=list(info.borrow_scopes))
+        contract.behavior = "effects <= {" + ", ".join(sorted(info.declared_effects)) + "}" if info.declared_effects else "pure"
         contract.caller_obligations = [f"{name}: exact {kind}; recursively admitted contents and checked callable/capture evidence where applicable" for name, kind in info.parameters.items()]
         contract.caller_obligations.extend(["Resolved constant, callable, capture, marker, annotation and builtin bindings remain unchanged during execution.",
-                                            "Callable inputs satisfy their declared pure invocation contract with stable captures; annotations alone do not establish that evidence.",
-                                            "Callable invocation failure upper bound: IndexError, KeyError, ValueError, ZeroDivisionError and RecursionError, the closed supported callable failure universe.",
+                                            "Callable inputs satisfy their finite invocation effect bound with stable captures; annotations alone do not establish actual evidence. Capability inputs have the exact supported interface, allowed operations and live invocation lifetime; no retention or transfer.",
+                                            "Pure Callable invocation failure upper bound: IndexError, KeyError, ValueError, ZeroDivisionError and RecursionError. Effectful conditional callbacks additionally propagate the finite operation failure bounds of their declared families; concrete target failures propagate separately.",
                                             "Ordinary callers receive no runtime guards; unchecked import initialization has no purity claim.",
                                             "Recursion may diverge or raise RecursionError; resource exhaustion and interruption are outside the failure contract."])
         info.contract = contract
@@ -1865,8 +2191,15 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             callback = CallableValue(a.callable.parameters, a.callable.returns,
                                      tuple(sorted(set(a.callable.targets + b.callable.targets))),
                                      tuple(sorted(set(a.callable.captures + b.callable.captures))),
-                                     a.callable.conditional or b.callable.conditional)
-        return Value(a.types | b.types, literal, a.items if a.items == b.items else None, callback)
+                                     a.callable.conditional or b.callable.conditional,
+                                     tuple(sorted(set(a.callable.effect_bound + b.callable.effect_bound))))
+        capability = a.capability if a.capability == b.capability else None
+        types = a.types | b.types
+        if callback:
+            schema = TypeSpec("Callable", tuple(self.graph.types[k] for k in callback.parameters), self.graph.types[callback.returns], effect_bound=callback.effect_bound)
+            self.graph.types[str(schema)] = schema
+            types = frozenset({str(schema)})
+        return Value(types, literal, a.items if a.items == b.items else None, callback, capability)
 
     def _collection_operation(self, identity, node, quiet=False, failures=()):
         if not quiet:
@@ -1882,17 +2215,19 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         return ("RecursionError",) if schema is not None and schema.name not in SCALARS else ()
 
     def _collection_callback(self, callback, parameters, returns, node, env, quiet):
-        schema = TypeSpec("Callable", tuple(parameters), returns)
+        if not quiet and callback.callable:
+            self._require_effects(callback.callable.effect_bound, node, "ordered callback invocation")
+        schema = TypeSpec("Callable", tuple(parameters), returns, effect_bound=tuple(sorted(self.active.declared_effects)) if self.active else ())
         self.graph.types[str(schema)] = schema
         if not self.matches(callback, str(schema)):
             if not quiet:
-                self.emit("PAL221", node, f"collection callback requires resolved pure {schema} with stable captures")
+                self.emit("PAL221", node, f"collection callback requires resolved bounded {schema} with stable captures")
             return False
         if not quiet:
             self._ready_callable(callback, env, node)
             evidence = callback.callable
             if evidence.conditional:
-                self.failures.update(CALLABLE_FAILURES)
+                self.failures.update(self._callable_failures(evidence.effect_bound))
             for identity in evidence.targets:
                 info = self.graph.functions[identity]
                 if self.active:
@@ -1973,7 +2308,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 if method == "filter":
                     returned = self.graph.types["bool"]
                 if not self._data_schema(returned) or not self._collection_callback(callback, (element,), returned, node.args[0], env, quiet):
-                    return reject(f"Vector.{method} requires a checked pure fixed callback with admitted result")
+                    return reject(f"Vector.{method} requires a checked bounded fixed callback with admitted result")
                 result = owner if method == "filter" else self._value_schema("Vector", (returned,))
                 if method == "map":
                     failures = self._nested_validation_failures(returned)
@@ -1981,7 +2316,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 callback = values[0].callable
                 accumulator = self.graph.types.get(callback.parameters[0]) if callback and len(callback.parameters) == 2 else None
                 if not self._data_schema(accumulator) or not self.matches(values[1], str(accumulator)) or not self._collection_callback(values[0], (accumulator, element), accumulator, node.args[0], env, quiet):
-                    return reject("Vector.fold requires (checked pure Callable[[A,T],A], admitted A initial)")
+                    return reject("Vector.fold requires (checked bounded Callable[[A,T],A], admitted A initial)")
                 result = self.annotation_value(str(accumulator))
                 failures = self._nested_validation_failures(accumulator)
         elif name in {"Map", "OrderedMap"}:
@@ -2083,6 +2418,44 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         return value if self._data_value(value) else UNKNOWN
 
     def _statement(self, node, env):
+        if isinstance(node, ast.With):
+            if len(node.items) != 1:
+                self.emit("PAL320", node, "borrow admits exactly one context item")
+                return env
+            item = node.items[0]
+            call = item.context_expr
+            target = self._expr(call.func, env, quiet=True) if isinstance(call, ast.Call) else UNKNOWN
+            capability = self._expr(call.args[0], env) if isinstance(call, ast.Call) and len(call.args) == 1 else UNKNOWN
+            if not self.active or self.definition_mode or self.initializing or target.kind != "primitive:borrow" or not isinstance(call, ast.Call) or call.keywords or len(call.args) != 1 or not isinstance(call.args[0], ast.Name) or capability.kind not in CAPABILITIES or not isinstance(item.optional_vars, ast.Name):
+                self.emit("PAL320", node, "only with borrow(exact local capability) as fresh_name has a characterized context lifetime")
+                return env
+            name = item.optional_vars.id
+            if name in env and not self.in_dead:
+                self.emit("PAL101", node, f"borrow binding `{name}` is already initialized", first=env[name].first[0])
+                return env
+            if not self._foundation_available("pyalamode.effects") or self._module_changed("pyalamode", "borrow"):
+                self.emit("PAL240", node, "borrow implementation or dependency identity was replaced")
+            self._require_effects((CAPABILITIES[capability.kind],), node, "borrow entry/exit")
+            self._collection_operation("borrow.enter_exit", node, failures=("RuntimeError",))
+            self.active.borrow_scopes.append({"name": name, "interface": capability.kind, "line": node.lineno, "end_line": node.end_lineno, "lifetime": "logical view invalidated on every exit; resource transfer unsupported"})
+            nested = dict(env)
+            nested[name] = Binding(capability, (node.lineno,))
+            result = self._block(node.body, nested)
+            if result is not None:
+                result[name] = Binding(UNKNOWN, (node.lineno,), False)
+            return result
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            # Characterized effects may intentionally return None. Unknown calls
+            # still go through finite call resolution and fail, regardless of bounds.
+            value = self._expr(node.value, env)
+            owner = self._expr(node.value.func.value, env, quiet=True) if isinstance(node.value.func, ast.Attribute) else UNKNOWN
+            if owner.kind in CAPABILITIES or value.kind == "None":
+                return env
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            value = self._expr(node.value, env, quiet=True)
+            if value.kind in CAPABILITIES:
+                self.emit("PAL320", node, "capability alias bindings are unsupported; use a parameter or finite borrow scope")
+                return env
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and self._primitive_identity(node.value.func, {"replace"}):
             self._expr(node.value, env)
             self.emit("PAL250", node, "replace returns a new record value; its result is ignored", origin="persistent return-only operation")
@@ -2162,6 +2535,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if self.active and node.id in self.active.captures:
                 value = self.active.captures[node.id]
                 self.active.capture_uses.add(node.id)
+                if value.kind in CAPABILITIES:
+                    return reject("PAL320", f"capability `{node.id}` cannot be captured by a callable")
                 return value
             if self.active and node.id in self.active.enclosing_names:
                 return reject("PAL240", f"captured binding `{node.id}` is not established as stable and initialized")
@@ -2187,7 +2562,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return Value.exact("builtin:" + node.attr)
                 if module == "pyalamode" and node.attr in COLLECTIONS and self._foundation_available(module):
                     return Value.exact("collection_class:" + node.attr)
-                if module == "pyalamode" and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES and self._foundation_available(module):
+                if module in {"pyalamode", "pyalamode.effects"} and node.attr in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES and self._foundation_available(module):
                     return Value.exact("primitive:" + node.attr)
                 target = self.graph.modules.get(module)
                 if target:
@@ -2270,8 +2645,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if any(isinstance(item, ast.Starred) for item in node.elts):
                 return reject("PAL201", "tuple unpacking has no supported construction contract")
             items = tuple(self._expr(item, env, quiet=quiet) for item in node.elts)
-            if any(not value.types or value.callable or (value.kind and value.kind.startswith(("module:", "builtin:"))) for value in items):
-                return reject("PAL221", "tuple contents must be recursively admitted immutable data; callable/module objects are not tuple data")
+            if any(not self._data_value(value) for value in items):
+                return reject("PAL221", "tuple contents must be recursively admitted immutable data; capabilities/callables/modules are not tuple data")
             args = tuple(self.graph.types[value.kind] for value in items if value.kind in self.graph.types)
             if len(args) != len(items):
                 return reject("PAL221", "tuple element exact contract is ambiguous")
@@ -2285,6 +2660,12 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return reject("PAL210", "conditional expression requires exact bool")
             return self.merge_values(yes, no)
         if isinstance(node, ast.Call):
+            capability = self._capability_call(node, env, quiet)
+            if capability is not None:
+                return capability
+            provider = self._provider_call(node, env, quiet)
+            if provider is not None:
+                return provider
             record_value = self._record_call_value(node, env, quiet)
             if record_value is not None:
                 return record_value
@@ -2319,6 +2700,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if not quiet:
                 self._record_call(node)
                 self._ready_callable(target, env, node)
+                self._require_effects(callback.effect_bound, node, "callable invocation")
             if callback.targets:
                 if callback.conditional:
                     if node.keywords or len(node.args) != len(callback.parameters) or any(isinstance(a, ast.Starred) for a in node.args):
@@ -2327,7 +2709,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         if not self.matches(self._expr(arg, env, quiet=quiet), expected) and not quiet:
                             self.emit("PAL221", arg, f"conditional callback argument requires {expected}")
                     if not quiet:
-                        self.failures.update(CALLABLE_FAILURES)
+                        self.failures.update(self._callable_failures(callback.effect_bound))
                 infos = [self.graph.functions[identity] for identity in callback.targets]
                 for info in infos:
                     self._checked_inputs(node, info, env, quiet)
@@ -2352,7 +2734,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         if not quiet:
                             self.emit("PAL221", arg, f"callback argument requires {expected}; found {self._describe(value)}")
                 if not quiet:
-                    self.failures.update(CALLABLE_FAILURES)
+                    self.failures.update(self._callable_failures(callback.effect_bound))
                 return self.annotation_value(callback.returns)
             return reject("PAL230", "callable annotation alone does not establish invocation evidence")
         return super()._expr(node, env, quiet=quiet)
@@ -2377,6 +2759,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         for name, arg in supplied.items():
             value = self._expr(arg, env, quiet=quiet)
             expected = info.parameters.get(name)
+            if value.callable and self.active and not quiet:
+                self._ready_callable(value, env, arg)
+                key = info.identity + ":" + name
+                self.active.callable_arguments.setdefault(key, set()).update(value.callable.targets)
             if expected and not self.matches(value, expected) and not quiet:
                 self.emit("PAL221", arg, f"argument `{name}` of `{info.qualified}` requires {expected}; found {self._describe(value)}")
 
@@ -2391,6 +2777,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return self.graph.functions[value.callable.targets[0]]
         return None
 
+    @staticmethod
+    def _callable_evidence(callback):
+        return {"targets": list(callback.targets), "captures": [list(c) for c in callback.captures], "conditional": callback.conditional, "effect_bound": list(callback.effect_bound)}
+
     def _ready_callable(self, value, env, node, seen=None):
         if not value.callable or not self.active:
             return
@@ -2400,6 +2790,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 continue
             seen.add(target)
             info = self.graph.functions[target]
+            self.active.callable_dependencies.add(target)
+            self._depend(info.analyzer.path)
             if info.parent is self.active:
                 for name in info.capture_uses:
                     capture = info.captures[name]
@@ -2447,6 +2839,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 contract.enforcement = self.result.mode
                 contract.source_evidence = "unverified: audit or failed selected gate"
                 contract.freshness = "no successful checked claim"
+                contract.behavior = "unverified behavior; no certified effect bound"
         self.result.diagnostics.sort(key=lambda d: (d.line, d.column, d.rule))
 
 

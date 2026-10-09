@@ -1,6 +1,6 @@
 # Pyalamode
 
-Pyalamode checks a functional core in ordinary Python. The current M4 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, and optional generated data guards. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
+Pyalamode checks a functional core in ordinary Python. The current M5 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, and finite checked effectful shells with opaque capabilities. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
 The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux** (`cpython-3.13.1`). Other patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Installation under another Python 3.13 patch does not establish compatibility.
 
@@ -19,6 +19,8 @@ pyalamode check examples/collections --no-cache
 python -m examples.collections.demo
 pyalamode check examples/records --no-cache
 python -m examples.records.demo
+pyalamode check examples/effects --no-cache
+python -m examples.effects.demo
 ```
 
 The scalar example prints `1300` and `0`. The module example prints `1500`, `6`, `6`, and `2`. Its checked core uses stable imports, defaults, a closure, a recursive calculation, and tuple inputs; its ordinary demo prints those results without receiving a purity claim.
@@ -70,13 +72,14 @@ Every parameter and result has an explicit supported annotation. Analyzed calls 
 | --- | --- |
 | Scalars | Exact `int`, `bool`, `str`, `bytes`, `None`; stable `types.NoneType` imports; supported quoted annotations |
 | Tuples | Fixed `tuple[int, str]`, homogeneous `tuple[int, ...]`, empty `tuple[()]`; recursive exact immutable data, excluding subclasses and callable payloads |
-| Callables | Stable `typing` or `collections.abc` `Callable[[int, str], int]`; fixed positional pure invocation with exact admitted inputs/result and stable captures |
+| Callables | Stable `typing` or `collections.abc` `Callable[[int, str], int]`; fixed positional pure invocation. Product `Effectful[[ClockCapability], int, Clock]` adds a finite effect upper bound and exact capability slots. Actual target/capture evidence is required. |
+| Capabilities | Exact `IOCapability`, `StateCapability`, `ClockCapability`, `RandomCapability`, `EnvironmentCapability`; borrowed invocation inputs in matching effectful functions, excluded from stable data/returns/defaults/captures/aliases |
 | Collections | Stable `pyalamode` imports of `Vector[T]`, `OrderedMap[K, V]`, `Map[K, V]`, and `Set[T]`; recursively admitted data; map keys and Set elements use one exact scalar domain |
 | Records | Exact `@record` declarations with fixed public typed fields and stable defaults; recursive admitted data, pure slot reads, exact type-sensitive equality and `replace` |
 
 Callable parameters express a required input contract. They do not turn an unknown function, lambda, protocol, or ordinary annotated parameter into checked pure evidence. Checked callers supply resolved checked functions or pass a callable already established by their own input contract. Callable annotations allow nested callable inputs/results, but exclude `Any`, ellipsis signatures, variadics, and keyword-only callback shapes. Optional positional defaults and positional-only parameters are compatible when the complete fixed positional call fits. Direct checked calls also support normal positional-only, positional-or-keyword, keyword-only, and default arguments.
 
-A generic admitted callable has the finite invocation failure upper bound **`IndexError`, `KeyError`, `ValueError`, `ZeroDivisionError`, and `RecursionError`**, the current closed operation universe. Conditional callback invocation propagates that bound. Concrete direct targets retain their characterized transitive failures. Reports disclose concrete callback defaults, captures, returned targets, and collection operation identities when established. Recursively nested library validation and equality have a separate conservative `RecursionError` bound.
+A generic pure admitted callable has the finite invocation failure upper bound **`IndexError`, `KeyError`, `ValueError`, `ZeroDivisionError`, and `RecursionError`**, the current closed operation universe. Conditional pure callback invocation propagates that bound. Effectful conditional callbacks add the finite operation failure categories of their declared families, including `RuntimeError`, `OSError` and `UnicodeError` where relevant. Concrete direct targets retain their characterized transitive failures. Reports disclose concrete callback defaults, captures, returned targets, and collection operation identities when established. Recursively nested library validation and equality have a separate conservative `RecursionError` bound.
 
 Stable constants require a single characterized source initialization and no analyzed replacement. Upper-case spelling, `Final`, hashability, a current integer object, and an annotation do not establish stability. A nested function can capture admitted immutable values and checked callables. Changing cells fail, and every required cell must be initialized before a closure is invoked or escapes. Recursion is admitted without a termination claim.
 
@@ -86,11 +89,48 @@ The scalar operations remain integer unary `+`/`-`, integer `+`/`-`/`*`/`//`/`%`
 
 Statements include one-name initialization, annotated initialization, `if`/`elif`/`else`, `return`, `pass`, docstrings, and checked nested function definitions. Each reachable binding initializes once. Exclusive branches may initialize the same name; missing initialization and reachable reinitialization fail. Imports are module-level dependencies.
 
-Module initializers and defaults use closed stable data expressions, earlier stable bindings, approved builtin calls, and checked callable references. **Calling application functions in initialization/default expressions is excluded**, even if their invocation contract is checked. Annotation expressions are parsed from the finite whitelist. Functions admit the resolved identity `fun`; fixed record classes admit the library declaration `record`. Imports, decorators, annotations and defaults must be available when Python evaluates them. Initialization and definition-time default failures are reported separately from invocation failures.
+Module initializers and defaults use closed stable data expressions, earlier stable bindings, approved builtin calls, and checked callable references. **Calling application functions in initialization/default expressions is excluded**, even if their invocation contract is checked. Annotation expressions are parsed from the finite whitelist. Functions admit the resolved identity `fun` and finite identity `effects` declarations; fixed record classes admit the library declaration `record`. Imports, decorators, annotations and defaults must be available when Python evaluates them. Initialization and definition-time default failures are reported separately from invocation failures.
 
 Local imports resolve from the project root with package-before-module precedence and required package initializers. A strict module imports only characterized foundations or functional local modules. Cyclic direct from-imports and eager cyclic namespace reads in initialization/defaults/non-postponed annotations fail `PAL241`; module imports with deferred function references remain supported. This is a finite conservative availability gate. An ordinary module may perform unchecked initialization before using checked exports. Unresolved external APIs receive no trusted admission. A local file named `pyalamode`, `typing`, `types`, or `collections` cannot acquire foundation behavior through its spelling.
 
-Fixed tuples support in-range literal integer indexing and literal slicing; homogeneous tuples support exact integer indexes and slices. Tuple/collection/record equality requires matching recursive exact data schemas. Map/Set membership uses characterized scalar lookup. Loops, comprehensions, destructuring, arbitrary classes/methods, static patterns, mutable strict data, reflection, generators, async, user exceptions/handlers, external trust approvals, and effects remain excluded. Dynamic ordinary dispatch stays the ordinary caller's responsibility. The checker is conservative about unknown aliases, ordinary control flow, and cells outside a checked enclosing scope.
+Fixed tuples support in-range literal integer indexing and literal slicing; homogeneous tuples support exact integer indexes and slices. Tuple/collection/record equality requires matching recursive exact data schemas. Map/Set membership uses characterized scalar lookup. Loops, comprehensions, destructuring, arbitrary classes/methods, static patterns, mutable strict data, reflection, generators, async, user exceptions/handlers, external trust approvals, arbitrary effectful operations and Task remain excluded. Dynamic ordinary dispatch stays the ordinary caller's responsibility. The checker is conservative about unknown aliases, ordinary control flow, and cells outside a checked enclosing scope.
+
+## Checked effectful shells
+
+A declaration names a finite upper bound. Every admitted operation remains characterized, including callback invocation. Unknown calls and implicit dispatch fail even when all five effects are declared.
+
+```python
+from pyalamode import effects, Effectful, Clock, ClockCapability, borrow
+
+@effects(Clock)
+def read_clock(clock: ClockCapability) -> int:
+    return clock.now_ns()
+
+@effects(Clock)
+def invoke(reader: Effectful[[ClockCapability], int, Clock], clock: ClockCapability) -> int:
+    with borrow(clock) as scoped:
+        return reader(scoped)
+```
+
+`@effects` selects the function, alone or alongside one `@fun`; both declarations preserve the identical function without registration, wrappers or metadata mutation. Pure callers cannot invoke a declared effectful function. `Callable` has an empty effect bound; `Effectful` permits a concrete target with a smaller bound and unions every conditional alternative. Capability callback arguments are explicit borrowed slots; a callback cannot capture a live capability. Vector map/filter/fold preserve ordered execution and union callback bounds; their capture restriction remains the same.
+
+The exact interfaces are `IOCapability.read_text(path)`/`write_text(path,text)`, `StateCapability.get()`/`set(int)`, `ClockCapability.now_ns()`, `RandomCapability.below(int)` and `EnvironmentCapability.get(name,default)`. IO reads/writes whole UTF-8 files, closes internally on completion/failure, and uses explicit rooted relative paths. `borrow` is a logical lease whose view expires on every exit, including return or body failure. Persistent readers, sessions, arbitrary context managers and resource transfer remain unsupported.
+
+Provider setup is ordinary Python: `recorded_clock((123,))`, `state(0)`, `recorded_random((3,))`, `recorded_environment((("NAME","demo"),))`, and `recorded_io((), allowed_ops=("read_text","write_text"))` provide controlled inputs. `live_clock()`, `live_random()`, `live_environment()` and `live_io(root, allowed_ops=("read_text","write_text"))` access their live interfaces. Controlled providers retain their effects. Provider constructors are refused inside checked functions, defaults and functional module initializers. Recorded exhaustion raises `IndexError`; recorded IO missing reads raise `KeyError`; invalid bounds/path/name raise `ValueError`. Failures remain separate from effects.
+
+A capability slot conservatively requires the **full interface operation set** and a live invocation lifetime. The checker does not infer minimal callee permissions: a known read-only IO provider cannot satisfy any checked IOCapability slot, including a reader. Ordinary narrower providers remain usable under their runtime permission checks. Known closed/unknown shell capability operations invalidate analyzed lending evidence; ordinary annotations establish no actual provider type. Capabilities cannot be stored in tuples/collections/records, defaults, global constants, alias bindings, captured cells or returned stable values. Ordinary callers still owe exact interfaces, permissions, lifetime, dependency integrity and IO path consistency. The rooted IO contract is not a security sandbox.
+
+Entry policy can restrict exact selected functions:
+
+```toml
+[tool.pyalamode.effect_bounds]
+"core:invoke" = ["Clock"]
+"core:pure_total" = []
+```
+
+The declared bound cannot exceed policy; required effects must fit the declaration. Reports retain declared/required effects, origin paths, separate invocation and definition failures, concrete callable argument/reference dependencies, and exact returned/captured callback evidence across warm checks. An uninvoked effectful callable value retains its assumptions without adding invocation effects. Guards validate supported data only and refuse callback/capability exports; debug can assert data alongside unguarded capability inputs.
+
+Use public names through `from pyalamode import ...` or `from pyalamode.effects import ...`. The exported `effects` function shares its helper submodule name: ordinary `import pyalamode.effects as e` binds that function, so `@e(Clock)` works, while `e.effects`/`e.ClockCapability` namespace syntax is refused. See the [M5 handoff](Docs/milestones/05-effects.md) and [runtime contract](Docs/evidence/m05-runtime-contract.md) for the finite catalog, failures, dependency/cleanup assumptions and costs.
 
 ## Eager persistent collections
 
@@ -149,7 +189,7 @@ boundary_guards = "exports"
 guarded_exports = ["examples.records.core:tag_customer"]
 ```
 
-Build then provides the guarded public alias `pyalamode_exports.examples.records.core:tag_customer`, imported normally with `from pyalamode_exports.examples.records.core import tag_customer`. It validates exact supported arguments before the original body and returned data afterward. Original-module functions remain unwrapped and unguarded in exports mode; checked internal calls use those originals. Guards are off by default and do not freeze inputs, prove effects/ownership/callback purity, or monitor dependency tampering. M4 refuses selected Callable boundaries. Unknown, ambiguous, duplicate and conflicting selections fail.
+Build then provides the guarded public alias `pyalamode_exports.examples.records.core:tag_customer`, imported normally with `from pyalamode_exports.examples.records.core import tag_customer`. It validates exact supported arguments before the original body and returned data afterward. Original-module functions remain unwrapped and unguarded in exports mode; checked internal calls use those originals. Guards are off by default and do not freeze inputs, prove effects/ownership/callback purity, or monitor dependency tampering. Selected Callable, Effectful and live capability boundaries are refused. Unknown, ambiguous, duplicate and conflicting selections fail.
 
 `boundary_guards = "debug"` additionally inserts supported exact data assertions at selected function parameters, local bindings and returns in copied source. Reports list coverage; callable evidence obligations remain. Debug assertions add repeated traversal and ordinary import/allocation overhead. The [M4 handoff](Docs/milestones/04-records.md) and [runtime contract](Docs/evidence/m04-runtime-contract.md) publish guard behavior, costs, snapshot preconditions, adapter limits and evidence.
 
@@ -182,4 +222,4 @@ python -m unittest discover -s tests -p 'm0*.py' -v
 python benchmarks/m01_scalar.py --output /tmp/pyalamode-m01.json
 ```
 
-The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.
+The M5 suite adds finite operation/declared/required effect unions, concrete and conditional higher-order capability slots, data/alias/capture/lifetime escape refusals, controlled providers, whole-path IO cleanup, permission gates, partial warm callable evidence, and current source/policy/product/writer fingerprints. The M4 suite inherits the earlier adversarial guarantees and adds fixed record/schema/definition evidence, nested record validation, retained replacements, exclusive snapshot assertions, foreign hook/metadata refusal, fresh by-value exports, finite adapter qualification, selected guard entry/return coverage, internal-call isolation, debug coverage, circular initialization refusal and runtime-byte/policy/writer freshness. See [the M4 handoff](Docs/milestones/04-records.md), [the M3 handoff](Docs/milestones/03-collections.md), [the M2 handoff](Docs/milestones/02-modules.md), and [the composite specification](SPEC-sol6.1-composite.md). Human authoring-time and usability claims remain unmeasured.
