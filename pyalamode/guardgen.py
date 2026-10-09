@@ -69,11 +69,10 @@ class Schemas:
             cases = []
             for case_name, case in self.records[text]["cases"].items():
                 fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in case["fields"].items()) + ("," if len(case["fields"]) == 1 else "") + ")"
-                cases.append("(" + reference + "." + case_name + ", " + fields + ")")
+                cases.append("(" + self.case_reference(case["schema"], case) + ", " + fields + ")")
             return "('oneof', " + reference + ", (" + ", ".join(cases) + ("," if len(cases) == 1 else "") + "))"
         if schema.name.startswith("case:"):
-            module, domain, name = schema.name[len("case:"):].rsplit(":", 2)
-            reference = self.local_records.get(text) or self.module(module) + "." + domain + "." + name
+            reference = self.case_reference(text, self.records[text])
             fields = "(" + ", ".join("(" + repr(field) + ", " + self.code(kind) + ")" for field, kind in self.records[text]["fields"].items()) + ("," if len(self.records[text]["fields"]) == 1 else "") + ")"
             return "('case', " + reference + ", " + fields + ")"
         if schema.name.startswith("record:"):
@@ -85,6 +84,15 @@ class Schemas:
         if schema.name in {"Vector", "Map", "OrderedMap", "Set", "Option", "Result", "Some", "Nothing", "Ok", "Err"}:
             return "(" + repr(schema.name) + ", " + children + ")"
         raise ValueError("guard schemas require supported exact data, not Callable evidence")
+
+    def case_reference(self, text, case):
+        """Nested cases are domain attributes; open-domain extension cases are module attributes."""
+        if text in self.local_records:
+            return self.local_records[text]
+        if "module" in case and "qualname" in case:
+            return self.module(case["module"]) + "." + case["qualname"]
+        module, domain, name = _contract_type(text).name[len("case:"):].rsplit(":", 2)
+        return self.module(module) + "." + domain + "." + name
 
     def imports(self):
         return ["import " + name + " as " + alias for name, alias in self.modules.items()]
@@ -146,7 +154,8 @@ def debug_source(source, result, records):
     local_records = {record["schema"]: prefix + "record" + str(index) for index, record in enumerate(declarations)}
     for oneof in result.oneofs:
         for name, case in oneof["cases"].items():
-            local_records[case["schema"]] = local_records[oneof["schema"]] + "." + name
+            if not case.get("extension"):
+                local_records[case["schema"]] = local_records[oneof["schema"]] + "." + name
     schemas = Schemas(records, prefix, local_records)
     validate = prefix + "validate"
     contracts = {contract.name: contract for contract in result.contracts}

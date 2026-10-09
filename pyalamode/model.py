@@ -146,6 +146,7 @@ class CheckResult:
     binding_context: list[str] = field(default_factory=list)
     records: list[dict] = field(default_factory=list)
     oneofs: list[dict] = field(default_factory=list)
+    cases: list[dict] = field(default_factory=list)
     setup_observations: list[dict] = field(default_factory=list)
     unsafe_adapters: list[dict] = field(default_factory=list)
     integration_inputs: dict[str, dict] = field(default_factory=dict)

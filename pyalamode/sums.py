@@ -12,6 +12,8 @@ __all__ = ["oneof", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", 
 
 _CASES = ()
 _ONEOFS = ()
+# Open domains, by identity; their extension cases come from other declarations.
+_OPEN = ()
 _DATA = object()
 
 
@@ -179,8 +181,26 @@ def _declaration(cls, path):
     return attributes
 
 
-def case(cls):
-    """Create a fixed case declaration; its containing oneof closes its tag."""
+def _is_open(kind):
+    return any(kind is entry for entry in _OPEN)
+
+
+def case(cls=None, /, *, of=None):
+    """Create a fixed case declaration.
+
+    Nested @case declarations are closed by their containing @oneof. A
+    top-level @case(of=Domain) adds a case to an open domain.
+    """
+    if cls is None:
+        if of is None or not _is_open(of):
+            _collections._invalid("case", "of= requires an open @oneof(open=True) domain")
+        return lambda declaration: _extend(declaration, of)
+    if of is not None:
+        _collections._invalid("case", "use @case(of=Domain) as a decorator factory")
+    return _case(cls)
+
+
+def _case(cls):
     attributes = _declaration(cls, "case")
     annotations = attributes.get("__annotations__", {})
     if type(annotations) is not dict:
@@ -227,9 +247,51 @@ class _DomainType(type):
         return info is not None and any(kind is case for case, _ in info[2])
 
 
-def oneof(cls):
-    """Seal a declaration-only namespace with its exact nested case set."""
+def _extend(cls, domain):
+    """Attach a top-level extension case to an open domain, in canonical order."""
     global _CASES, _ONEOFS
+    info = _oneof_info(domain)
+    product = _case(cls)
+    entry = _pending_info(product)
+    qualified = type.__getattribute__(product, "__qualname__")
+    if info is None or qualified != entry[5]:
+        _collections._invalid("case", "extension cases are top-level declarations of an open domain")
+    if any(_pending_info(kind)[5] == entry[5] for kind, _ in info[2]):
+        _collections._invalid("case", "open domain already has a case with this name")
+    _CASES = tuple((kind, fields, defaults, domain, info[1], name) if kind is product else row
+                   for row in _CASES for kind, fields, defaults, family, old_identity, name in (row,))
+    domain_module = type.__getattribute__(domain, "__module__")
+    domain_qualified = type.__getattribute__(domain, "__qualname__")
+
+    def nested(kind):
+        return (type.__getattribute__(kind, "__module__") == domain_module
+                and type.__getattribute__(kind, "__qualname__").startswith(domain_qualified + "."))
+
+    def key(item):
+        return (type.__getattribute__(item[0], "__module__"), type.__getattribute__(item[0], "__qualname__"))
+    cases = info[2] + ((product, entry[1]),)
+    ordered = tuple(item for item in cases if nested(item[0])) + tuple(sorted((item for item in cases if not nested(item[0])), key=key))
+    _ONEOFS = tuple((kind, identity, ordered) if kind is domain else row
+                    for row in _ONEOFS for kind, identity, _ in (row,))
+    return product
+
+
+def oneof(cls=None, /, *, open=False):
+    """Seal a declaration-only namespace with its nested case set.
+
+    @oneof is closed. @oneof(open=True) also accepts top-level
+    @case(of=Domain) declarations; matches outside the defining
+    distribution must then end with a wildcard.
+    """
+    if type(open) is not bool:
+        _collections._invalid("oneof", "open requires an exact bool")
+    if cls is None:
+        return lambda declaration: _seal(declaration, open)
+    return _seal(cls, open)
+
+
+def _seal(cls, is_open):
+    global _CASES, _ONEOFS, _OPEN
     attributes = _declaration(cls, "oneof")
     cases = []
     allowed = {"__module__", "__qualname__", "__doc__", "__dict__", "__weakref__",
@@ -247,7 +309,7 @@ def oneof(cls):
         if type.__getattribute__(value, "__module__") != module or type.__getattribute__(value, "__qualname__") != qualified + "." + name or info[5] != name:
             _collections._invalid("oneof", "case must be declared inside its domain under its own name")
         cases.append((value, info[1]))
-    if not cases:
+    if not cases and not is_open:
         _collections._invalid("oneof", "domain requires at least one case")
 
     def reject_subclass(subclass, **kwargs):
@@ -262,6 +324,8 @@ def oneof(cls):
                    if any(kind is candidate for candidate, _ in cases) else entry
                    for entry in _CASES for kind, fields, defaults, family, old_identity, name in (entry,))
     _ONEOFS += ((product, identity, tuple(cases)),)
+    if is_open:
+        _OPEN += (product,)
     return product
 
 

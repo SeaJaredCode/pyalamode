@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stages 0, 1 and 2 implemented on branch `sum-types` and merged with M11 (`c668439`); stage 3 queued.
+Status: stages 0 to 3 implemented on branch `sum-types`, merged with M11 (`c668439`).
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -22,7 +22,7 @@ Open unions (structural "anything with this class" sets) stay unsupported. `Opti
 | 0 | `oneof` becomes the canonical decorator, with a transitional `variant` alias | M6 | Implemented, then superseded by stage 2 |
 | 1 | Closed unions in annotations, values, matches, records, cases, guards and value encoding | M6, M11 | Implemented on `sum-types` |
 | 2 | Full rename to `oneof`; the `variant` spelling is gone | M11 | Implemented on `sum-types` |
-| 3 | Open tagged `@oneof(open=True)` with a distribution-scoped case registry | M11 committed, stage 2 | Queued |
+| 3 | Open tagged `@oneof(open=True)` with distribution-scoped `@case(of=Domain)` | M11, stage 2 | Implemented on `sum-types` |
 
 Stage order follows the original design note. Closed unions stand alone, unlock `int | None`, and exercise the multi-member value representation. Open tagged work touches registry and policy, so it reviews separately. Stage 2 waits for M11 because the uncommitted M11 tree edits the same checker lines and adds new files (`encoding.py`, `distribution.py`) that name `variant`.
 
@@ -105,13 +105,56 @@ The project has no users yet, so the rename is complete rather than aliased.
 - Genuine M10 history stays readable as provenance. The legacy reader accepts its `variant` boundary kind, its `selected_variants` coverage key and its `variants.py` product inventory, and nothing else uses those spellings.
 - Historical milestone, evidence and conformance documents keep `@variant`, because they record what was built and measured at the time.
 
-## Stage 3: open tagged (after M11)
+## Stage 3: open tagged sums
 
-- Declaration: `@oneof(open=True)` with nested cases as today, plus top-level `@case(of=Domain)` declarations in other modules.
-- Cases from a consumer package are refused in the first cut. Only modules owned by the same checked distribution may add cases. This keeps M11 producer evidence sound without cross-package invalidation machinery.
-- The case registry collects cases across the distribution's modules. The domain fingerprint covers the full collected set.
-- Coverage: inside the defining distribution, explicit coverage works as for closed domains. Outside it, a final `_` is mandatory regardless of policy, and `explicit_cases` cannot select the domain.
-- Encoding: case identity is the declaring `module:Domain.Case`, which is already stable across the distribution.
+### Declaration
+
+```python
+# shapes.py
+@oneof(open=True)
+class Shape:
+    @case
+    class Circle:
+        radius: int
+
+# squares.py, same project or distribution
+from shapes import Shape
+
+@case(of=Shape)
+class Square:
+    side: int
+```
+
+- `@oneof(open=True)` is the only open spelling. `@oneof(open=False)`, `@oneof()` and non-literal values are refused; a closed domain is plain `@oneof`. An open domain may start with no nested cases (`pass`).
+- `@case(of=Domain)` is a top-level class with the same payload rules as a nested case. `Domain` must resolve to an unchanged open domain. Case names are unique across the whole domain.
+- Extension cases are module attributes, not domain attributes. `Shape.Square` is refused statically and absent at runtime; code imports `Square` from its module.
+- A case declared outside the domain's own checked distribution is refused (PAL120). For a project check, the project is one distribution; an installed checked dependency is another.
+
+### Census and freshness
+
+Exhaustiveness inside the distribution is only sound if the checker sees every contributed case, including cases in modules nobody imports.
+
+- When any loaded source declares `@oneof(open=...)`, source loading parses (never imports) every project module under the root, using the same exclusions as project discovery, and loads each one that declares `@case(of=...)`.
+- Every module that defines or imports an open domain depends, for cache keys, on all extension modules and their import closures. Adding or editing an extension anywhere in the project therefore re-analyzes those consumers.
+- The domain fingerprint covers all cases with their declaring modules, plus the open flag.
+
+### Coverage
+
+- Inside the defining distribution, coverage is exhaustive over the full collected case set, and `explicit_cases` applies as for closed domains.
+- In any other distribution, a match over an open domain must end with `_`. Inside a union, `case Domain():` also covers that member, because it matches future cases at runtime too. `explicit_cases` cannot select another distribution's open domain.
+
+### Runtime, guards, encoding and distribution
+
+- The runtime catalog orders cases as nested cases in declaration order, then extension cases by `(module, qualname)`. The checker uses the same order, so generated guard schemas compare equal.
+- Guard code references extension cases through their own module, which imports that module and registers the case before validation.
+- Encoding keeps PALV1. An extension case's nominal identity is its own `module:Name`. The schema descriptor lists the cases loaded in the process, so encoder and decoder must have imported the same extension modules; otherwise decoding refuses with "wire schema differs from selected schema".
+- Wheel evidence: domain rows carry `open`, and each case row carries `module`, `qualname` and `extension`. Extension cases are a new export kind, `case`, listed in `exports` by their own `module:Name` and verified against the consumer's re-derivation like records and domains.
+
+### Not in the first cut
+
+- Cases contributed by consumer packages to a dependency's open domain.
+- Open unions.
+- Census for single-source APIs (`analyze_source`, `analyze_sources`). Their census is exactly the sources passed in.
 
 ## Merge notes for the orchestrator
 

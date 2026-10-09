@@ -276,7 +276,10 @@ class _Compiler:
                     _type_error("schema", "malformed product schema metadata")
                 descriptors = _field_descriptors(case[0], case[1])
                 name = _name(case[5])
-                if name in names or self.nominal(case[0]) != identity + "." + name:
+                label = self.nominal(case[0])
+                # Extension cases of an open domain keep their own top-level identity.
+                extension = _sums._is_open(kind) and label.rsplit(":", 1)[-1] == name
+                if name in names or label != identity + "." + name and not extension:
                     _type_error("schema", "malformed product schema metadata")
                 names.append(name)
                 cases.append(_Case(case[0], name, self.fields(case[1], depth), descriptors))

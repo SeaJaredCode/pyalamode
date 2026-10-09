@@ -347,7 +347,7 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
-                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), oneofs=payload.get("oneofs", []),
+                             binding_context=payload.get("binding_context", []), records=payload.get("records", []), oneofs=payload.get("oneofs", []), cases=payload.get("cases", []),
                              setup_observations=payload.get("setup_observations", []),
                              unsafe_adapters=payload.get("unsafe_adapters", []), integration_inputs=payload.get("integration_inputs", {}))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
@@ -607,6 +607,17 @@ def _source_dependencies(sources: dict[str, str], root: Path, graph=None) -> dic
             for dependency in tuple(values):
                 values.update(direct[dependency] - {path})
             changed |= previous != len(values)
+    # A module that sees an open domain depends on every case contributed to it,
+    # so adding or editing an extension anywhere in the project changes its key.
+    from .checker import _declares_class_keyword
+    open_paths = {path for path, source in sources.items() if _declares_class_keyword(source, "open")}
+    extension_paths = {path for path, source in sources.items() if _declares_class_keyword(source, "of")}
+    if open_paths and extension_paths:
+        closure = {path: set(values) for path, values in direct.items()}
+        contributed = set(extension_paths).union(*(closure[path] for path in extension_paths))
+        for path, values in direct.items():
+            if path in open_paths or values & open_paths:
+                values.update(contributed - {path})
     return direct
 
 
@@ -756,7 +767,7 @@ def _distribution_contract_relation(payload,actual,claimed,graph,kind):
         if type(value) is list:return [normalized(v,paths) for v in value]
         if type(value) is dict:return {k:normalized(v,paths) for k,v in value.items()}
         return value
-    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","cases","case_fingerprint")
+    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","domain","fields","defaults") if kind=="case" else ("name","line","schema","cases","case_fingerprint")
     for key in keys:
         if normalized(actual[key],current_paths)!=normalized(claimed[key],producer_paths):raise DistributionError("producer structure disagrees with current authored declaration: "+key)
     if kind=="function":
@@ -815,17 +826,17 @@ def _finish_distributions(result, snapshot, graph, root, intrinsic):
                     analyzer = intrinsic.modules.get(namespace) if intrinsic else None
                     if analyzer is None:
                         raise DistributionError("export absent from actual source")
-                    reports = [asdict(c) for c in analyzer.result.contracts] if row["kind"] == "function" else analyzer.result.records if row["kind"] == "record" else analyzer.result.oneofs
+                    reports = [asdict(c) for c in analyzer.result.contracts] if row["kind"] == "function" else analyzer.result.records if row["kind"] == "record" else analyzer.result.cases if row["kind"] == "case" else analyzer.result.oneofs
                     actual = next((c for c in reports if c["name"] == export),None)
                     if actual is None:
                         source_status = max(source_status,1)
                         continue
-                    keys = ("parameters","parameter_kinds","returns","defaults","effect_bound") if row["kind"] == "function" else ("schema","fields","defaults") if row["kind"] == "record" else ("schema","cases","case_fingerprint")
+                    keys = ("parameters","parameter_kinds","returns","defaults","effect_bound") if row["kind"] == "function" else ("schema","fields","defaults") if row["kind"] == "record" else ("schema","domain","fields","defaults") if row["kind"] == "case" else ("schema","cases","case_fingerprint")
                     if any(actual[k] != row["contract"][k] for k in keys):
                         raise DistributionError("producer contract disagrees with parsed declarations")
                     if analyzer.result.status==0:_distribution_contract_relation(payload,actual,row["contract"],intrinsic,row["kind"])
                     current=graph.modules[namespace]
-                    current_reports=[asdict(c) for c in current.result.contracts] if row["kind"]=="function" else current.result.records if row["kind"]=="record" else current.result.oneofs
+                    current_reports=[asdict(c) for c in current.result.contracts] if row["kind"]=="function" else current.result.records if row["kind"]=="record" else current.result.cases if row["kind"]=="case" else current.result.oneofs
                     current_actual=next((c for c in current_reports if c["name"]==export),None)
                     if current_actual is None:source_status=max(source_status,1)
                     else:proven.append({**row,"contract":current_actual})

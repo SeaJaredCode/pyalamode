@@ -355,11 +355,17 @@ def _contract(value,kind):
         for key in ("ordinary_validation_failures","ordinary_representation_failures"):
             for name,reason in mapping(value[key]).items():strings([name],FAILURES|{"TypeError","AttributeError"});text(reason)
     elif kind=="oneof":
-        shape(value,set("name schema path line cases case_fingerprint enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
-        _schema(value["schema"]);sha(value["case_fingerprint"]);text(value["equivalence"])
+        shape(value,set("name schema path line open cases case_fingerprint enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
+        _schema(value["schema"]);sha(value["case_fingerprint"]);text(value["equivalence"]);boolean(value["open"])
         for name,row in mapping(value["cases"]).items():
-            identifier(name);shape(row,{"schema","fields","defaults"});_schema(row["schema"]);schema_map(row["fields"]);schema_map(row["defaults"])
+            identifier(name);shape(row,{"schema","fields","defaults","module","qualname","extension"});_schema(row["schema"]);schema_map(row["fields"]);schema_map(row["defaults"])
+            text(row["module"]);text(row["qualname"]);boolean(row["extension"])
+            if row["extension"] and not value["open"]: raise DistributionError("closed domain cannot carry extension cases")
             if not set(row["defaults"])<=set(row["fields"]): raise DistributionError("invalid case defaults")
+    elif kind=="case":
+        shape(value,set("name schema path line domain fields defaults module qualname enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
+        _schema(value["schema"]);_schema(value["domain"]);schema_map(value["fields"]);schema_map(value["defaults"]);text(value["module"]);text(value["qualname"]);text(value["equivalence"])
+        if not set(value["defaults"])<=set(value["fields"]): raise DistributionError("invalid case defaults")
     else: raise DistributionError("unknown export kind")
     identifier(value["name"]);text(value["path"],4096);integer(value["line"],1)
     for key in ("behavior","source_evidence","freshness","boundary_protection"): text(value[key])
@@ -769,7 +775,7 @@ def build_wheel(result,capture,root,destination):
         members[path]=artifact;members[info+"/pyalamode/sources/"+path]=raw
         namespace=graph.module_name(absolute)
         modules.append({"module":namespace,"authored_path":path,"source_sha256":hashlib.sha256(raw).hexdigest(),"installed_path":path,"artifact_sha256":hashlib.sha256(artifact).hexdigest(),"initialization":{"source_evidence":file.initialization_evidence,"effects":[] if file.module_mode and file.verified else None,"failures":file.initialization_failures if file.module_mode and file.verified else None},"setup_observations":file.setup_observations})
-        for kind,rows in (("function",[asdict(c) for c in file.contracts]),("record",file.records),("oneof",file.oneofs)):
+        for kind,rows in (("function",[asdict(c) for c in file.contracts]),("record",file.records),("oneof",file.oneofs),("case",file.cases)):
             for c in rows:
                 selector=namespace+":"+c["name"]
                 if selector in declaration["exports"]:

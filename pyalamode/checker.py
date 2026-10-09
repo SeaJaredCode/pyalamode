@@ -596,7 +596,7 @@ class ScalarAnalyzer:
                     block(statement.body, {}, _written_names(statement.body), statement.name, {}, exports)
                     if hasattr(self, "symbols") and module:
                         symbol = self.symbols.get(statement.name)
-                        if symbol and symbol.kind in {"record", "oneof"} and self._symbol_stable(statement.name, symbol):
+                        if symbol and symbol.kind in {"record", "oneof", "case"} and self._symbol_stable(statement.name, symbol):
                             env[statement.name] = Binding(self._resolve_symbol(symbol, statement, True), (statement.lineno,))
                     continue
                 calls(statement)
@@ -823,6 +823,12 @@ class RecordInfo:
 @dataclass
 class CaseInfo(RecordInfo):
     domain: str = ""
+    extension: bool = False
+
+    @property
+    def export_name(self):
+        """Nested cases are reached through their domain; extension cases by their own name."""
+        return self.node.name if self.extension else self.domain
 
     @property
     def schema(self):
@@ -838,6 +844,7 @@ class OneOfInfo:
     valid: bool = True
     ready: bool = False
     preparing: bool = False
+    open: bool = False
 
     @property
     def identity(self):
@@ -845,7 +852,9 @@ class OneOfInfo:
 
     @property
     def fingerprint(self):
-        data = [(name, list(info.fields.items())) for name, info in self.cases.items()]
+        data = [(name, info.module, list(info.fields.items())) for name, info in self.cases.items()]
+        if self.open:
+            data.append("open")
         return hashlib.sha256(json.dumps(data, separators=(",", ":")).encode()).hexdigest()
 
 def _module_name(path: str, root: Path) -> str:
@@ -896,7 +905,25 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
     sources: dict[str, str] = {}
     errors = []
     queue = list(paths)
-    while queue:
+    census_done = False
+    while queue or not census_done:
+        if not queue:
+            census_done = True
+            if any(_declares_class_keyword(text, "open") for text in sources.values()):
+                # Open domains: every project module may contribute a case, so parse
+                # (never import) all of them and load the ones declaring @case(of=...).
+                from .project import discover_paths
+                for candidate in discover_paths([root], root)[0]:
+                    if str(candidate) in sources or read_root is not None and not candidate.is_relative_to(read_root):
+                        continue
+                    try:
+                        raw = candidate.read_bytes()
+                        text = raw.decode(tokenize.detect_encoding(io.BytesIO(raw).readline)[0])
+                    except (OSError, UnicodeError, SyntaxError, ValueError):
+                        continue
+                    if _declares_class_keyword(text, "of"):
+                        queue.append(candidate)
+            continue
         path = queue.pop(0).resolve()
         if read_root is not None and not path.is_relative_to(read_root):
             errors.append(diagnostic("PAL001", str(read_root), "editor source resolves outside workspace; refused before reading", origin="editor source ownership"))
@@ -937,6 +964,18 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
     return sources, errors
 
 
+def _declares_class_keyword(source, keyword):
+    """Whether a top-level class decorator call passes `keyword=` (open domain or extension case)."""
+    if keyword + "=" not in source.replace(" ", ""):
+        return False
+    try:
+        tree = ast.parse(source, feature_version=(3, 13))
+    except (SyntaxError, ValueError):
+        return False
+    return any(isinstance(node, ast.ClassDef) and any(isinstance(d, ast.Call) and any(k.arg == keyword for k in d.keywords) for d in node.decorator_list)
+               for node in tree.body)
+
+
 class SourceGraph:
     """One closed source snapshot. Local imports never fall back to executing Python."""
 
@@ -962,6 +1001,8 @@ class SourceGraph:
         self.cases: dict[str, RecordInfo] = {}
         self.record_declarations: list[RecordInfo] = []
         self.oneof_declarations: list[OneOfInfo] = []
+        self.pending_extensions: list[tuple] = []
+        self.extension_cases: list[tuple[CaseInfo, OneOfInfo]] = []
         for path, source in sources.items():
             analyzer = FunctionalAnalyzer(source, path, "audit" if audit else "strict", policy, self)
             self.analyzers[path] = analyzer
@@ -984,6 +1025,7 @@ class SourceGraph:
             analyzer.discover_records()
         for analyzer in self.analyzers.values():
             analyzer.discover_oneofs()
+        self._link_extensions()
         # Case lookup follows the chosen domain, including disjoint tag names;
         # shadow declarations remain reportable but cannot extend that catalog.
         self.cases = {case.identity: case for domain in self.oneofs.values() for case in domain.cases.values()}
@@ -1181,12 +1223,51 @@ class SourceGraph:
         # all signatures still precede bodies, including recursive components.
         for oneof_info in self.oneof_declarations:
             oneof_info.analyzer.prepare_oneof(oneof_info)
+        for case_info, domain in self.extension_cases:
+            case_info.analyzer.prepare_extension(case_info, domain)
+        for case_info, domain in self.extension_cases:
+            # One invalid contributed case leaves the whole open domain unverified.
+            for member in domain.cases.values():
+                member.valid = member.valid and domain.valid
         for record_info in self.record_declarations:
             record_info.analyzer.prepare_record(record_info)
         for info in self.functions.values():
             info.analyzer.declare_effects(info)
         for info in self.functions.values():
             info.analyzer.signature(info)
+
+    def owner(self, path):
+        """The checked distribution owning a source; None is the project being checked."""
+        return self.source_owners.get(str(path))
+
+    def _link_extensions(self):
+        """Attach top-level @case(of=Domain) declarations to open domains in canonical order."""
+        touched = {}
+        for analyzer, node, target in self.pending_extensions:
+            domain = self.oneofs.get(self.reference(analyzer, target))
+            if domain is None or not domain.open:
+                analyzer.emit("PAL120", node, "@case(of=...) requires an unchanged open @oneof(open=True) domain")
+                continue
+            if self.owner(analyzer.path) != self.owner(domain.analyzer.path):
+                analyzer.emit("PAL120", node, "open domain cases must be declared inside the domain's own checked distribution")
+                continue
+            if node.name in domain.cases:
+                analyzer.emit("PAL101", node, "open domain already has a case named `" + node.name + "`")
+                continue
+            module = self.module_name(analyzer.path)
+            case_info = CaseInfo(node, analyzer, module, domain=domain.node.name, extension=True)
+            domain.cases[node.name] = case_info
+            analyzer.symbols[node.name] = Symbol("case", case_info.identity, node)
+            self.cases[case_info.identity] = case_info
+            self.types[case_info.identity] = case_info.schema
+            self.extension_cases.append((case_info, domain))
+            touched[domain.identity] = domain
+        for domain in touched.values():
+            # Nested cases first in declaration order, then extensions by (module, name),
+            # matching the runtime catalog order used by guards and encoding.
+            nested = [(name, info) for name, info in domain.cases.items() if not info.extension]
+            extensions = sorted(((name, info) for name, info in domain.cases.items() if info.extension), key=lambda item: (item[1].module, item[0]))
+            domain.cases = dict(nested + extensions)
 
     def module_name(self, path):
         return self.module_names.get(str(path), _module_name(str(path), self.root))
@@ -1227,6 +1308,9 @@ class SourceGraph:
         elif reference in self.oneofs:
             info = self.oneofs[reference]
             target, name = info.analyzer, info.node.name
+        elif reference in self.cases:
+            info = self.cases[reference]
+            target, name = info.analyzer, info.export_name
         owner = self.source_owners.get(target.path)
         if owner is None or owner == self.source_owners.get(analyzer.path):
             return True
@@ -1257,7 +1341,7 @@ class SourceGraph:
                 return infos[0].identity if len(infos) == 1 else None
             if symbol.kind == "function":
                 return symbol.name
-            if symbol.kind in {"record", "oneof"}:
+            if symbol.kind in {"record", "oneof", "case"}:
                 return symbol.name
             if symbol.kind == "module":
                 # __init__ exports an effects function under the submodule name:
@@ -1339,6 +1423,9 @@ class SourceGraph:
                         return "module:pyalamode"
             if owner in self.oneofs:
                 case_info = self.oneofs[owner].cases.get(node.attr)
+                if case_info is not None and case_info.extension:
+                    # Extension cases are not attributes of the runtime domain namespace.
+                    return None
                 return str(case_info.schema) if case_info else owner
             if owner in self.records or owner in self.cases:
                 return owner
@@ -2044,9 +2131,13 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return
         for node in self.tree.body:
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, {"case"}) for d in node.decorator_list):
-                self.emit("PAL120", node, "@case declarations are supported only inside a closed @oneof domain")
+                target = self._extension_target(node)
+                if target is None:
+                    self.emit("PAL120", node, "top-level @case declarations require @case(of=OpenDomain); closed cases are nested in their @oneof")
+                else:
+                    self.graph.pending_extensions.append((self, node, target))
             if isinstance(node, ast.ClassDef) and any(self._primitive_identity(d.func if isinstance(d, ast.Call) else d, DOMAIN_DECORATORS) for d in node.decorator_list):
-                info = OneOfInfo(node, self, self.graph.module_name(self.path))
+                info = OneOfInfo(node, self, self.graph.module_name(self.path), open=self._open_declaration(node))
                 self.graph.oneof_declarations.append(info)
                 if info.identity not in self.graph.oneofs or self.graph.modules.get(info.module) is self:
                     self.graph.oneofs[info.identity] = info
@@ -2058,6 +2149,76 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         info.cases[member.name] = case_info
                         self.graph.cases[case_info.identity] = case_info
                         self.graph.types[case_info.identity] = case_info.schema
+
+    def _open_declaration(self, node):
+        """True only for exactly @oneof(open=True)."""
+        decorator = node.decorator_list[0] if len(node.decorator_list) == 1 else None
+        return (isinstance(decorator, ast.Call) and not decorator.args and len(decorator.keywords) == 1
+                and decorator.keywords[0].arg == "open" and isinstance(decorator.keywords[0].value, ast.Constant)
+                and decorator.keywords[0].value.value is True and self._primitive_identity(decorator.func, DOMAIN_DECORATORS) is not None)
+
+    def _extension_target(self, node):
+        """The `of=` expression of an exact single @case(of=Domain) decorator."""
+        decorator = node.decorator_list[0] if len(node.decorator_list) == 1 else None
+        if (isinstance(decorator, ast.Call) and not decorator.args and len(decorator.keywords) == 1
+                and decorator.keywords[0].arg == "of" and self._primitive_identity(decorator.func, {"case"}) is not None):
+            return decorator.keywords[0].value
+        return None
+
+    def prepare_extension(self, case_info, domain):
+        """Check a top-level @case(of=Domain) declaration in its own module namespace."""
+        if case_info.ready:
+            return
+        previous = self.active, self.boundary, self.locals, self.definition_mode, self.constant_limit, self.failures
+        self.active, self.boundary, self.locals = None, case_info.node.name, set()
+        self.definition_mode, self.constant_limit, self.failures = True, case_info.node.lineno, case_info.failures
+        before = len(self.result.diagnostics)
+        node = case_info.node
+        if node.bases or node.keywords or getattr(node, "type_params", []) or self._extension_target(node) is None:
+            self.emit("PAL120", node, "extension cases require only @case(of=OpenDomain), fixed typed data fields, no class behavior")
+        if not self._symbol_stable(node.name, self.symbols[node.name]) or case_info.identity in self.graph.replaced_oneofs:
+            self.emit("PAL240", node, "extension case behavior has an analyzed replacement")
+        self._prepare_case_body(case_info, node)
+        case_info.valid = len(self.result.diagnostics) == before
+        if not case_info.valid:
+            domain.valid = False
+        self.active, self.boundary, self.locals, self.definition_mode, self.constant_limit, self.failures = previous
+
+    def _prepare_case_body(self, case_info, member):
+        """Fixed typed payload fields and stable trailing defaults, shared by nested and extension cases."""
+        default_seen = False
+        class_defaults = {}
+        postponed = any(isinstance(item, ast.ImportFrom) and item.module == "__future__" and any(alias.name == "annotations" for alias in item.names) for item in self.tree.body)
+        self.locals = set()
+        for field_node in member.body:
+            if isinstance(field_node, ast.Pass) or isinstance(field_node, ast.Expr) and isinstance(field_node.value, ast.Constant) and type(field_node.value.value) is str:
+                continue
+            if not isinstance(field_node, ast.AnnAssign) or not isinstance(field_node.target, ast.Name) or field_node.target.id.startswith("_"):
+                self.emit("PAL120", field_node, "case payloads require public typed data fields and stable trailing defaults")
+                continue
+            name = field_node.target.id
+            if name in case_info.fields:
+                self.emit("PAL101", field_node, "case field has another declaration")
+                continue
+            value = None
+            if field_node.value is not None:
+                self.locals = set(class_defaults)
+                value = self._expr(field_node.value, class_defaults)
+                class_defaults[name] = Binding(value, (field_node.lineno,))
+            annotation_names = () if postponed or isinstance(field_node.annotation, ast.Constant) and type(field_node.annotation.value) is str else class_defaults
+            expected = self._annotation(field_node.annotation, extra_names=annotation_names)
+            if not self._data_schema(self.graph.types.get(expected)):
+                self.emit("PAL130", field_node, "case fields require previously available recursively admitted data")
+                expected = None
+            case_info.fields[name] = expected or "<unknown>"
+            if field_node.value is not None:
+                default_seen = True
+                if not expected or not self.matches(value, expected):
+                    self.emit("PAL221", field_node, "case default does not establish its exact field schema")
+                case_info.defaults[name] = value
+            elif default_seen:
+                self.emit("PAL120", field_node, "required case fields precede defaults")
+        case_info.ready = True
 
     def prepare_oneof(self, info):
         if info.ready:
@@ -2074,13 +2235,15 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         node = info.node
         if self.graph.oneofs.get(info.identity) is not info:
             self.emit("PAL241", node, "closed domain declaration conflicts with the canonical package/module schema; shadowed nominal declarations are unverified", origin="nominal import resolution")
-        if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not self._primitive_identity(node.decorator_list[0], DOMAIN_DECORATORS):
+        if node.bases or node.keywords or getattr(node, "type_params", []) or len(node.decorator_list) != 1 or not (info.open or self._primitive_identity(node.decorator_list[0], DOMAIN_DECORATORS)):
             self.emit("PAL120", node, "domains require only @oneof, nested fixed @case declarations and no bases/metaclass/generic behavior")
         if not self._symbol_stable(node.name, self.symbols[node.name]) or info.identity in self.graph.replaced_oneofs:
             self.emit("PAL240", node, "domain namespace or case behavior has an analyzed replacement")
         names = set()
         for member in node.body:
             if isinstance(member, ast.Expr) and isinstance(member.value, ast.Constant) and type(member.value.value) is str:
+                continue
+            if isinstance(member, ast.Pass) and info.open:
                 continue
             if not isinstance(member, ast.ClassDef) or member.name.startswith("_"):
                 self.emit("PAL120", member, "a closed domain contains only public nested @case declarations")
@@ -2100,40 +2263,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 self.emit("PAL120", member, "cases require only @case, fixed typed data fields, no class behavior")
             if case_info.identity in self.graph.replaced_oneofs:
                 self.emit("PAL240", member, "case behavior has an analyzed replacement")
-            default_seen = False
-            class_defaults = {}
-            postponed = any(isinstance(item, ast.ImportFrom) and item.module == "__future__" and any(alias.name == "annotations" for alias in item.names) for item in self.tree.body)
-            self.locals = set()
-            for field_node in member.body:
-                if isinstance(field_node, ast.Pass) or isinstance(field_node, ast.Expr) and isinstance(field_node.value, ast.Constant) and type(field_node.value.value) is str:
-                    continue
-                if not isinstance(field_node, ast.AnnAssign) or not isinstance(field_node.target, ast.Name) or field_node.target.id.startswith("_"):
-                    self.emit("PAL120", field_node, "case payloads require public typed data fields and stable trailing defaults")
-                    continue
-                name = field_node.target.id
-                if name in case_info.fields:
-                    self.emit("PAL101", field_node, "case field has another declaration")
-                    continue
-                value = None
-                if field_node.value is not None:
-                    self.locals = set(class_defaults)
-                    value = self._expr(field_node.value, class_defaults)
-                    class_defaults[name] = Binding(value, (field_node.lineno,))
-                annotation_names = () if postponed or isinstance(field_node.annotation, ast.Constant) and type(field_node.annotation.value) is str else class_defaults
-                expected = self._annotation(field_node.annotation, extra_names=annotation_names)
-                if not self._data_schema(self.graph.types.get(expected)):
-                    self.emit("PAL130", field_node, "case fields require previously available recursively admitted data")
-                    expected = None
-                case_info.fields[name] = expected or "<unknown>"
-                if field_node.value is not None:
-                    default_seen = True
-                    if not expected or not self.matches(value, expected):
-                        self.emit("PAL221", field_node, "case default does not establish its exact field schema")
-                    case_info.defaults[name] = value
-                elif default_seen:
-                    self.emit("PAL120", field_node, "required case fields precede defaults")
-            case_info.ready = True
-        if not names:
+            self._prepare_case_body(case_info, member)
+        if not names and not info.open:
             self.emit("PAL120", node, "a closed domain must declare at least one case")
         info.valid = len(self.result.diagnostics) == before
         for case_info in info.cases.values():
@@ -2244,6 +2375,13 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return UNKNOWN
             self._depend(info.analyzer.path)
             return Value.exact("oneof_class:" + info.identity)
+        if symbol.kind == "case":
+            info = self.graph.cases[symbol.name]
+            if not self.graph.export_allowed(self, info.analyzer, info.node.name, node, quiet): return UNKNOWN
+            if not info.valid or info.identity in self.graph.replaced_oneofs:
+                return UNKNOWN
+            self._depend(info.analyzer.path)
+            return Value.exact("case_class:" + info.identity)
         if symbol.kind == "record":
             info = self.graph.records[symbol.name]
             if not self.graph.export_allowed(self, info.analyzer, info.node.name, node, quiet): return UNKNOWN
@@ -2352,7 +2490,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 case_info = self.graph.cases.get(reference)
                 if oneof_info and oneof_info.valid and reference not in self.graph.replaced_oneofs and self.graph.export_allowed(self,oneof_info.analyzer,oneof_info.node.name,node,True):
                     return "oneof:" + oneof_info.module + ":" + oneof_info.node.name
-                if case_info and case_info.valid and reference not in self.graph.replaced_oneofs and self.graph.export_allowed(self,case_info.analyzer,case_info.domain,node,True):
+                if case_info and case_info.valid and reference not in self.graph.replaced_oneofs and self.graph.export_allowed(self,case_info.analyzer,case_info.export_name,node,True):
                     return case_info.schema.name
                 record_info = self.graph.records.get(reference)
                 if record_info and record_info.valid and reference not in self.graph.replaced_records and not self._module_changed(record_info.module, record_info.node.name) and self.graph.export_allowed(self,record_info.analyzer,record_info.node.name,node,True):
@@ -2703,6 +2841,11 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     if info.valid:
                         env[node.name] = Binding(Value.exact("oneof_class:" + info.identity), (node.lineno,))
                         self._add_failures(category for case_info in info.cases.values() for category in case_info.failures)
+                elif isinstance(node, ast.ClassDef) and self.symbols.get(node.name, Symbol("", "")).kind == "case":
+                    info = self.graph.cases[self.symbols[node.name].name]
+                    if info.valid:
+                        env[node.name] = Binding(Value.exact("case_class:" + info.identity), (node.lineno,))
+                        self._add_failures(info.failures)
                 elif isinstance(node, ast.ClassDef) and self.symbols.get(node.name, Symbol("", "")).kind == "record":
                     info = self.graph.records[self.symbols[node.name].name]
                     if info.valid:
@@ -3623,7 +3766,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             expected = self.union_tags(schema)
             identity, version = str(schema), self.union_fingerprint(schema)
             member_domains = [self.graph.oneofs[str(member)] for member in schema.arguments if member.name.startswith("oneof:")]
-            policy_domains = {info.module + ":" + info.node.name for info in member_domains}
+            external_open = [info for info in member_domains if info.open and self.graph.owner(info.analyzer.path) != self.graph.owner(self.path)]
+            policy_domains = {info.module + ":" + info.node.name for info in member_domains if info not in external_open}
         elif schema.name.startswith("oneof:"):
             domain = self.graph.oneofs[str(schema)]
             expected = {case.identity for case in domain.cases.values()}
@@ -3633,7 +3777,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             domain = None
             expected = {"Some", "Nothing"} if schema.name == "Option" else {"Ok", "Err"} if schema.name == "Result" else {"True", "False"} if schema.name == "bool" else {"None"} if schema.name == "None" else {str(schema)} if schema.name.startswith(("case:", "record:")) else {schema.name}
             identity, version = str(schema), "builtin-domains-v1"
-        coverage, wildcard, continuing = set(), False, None
+        if schema.name != "union":
+            external_open = [domain] if domain is not None and domain.open and self.graph.owner(domain.analyzer.path) != self.graph.owner(self.path) else []
+        coverage, wildcard, continuing, whole = set(), False, None, []
         for index, case in enumerate(node.cases):
             captures = {}
             tag, complete = self._pattern(case.pattern, schema, captures)
@@ -3656,13 +3802,20 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 guard_true = guard.literal is True
             if (complete or schema.name == "bool" and isinstance(case.pattern, ast.MatchSingleton)) and (not guarded or guard_true) and tag:
                 coverage.update(tag if isinstance(tag, frozenset) else {"True", "False"} if tag == "bool" else {tag})
+                if isinstance(tag, frozenset):
+                    whole.append(tag)
             if is_wildcard and (not guarded or guard_true):
                 wildcard = True
                 if index != len(node.cases) - 1:
                     self.emit("PAL330", case.pattern, "deliberate wildcard must be final")
             continuing = self._merge(continuing, self._block(case.body, branch))
         if schema.name != "union":
-            policy_domains = {identity} if domain else set()
+            policy_domains = {identity} if domain and not external_open else set()
+        for info in external_open:
+            # Cases may be added later inside the defining distribution only.
+            cases = {case.identity for case in info.cases.values()}
+            if not wildcard and not any(cases <= tag for tag in whole):
+                self.emit("PAL330", node, "open domain `" + info.module + ":" + info.node.name + "` belongs to another checked distribution; end the match with a wildcard `_`" + (" or cover it with `case " + info.node.name + "():`" if schema.name == "union" else ""))
         policy_explicit = bool(policy_domains & set(self.policy.get("explicit_cases", [])))
         if policy_explicit and wildcard:
             self.emit("PAL330", node, "project explicit_cases policy requires full explicit case coverage and forbids wildcard consumers")
@@ -3827,6 +3980,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if owner.kind and owner.kind.startswith("oneof_class:"):
                 domain = self.graph.oneofs.get(owner.kind[len("oneof_class:"):])
                 case_info = domain.cases.get(node.attr) if domain else None
+                case_info = None if case_info is not None and case_info.extension else case_info
                 if case_info and case_info.valid and case_info.identity not in self.graph.replaced_oneofs:
                     return Value.exact("case_class:" + case_info.identity)
                 return reject("PAL240", "domain member is absent or its behavior is replaced")
@@ -4228,12 +4382,31 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                                        "Allocation identity, arbitrary formatting/hashing and unsupported hooks are outside strict record operations."],
                 "equivalence": "exact record type and recursively equivalent fields in declaration order"})
         self.result.oneofs = []
+        for case_info, domain in self.graph.extension_cases:
+            if case_info.analyzer is not self:
+                continue
+            admitted = case_info.valid and domain.valid and self.result.mode == "strict" and not self.result.diagnostics
+            self.result.cases.append({"name": case_info.node.name, "schema": case_info.identity, "path": self.path, "line": case_info.node.lineno,
+                "domain": domain.identity, "fields": dict(case_info.fields), "defaults": {n: v.kind for n, v in case_info.defaults.items()},
+                "module": case_info.module, "qualname": case_info.node.name, "enforcement": self.result.mode,
+                "behavior": "pure exact open-domain case construction, field/pattern dispatch and type-sensitive value equivalence" if admitted else "unverified declaration",
+                "source_evidence": "checked open-domain case declaration" if admitted else "unverified open-domain case declaration",
+                "trust": ["pyalamode oneofs-v1 immutable exact case catalog, approved records/collections validators and ordinary CPython class operations"],
+                "failures": ["RecursionError"], "definition_failures": sorted(case_info.failures),
+                "freshness": "current for recorded fields and owning domain" if admitted else "no successful checked claim",
+                "boundary_protection": "ordinary constructors validate payloads; optional selected data guards reported separately",
+                "caller_obligations": ["Exact declared case of its open domain and recursively admitted payloads; unchanged domain/case behavior, builtin bindings and product runtime.",
+                    "Matches outside the defining distribution end with a wildcard; the case set may grow inside it."],
+                "equivalence": "exact domain case tag and recursively type-sensitive payloads in declaration field order"})
         for info in self.graph.oneof_declarations:
             if info.analyzer is not self:
                 continue
             admitted = info.valid and self.result.mode == "strict" and not self.result.diagnostics
             self.result.oneofs.append({"name": info.node.name, "schema": info.identity, "path": self.path, "line": info.node.lineno,
-                "cases": {name: {"schema": case_info.identity, "fields": dict(case_info.fields), "defaults": {n: v.kind for n, v in case_info.defaults.items()}} for name, case_info in info.cases.items()},
+                "open": info.open,
+                "cases": {name: {"schema": case_info.identity, "fields": dict(case_info.fields), "defaults": {n: v.kind for n, v in case_info.defaults.items()},
+                                 "module": case_info.module, "qualname": case_info.node.name if case_info.extension else info.node.name + "." + name,
+                                 "extension": case_info.extension} for name, case_info in info.cases.items()},
                 "case_fingerprint": info.fingerprint, "enforcement": self.result.mode,
                 "behavior": "pure exact closed-case construction, field/pattern dispatch and type-sensitive value equivalence" if admitted else "unverified declaration",
                 "source_evidence": "checked closed oneof declaration" if admitted else "unverified oneof declaration",
