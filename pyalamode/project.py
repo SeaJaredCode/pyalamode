@@ -16,7 +16,8 @@ import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .checker import analyze_file, analyze_source, fingerprint
+from .checker import SourceGraph, analyze_file, analyze_source, fingerprint, load_sources, _import_name, _local_path, _module_name
+import ast
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
                     Diagnostic, FunctionContract, diagnostic, foundation_identities)
 
@@ -51,7 +52,7 @@ class ProjectResult:
                 "coverage": {"eligible_functions": sum(r.eligible_functions for r in self.results),
                              "selected_functions": sum(r.selected_functions for r in self.results),
                              "analyzed_call_sites": sum(r.analyzed_call_sites for r in self.results)},
-                "claim_scope": "Selected same-file scalar functions only; unrelated initialization and ordinary shells are unchecked."}
+                "claim_scope": "Selected functions, stable dependencies and functional-module initialization; ordinary shells and unrelated ordinary initialization are unchecked."}
 
 
 def runtime_error(target: str = TARGET) -> str | None:
@@ -87,8 +88,11 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
                     "require_modules": []}
         for key, value in policy.items():
-            if key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; milestone 1 admits only its closed scalar configuration"
+            if key == "require_modules":
+                if type(value) is not list or any(type(pattern) is not str or not pattern or pattern.startswith("/") or ".." in Path(pattern).parts or "\\" in pattern for pattern in value):
+                    return policy, "require_modules must be a list of nonempty project-relative glob patterns"
+            elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
+                return policy, f"unsupported policy field/value {key}={value!r}; milestone 2 admits only its closed module configuration"
         return policy, None
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         return {}, f"cannot read project policy: {error}"
@@ -127,7 +131,10 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              eligible_functions=payload["eligible_functions"],
                              selected_functions=payload["selected_functions"],
                              analyzed_call_sites=payload["analyzed_call_sites"], cache_hit=True,
-                             mode="audit" if audit else "strict")
+                             mode="audit" if audit else "strict", module_mode=payload.get("module_mode", False),
+                             initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
+                             dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
+                             binding_context=payload.get("binding_context", []))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
         if payload["mode"] != result.mode:
             return None
@@ -169,28 +176,64 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         return result
     cache_path = project_root / ".pyalamode-cache"
     cache_policy = {**policy, "analysis_mode": "audit" if audit else "strict", "platform": sys.platform}
-    for path in files:
-        try:
-            raw = path.read_bytes()
-            # Paths are relevant to diagnostic/evidence identity; source bytes preserve encoding/newlines.
-            key = fingerprint(raw, {**cache_policy, "path": str(path)})
-        except OSError:
-            result.results.append(analyze_file(path, audit=audit, policy=cache_policy))
-            continue
-        analyzed = _cache_read(cache_path, key, str(path), audit) if cache else None
-        if analyzed is None:
-            try:
-                encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
-                analyzed = analyze_source(raw.decode(encoding), str(path), audit=audit, policy=cache_policy)
-            except (UnicodeError, SyntaxError) as error:
-                analyzed = CheckResult(str(path), key, mode="audit" if audit else "strict")
-                analyzed.diagnostics.append(diagnostic("PAL001", str(path), f"cannot decode source: {error}"))
-            analyzed.fingerprint = key
-            if cache:
-                _cache_write(cache_path, analyzed)
+    raw_sources = {}
+    sources, errors = load_sources(files, project_root, raw_sources)
+    result.tooling.extend(errors)
+    if errors:
+        result.elapsed_seconds = time.perf_counter() - started
+        return result
+    dependencies = _source_dependencies(sources, project_root)
+    graph = SourceGraph(sources, project_root, audit, cache_policy)
+    contexts = {path: graph.binding_context(path, dependencies[path]) for path in sources}
+    keys = {path: fingerprint(raw_sources[path], {**cache_policy, "path": path,
+            "source_dependencies": {d: hashlib.sha256(raw_sources[d]).hexdigest() for d in sorted(dependencies[path])},
+            "binding_context": contexts[path]})
+            for path in sources}
+    cached = {}
+    if cache:
+        for path, key in keys.items():
+            hit = _cache_read(cache_path, key, path, audit)
+            if hit is not None:
+                cached[path] = hit
+    # Conservatively include static import closures, including initialization requirements.
+    for path, analyzer in graph.analyzers.items():
+        analyzer.dependencies.update(dependencies[path])
+    analyzed_results = graph.analyze(cached)
+    for path, analyzed in sorted(analyzed_results.items()):
+        analyzed.fingerprint = keys[path]
+        analyzed.dependencies = {d: hashlib.sha256(raw_sources[d]).hexdigest() for d in sorted(dependencies[path])}
+        analyzed.binding_context = contexts[path]
+        if cache and path not in cached:
+            _cache_write(cache_path, analyzed)
         result.results.append(analyzed)
     result.elapsed_seconds = time.perf_counter() - started
     return result
+
+
+def _source_dependencies(sources: dict[str, str], root: Path) -> dict[str, set[str]]:
+    direct = {path: set() for path in sources}
+    for path, source in sources.items():
+        module = _module_name(path, root)
+        for node in ast.walk(ast.parse(source, filename=path, feature_version=(3, 13))):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else []
+            if isinstance(node, ast.ImportFrom):
+                base = _import_name(node, module, Path(path).name == "__init__.py")
+                names = [base] + [base + "." + a.name for a in node.names if a.name != "*"]
+            for name in names:
+                parts = name.split(".")
+                for count in range(1, len(parts) + 1):
+                    target = _local_path(root, ".".join(parts[:count]))
+                    if target and str(target) in sources and str(target) != path:
+                        direct[path].add(str(target))
+    changed = True
+    while changed:
+        changed = False
+        for path, values in direct.items():
+            previous = len(values)
+            for dependency in tuple(values):
+                values.update(direct[dependency] - {path})
+            changed |= previous != len(values)
+    return direct
 
 
 def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | None = None,
@@ -201,8 +244,8 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
     result = check_paths(paths, root=project_root, target=target, cache=False)
     if result.status:
         return result
-    if not any(file.selected_functions for file in result.results):
-        result.tooling.append(diagnostic("PAL001", str(project_root), "build requires at least one participating export; no checked artifact was produced"))
+    if not any(file.selected_functions or file.module_mode for file in result.results):
+        result.tooling.append(diagnostic("PAL001", str(project_root), "build requires a participating function or functional module; no checked artifact was produced"))
         return result
     if destination.exists():
         result.tooling.append(diagnostic("PAL001", str(destination), "output already exists; choose a fresh output directory to preserve prior artifacts"))
@@ -224,7 +267,8 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
             raw = source.read_bytes()
             # Source changes during analysis/copy invalidate this gate rather than publish stale evidence.
             policy, _ = load_policy(project_root)
-            check_key = fingerprint(raw, {**policy, "analysis_mode": "strict", "platform": sys.platform, "path": str(source)})
+            dependency_bytes = {d: hashlib.sha256(Path(d).read_bytes()).hexdigest() for d in file.dependencies}
+            check_key = fingerprint(raw, {**policy, "analysis_mode": "strict", "platform": sys.platform, "path": str(source), "source_dependencies": dependency_bytes, "binding_context": file.binding_context})
             if check_key != file.fingerprint:
                 raise OSError(f"source changed after checking: {source}")
             relative = source.relative_to(base)

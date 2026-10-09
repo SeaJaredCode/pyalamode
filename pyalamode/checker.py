@@ -1,4 +1,4 @@
-"""Closed scalar checker. Application code is parsed, never imported or evaluated."""
+"""Closed scalar/module checker. Application source is never imported or evaluated."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import hashlib
 import io
 import json
 import tokenize
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
@@ -31,6 +31,8 @@ def fingerprint(source: bytes, policy: dict | None = None) -> str:
 class Value:
     types: frozenset[str]
     literal: object = _UNKNOWN
+    items: tuple[Value, ...] | None = None
+    callable: CallableValue | None = None
 
     @classmethod
     def exact(cls, kind: str, literal: object = _UNKNOWN) -> Value:
@@ -39,6 +41,9 @@ class Value:
     @property
     def kind(self) -> str | None:
         return next(iter(self.types)) if len(self.types) == 1 else None
+
+    def with_callable(self, callback: CallableValue) -> Value:
+        return Value(self.types, self.literal, self.items, callback)
 
 
 UNKNOWN = Value(frozenset())
@@ -109,7 +114,7 @@ def _written_names(body: list[ast.stmt]) -> dict[str, list[ast.AST]]:
 
 
 class ScalarAnalyzer:
-    """One file's discovery, participating functions, and inspected ordinary calls."""
+    """Shared scalar operations, lexical write discovery and ordinary caller inspection."""
 
     def __init__(self, source: str, path: str, mode: str = "strict", policy: dict | None = None):
         self.source = source
@@ -159,29 +164,7 @@ class ScalarAnalyzer:
                     and not self._attribute_changed("pyalamode", "fun"))
         return False
 
-    def _annotation(self, node: ast.expr | None) -> str | None:
-        original = node
-        if isinstance(node, ast.Constant) and type(node.value) is str:
-            try:
-                node = ast.parse(node.value, mode="eval").body
-            except (SyntaxError, ValueError):
-                node = None
-        kind = None
-        if isinstance(node, ast.Constant) and node.value is None:
-            kind = "None"
-        elif isinstance(node, ast.Name):
-            if (node.id in {"bool", "int", "str", "bytes"} and node.id not in self.global_writes
-                    and not self._attribute_changed("builtins", node.id)):
-                kind = node.id
-            elif (node.id in self.none_imports and self._stable(node.id, self.none_imports[node.id])
-                  and not self._attribute_changed("types", "NoneType")):
-                kind = "None"
-        if kind is None:
-            self.emit("PAL130", original or ast.Constant(value=None),
-                      "annotation must identify an unshadowed exact scalar type")
-        return kind
-
-    def analyze(self) -> CheckResult:
+    def _prepare(self) -> ast.Module | CheckResult:
         try:
             tree = ast.parse(self.source, filename=self.path, feature_version=(3, 13))
         except (SyntaxError, ValueError) as error:
@@ -257,74 +240,7 @@ class ScalarAnalyzer:
                 self.changed_attributes.add((node.args[0].id, attr))
         if "*" in self.global_writes:
             self.emit("PAL240", self.global_writes["*"][0], "star imports or dynamic namespace writes leave approved bindings unresolved")
-        # M1 intentionally does not implement module mode or policy-selected modules.
-        for token in tokenize.generate_tokens(io.StringIO(self.source).readline):
-            if token.type == tokenize.COMMENT and token.string.strip() == "# mode: fun":
-                self.result.diagnostics.append(diagnostic("PAL120", self.path,
-                    "module mode requires the functional-modules milestone", line=token.start[0]))
-        parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-        selected = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self.result.eligible_functions += 1
-                if any(self._marker_like(d) for d in node.decorator_list):
-                    self.result.selected_functions += 1
-                    self.selected_nodes.add(id(node))
-                    selected.append(node)
-                    if parents.get(id(node)) is not tree:
-                        self.boundary = node.name
-                        self.emit("PAL120", node, "only top-level functions participate in the scalar milestone")
-        for node in selected:
-            self._function(node)
-        self._ordinary_calls(tree)
-        if self.result.mode == "audit" or self.result.diagnostics:
-            for contract in self.result.contracts:
-                contract.enforcement = self.result.mode
-                contract.source_evidence = "unverified: audit or failed selected gate"
-                contract.freshness = "no successful checked claim"
-        self.result.diagnostics.sort(key=lambda d: (d.line, d.column, d.rule))
-        return self.result
-
-    def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        self.boundary = node.name
-        self.failures = set()
-        if isinstance(node, ast.AsyncFunctionDef):
-            self.emit("PAL120", node, "async functions are outside the scalar subset")
-        if self.global_writes.get(node.name) != [node]:
-            self.emit("PAL240", node, f"participating export `{node.name}` has another analyzed binding")
-        if len(node.decorator_list) != 1 or not self._marker_valid(node.decorator_list[0]):
-            self.emit("PAL120", node, "participation requires one unchanged, statically resolved pyalamode.fun identity marker")
-        if node.args.defaults or any(d is not None for d in node.args.kw_defaults):
-            self.emit("PAL120", node, "defaults are unsupported and have not been evaluated")
-        if node.args.vararg or node.args.kwarg or getattr(node, "type_params", []):
-            self.emit("PAL120", node, "variadic parameters and type parameters are unsupported")
-        arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
-        self.locals = set(_written_names(node.body)) | {arg.arg for arg in arguments}
-        env: dict[str, Binding] = {}
-        parameters = {}
-        kinds = {}
-        for arg in arguments:
-            kind = self._annotation(arg.annotation)
-            if kind:
-                parameters[arg.arg] = kind
-            env[arg.arg] = Binding(Value.exact(kind) if kind else UNKNOWN, (arg.lineno,))
-            kinds[arg.arg] = ("positional_only" if arg in node.args.posonlyargs else
-                              "keyword_only" if arg in node.args.kwonlyargs else "positional_or_keyword")
-        returns = self._annotation(node.returns)
-        self.return_type = returns
-        continuing = self._block(node.body, env)
-        if continuing is not None and returns != "None":
-            self.emit("PAL211", node, "a completing path falls through with None instead of the declared result")
-        contract = FunctionContract(node.name, self.path, node.lineno, parameters, returns, kinds,
-                                    failures=sorted(self.failures))
-        contract.caller_obligations = [f"{name}: exact {kind}, with no subclasses" for name, kind in parameters.items()]
-        contract.caller_obligations.extend([
-            "Approved builtin, marker, annotation, and function bindings remain unchanged during execution.",
-            "Ordinary callers receive no runtime input guards or purity claim.",
-            "Resource exhaustion and interruption are outside the characterized failures.",
-        ])
-        self.result.contracts.append(contract)
-        self.contracts[node.name] = contract
+        return tree
 
     def _merge(self, left: dict[str, Binding] | None, right: dict[str, Binding] | None) -> dict[str, Binding] | None:
         if left is None:
@@ -541,10 +457,25 @@ class ScalarAnalyzer:
                             yield from expressions(child, shadowed)
                 for call, shadowed in expressions(expression, set()):
                     target = resolve(call.func.id) if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id not in shadowed else None
-                    if target is not None:
+                    resolved_info = None
+                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and hasattr(self, "_ordinary_resolved_info"):
+                        owner = call.func
+                        while isinstance(owner, ast.Attribute):
+                            owner = owner.value
+                        if not isinstance(owner, ast.Name) or owner.id not in shadowed:
+                            resolved_info = self._ordinary_resolved_info(call.func, env)
+                    elif isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and target is None and call.func.id not in shadowed and hasattr(self, "_ordinary_resolved_info"):
+                        resolved_info = self._ordinary_resolved_info(call.func, env)
+                    if target is not None or resolved_info is not None:
                         self.boundary = boundary
-                        self.result.analyzed_call_sites += 1
-                        self._call_inputs(call, self.contracts[target], env)
+                        if hasattr(self, "_record_call"):
+                            self._record_call(call)
+                        else:
+                            self.result.analyzed_call_sites += 1
+                        if resolved_info:
+                            self._checked_inputs(call, resolved_info, env)
+                        else:
+                            self._call_inputs(call, self.contracts[target], env)
 
             for statement in body:
                 if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -558,6 +489,10 @@ class ScalarAnalyzer:
                         visible = {name: target for name, target in external.items() if name not in lexical_writes}
                         visible.update(aliases)
                         block(statement.body, {}, local_writes, statement.name, {}, visible)
+                    elif hasattr(self, "infos"):
+                        info = self.infos.get(id(statement))
+                        if info:
+                            env[statement.name] = Binding(info.value(), (statement.lineno,))
                     # Defaults/decorators execute in the enclosing shell, not in its body.
                     annotations = [a.annotation for a in statement.args.posonlyargs + statement.args.args + statement.args.kwonlyargs if a.annotation]
                     annotations += [a.annotation for a in [statement.args.vararg, statement.args.kwarg] if a and a.annotation]
@@ -572,7 +507,11 @@ class ScalarAnalyzer:
                     block(statement.body, {}, _written_names(statement.body), statement.name, {}, exports)
                     continue
                 calls(statement)
-                if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                if isinstance(statement, (ast.Import, ast.ImportFrom)) and hasattr(self, "symbols") and module:
+                    for name, symbol in self.symbols.items():
+                        if symbol.node is statement and self._symbol_stable(name, symbol):
+                            env[name] = Binding(self._resolve_symbol(symbol, statement, True), (statement.lineno,))
+                elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                     targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                     if targets and all(isinstance(target, ast.Name) for target in targets) and statement.value is not None:
                         target = resolve(statement.value.id) if isinstance(statement.value, ast.Name) else None
@@ -626,19 +565,1208 @@ class ScalarAnalyzer:
                 self.emit("PAL221", argument, f"argument `{name}` of `{contract.name}` requires exact {expected}; found {self._describe(value)}", origin="ordinary call obligation")
 
 
+
+@dataclass(frozen=True)
+class TypeSpec:
+    """Closed exact-value schema; no runtime annotation evaluation or protocols."""
+    name: str
+    arguments: tuple[TypeSpec, ...] = ()
+    result: TypeSpec | None = None
+    variadic: bool = False
+
+    def __str__(self) -> str:
+        if self.name == "tuple":
+            if not self.arguments:
+                return "tuple[()]"
+            return "tuple[" + ", ".join(map(str, self.arguments)) + (", ..." if self.variadic else "") + "]"
+        if self.name == "Callable":
+            return "Callable[[" + ", ".join(map(str, self.arguments)) + "], " + str(self.result) + "]"
+        return self.name
+
+
+def _contract_type(text: str) -> TypeSpec:
+    """Decode our canonical cache schema, never a user annotation or Python value."""
+    def parse(node):
+        if isinstance(node, ast.Name) and node.id in SCALARS:
+            return TypeSpec(node.id)
+        if isinstance(node, ast.Constant) and node.value is None:
+            return TypeSpec("None")
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if node.value.id == "tuple":
+                variadic = len(parts) == 2 and isinstance(parts[-1], ast.Constant) and parts[-1].value is Ellipsis
+                return TypeSpec("tuple", tuple(parse(p) for p in (parts[:-1] if variadic else parts)), variadic=variadic)
+            if node.value.id == "Callable" and len(parts) == 2 and isinstance(parts[0], ast.List):
+                return TypeSpec("Callable", tuple(parse(p) for p in parts[0].elts), parse(parts[1]))
+        raise ValueError("invalid serialized exact type contract")
+    return parse(ast.parse(text, mode="eval").body)
+
+
+@dataclass(frozen=True)
+class CallableValue:
+    """Resolved invocation evidence, separate from an annotation's input obligation."""
+    parameters: tuple[str, ...]
+    returns: str | None
+    targets: tuple[str, ...] = ()
+    captures: tuple[tuple[str, str], ...] = ()
+    conditional: bool = False
+
+
+@dataclass
+class FunctionInfo:
+    node: ast.FunctionDef | ast.AsyncFunctionDef
+    analyzer: FunctionalAnalyzer
+    qualified: str
+    parent: FunctionInfo | None = None
+    parameters: dict[str, str] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
+    returns: str | None = None
+    defaults: dict[str, Value] = field(default_factory=dict)
+    captures: dict[str, Value] = field(default_factory=dict)
+    calls: set[str] = field(default_factory=set)
+    failures: set[str] = field(default_factory=set)
+    dependencies: set[str] = field(default_factory=set)
+    analyzed: bool = False
+    analyzing: bool = False
+    contract: FunctionContract | None = None
+    enclosing: dict[str, Binding] = field(default_factory=dict)
+    enclosing_names: set[str] = field(default_factory=set)
+    capture_uses: set[str] = field(default_factory=set)
+    definition_failures: set[str] = field(default_factory=set)
+    return_value: Value | None = None
+
+    @property
+    def identity(self) -> str:
+        return self.analyzer.path + "::" + self.qualified
+
+    def value(self) -> Value:
+        positional = tuple(self.parameters[n] for n in self.parameters if self.kinds[n] != "keyword_only")
+        schema = TypeSpec("Callable", tuple(self.analyzer.graph.types.get(t, TypeSpec("<unknown>")) for t in positional),
+                          self.analyzer.graph.types.get(self.returns))
+        kind = str(schema)
+        self.analyzer.graph.types[kind] = schema
+        return Value.exact(kind).with_callable(CallableValue(
+            positional, self.returns, (self.identity,), tuple((n, self.captures[n].kind or "unknown") for n in sorted(self.capture_uses))))
+
+
+@dataclass(frozen=True)
+class Symbol:
+    kind: str
+    name: str
+    node: ast.AST | None = None
+
+
+def _module_name(path: str, root: Path) -> str:
+    try:
+        relative = Path(path).resolve().relative_to(root)
+    except ValueError:
+        return Path(path).stem
+    parts = list(relative.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _import_name(node: ast.ImportFrom, module_name: str, package: bool) -> str:
+    if not node.level:
+        return node.module or ""
+    parts = module_name.split(".") if package else module_name.split(".")[:-1]
+    if node.level > len(parts) + 1:
+        return "<invalid-relative-import>"
+    prefix = parts[:len(parts) - node.level + 1]
+    return ".".join(prefix + ([node.module] if node.module else []))
+
+
+def _local_path(root: Path, name: str) -> Path | None:
+    parts = name.split(".")
+    if not name or any(not part.isidentifier() for part in parts):
+        return None
+    for count in range(1, len(parts)):
+        parent = root.joinpath(*parts[:count])
+        if parent.with_suffix(".py").is_file() and not (parent / "__init__.py").is_file():
+            return None
+    base = root.joinpath(*parts)
+    # CPython's filesystem finder tries an initialized package before a module file.
+    for candidate in (base / "__init__.py", base.with_suffix(".py")):
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _product_source(name: str, path: Path) -> bool:
+    return name == "pyalamode" and path == Path(__file__).resolve().parent / "__init__.py"
+
+
+def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | None = None) -> tuple[dict[str, str], list]:
+    """Read selected files and resolvable local imports, including package initialization."""
+    sources: dict[str, str] = {}
+    errors = []
+    queue = list(paths)
+    while queue:
+        path = queue.pop(0).resolve()
+        if str(path) in sources:
+            continue
+        try:
+            raw = path.read_bytes()
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+            source = raw.decode(encoding)
+            if raw_sources is not None:
+                raw_sources[str(path)] = raw
+            sources[str(path)] = source
+            tree = ast.parse(source, filename=str(path), feature_version=(3, 13))
+        except (OSError, UnicodeError, SyntaxError, ValueError) as error:
+            errors.append(diagnostic("PAL001", str(path), f"cannot read/parse source: {error}",
+                                     line=getattr(error, "lineno", 1) or 1))
+            continue
+        module = _module_name(str(path), root)
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = _import_name(node, module, path.name == "__init__.py")
+                names = [base] + [base + "." + alias.name for alias in node.names if alias.name != "*"]
+            for name in names:
+                parts = name.split(".")
+                for count in range(1, len(parts) + 1):
+                    dependency = _local_path(root, ".".join(parts[:count]))
+                    if dependency and not _product_source(".".join(parts[:count]), dependency) and str(dependency) not in sources:
+                        queue.append(dependency)
+    return sources, errors
+
+
+class SourceGraph:
+    """One closed source snapshot. Local imports never fall back to executing Python."""
+
+    def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None):
+        self.root, self.policy = root, policy or {}
+        self.types = {kind: TypeSpec(kind) for kind in SCALARS}
+        self.analyzers: dict[str, FunctionalAnalyzer] = {}
+        self.modules: dict[str, FunctionalAnalyzer] = {}
+        self.functions: dict[str, FunctionInfo] = {}
+        for path, source in sources.items():
+            analyzer = FunctionalAnalyzer(source, path, "audit" if audit else "strict", policy, self)
+            self.analyzers[path] = analyzer
+            self.modules[_module_name(path, root)] = analyzer
+        for analyzer in self.analyzers.values():
+            analyzer.prepare()
+        for analyzer in self.analyzers.values():
+            analyzer.discover()
+        # Signatures are available before bodies, including recursive components.
+        for info in self.functions.values():
+            info.analyzer.signature(info)
+        self.replaced_functions: set[str] = set()
+        self.replaced_foundations: set[tuple[str, str]] = set()
+        for analyzer in self.analyzers.values():
+            if analyzer.tree is None:
+                continue
+            aliases = {}
+            changed = True
+            while changed:
+                changed = False
+                for node in ast.walk(analyzer.tree):
+                    if isinstance(node, ast.Assign):
+                        reference = self.reference(analyzer, node.value, aliases)
+                        if reference:
+                            for target in node.targets:
+                                if isinstance(target, ast.Name) and target.id not in aliases:
+                                    aliases[target.id] = reference
+                                    changed = True
+            for node in ast.walk(analyzer.tree):
+                targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign)) else []
+                for target in targets:
+                    owner = target.value if isinstance(target, ast.Attribute) else None
+                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Attribute) and target.value.attr == "__dict__":
+                        owner = target.value.value
+                    reference = self.reference(analyzer, owner, aliases) if owner else None
+                    if reference in self.functions:
+                        self.replaced_functions.add(reference)
+                    elif reference and reference.startswith("foundation:"):
+                        _, module, attribute = reference.split(":", 2)
+                        self.replaced_foundations.add((module, attribute))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"setattr", "delattr"} and node.args:
+                    reference = self.reference(analyzer, node.args[0], aliases)
+                    if reference in self.functions:
+                        self.replaced_functions.add(reference)
+                    elif reference and reference.startswith("foundation:"):
+                        _, module, attribute = reference.split(":", 2)
+                        self.replaced_foundations.add((module, attribute))
+
+    def reference(self, analyzer, node, aliases=None, seen=None):
+        """Resolve source alias identity without executing or admitting its behavior."""
+        if isinstance(node, ast.Name) and aliases and node.id in aliases:
+            return aliases[node.id]
+        seen = set() if seen is None else seen
+        if isinstance(node, ast.Name):
+            key = (analyzer.path, node.id)
+            if key in seen:
+                return None
+            seen.add(key)
+            symbol = analyzer.symbols.get(node.id)
+            if not symbol:
+                infos = [i for i in analyzer.infos.values() if i.node.name == node.id]
+                return infos[0].identity if len(infos) == 1 else None
+            if symbol.kind == "function":
+                return symbol.name
+            if symbol.kind == "module":
+                return "module:" + symbol.name
+            if symbol.kind == "constant":
+                return self.reference(analyzer, symbol.node.value, aliases, seen)
+            if symbol.kind == "import":
+                module, name = symbol.name.split(":", 1)
+                target = self.modules.get(module)
+                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins"} else None
+        if isinstance(node, ast.Attribute):
+            owner = self.reference(analyzer, node.value, aliases, seen)
+            if owner and owner.startswith("module:"):
+                module = owner.split(":", 1)[1]
+                target = self.modules.get(module)
+                if target and node.attr in target.symbols:
+                    return self.reference(target, ast.Name(id=node.attr), None, seen)
+                if module + "." + node.attr in self.modules:
+                    return "module:" + module + "." + node.attr
+                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins"}:
+                    return "foundation:" + module + ":" + node.attr
+        return None
+
+    def binding_context(self, path, dependencies):
+        """Relevant analyzed replacements are cache inputs, even in ordinary writers."""
+        analyzer = self.analyzers[path]
+        relevant = {(_module_name(p, self.root), "*") for p in {path} | set(dependencies)}
+        for name, symbol in analyzer.symbols.items():
+            if symbol.kind == "import":
+                module, attribute = symbol.name.split(":", 1)
+                relevant.add((module, attribute))
+            elif symbol.kind == "module":
+                relevant.add((symbol.name, "*"))
+        if analyzer.tree:
+            for node in ast.walk(analyzer.tree):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in BUILTINS | {"int", "str", "bool", "bytes", "tuple"}:
+                    relevant.add(("builtins", node.id))
+        replacements = set()
+        for writer in self.analyzers.values():
+            for alias, attribute in writer.changed_attributes:
+                module = writer.module_aliases.get(alias)
+                if module and ((module, attribute) in relevant or (module, "*") in relevant or attribute == "*" and any(m == module for m, _ in relevant)):
+                    replacements.add(module + "." + attribute)
+        for identity in self.replaced_functions:
+            if identity.split("::", 1)[0] in {path} | set(dependencies):
+                replacements.add(identity + ".<behavior>")
+        for module, attribute in self.replaced_foundations:
+            if (module, attribute) in relevant or (module, "*") in relevant:
+                replacements.add(module + "." + attribute + ".<behavior>")
+        return sorted(replacements)
+
+    def analyze(self, cached: dict[str, CheckResult] | None = None) -> dict[str, CheckResult]:
+        for path, result in (cached or {}).items():
+            analyzer = self.analyzers[path]
+            analyzer.result = result
+            analyzer.dependencies.update(result.dependencies)
+            for info in analyzer.infos.values():
+                info.contract = next((c for c in result.contracts if c.name == info.qualified), None)
+                if info.contract:
+                    info.calls = {d for d in info.contract.dependencies if d in self.functions}
+                    info.dependencies = {d for d in info.contract.dependencies if d in self.analyzers}
+                    info.failures = set(info.contract.failures)
+                    info.definition_failures = set(info.contract.definition_failures)
+                    info.capture_uses = set(info.contract.captures)
+                    for name, kind in info.contract.captures.items():
+                        if kind not in self.types:
+                            self.types[kind] = _contract_type(kind)
+                        value = analyzer.annotation_value(kind)
+                        targets = info.contract.callable_targets.get(name)
+                        if targets and value.callable:
+                            value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(targets)))
+                        info.captures[name] = value
+                    if info.contract.return_callable_targets:
+                        value = analyzer.annotation_value(info.returns)
+                        if value.callable:
+                            info.return_value = value.with_callable(CallableValue(value.callable.parameters, value.callable.returns, tuple(info.contract.return_callable_targets)))
+                    info.analyzed = True
+        for analyzer in self.analyzers.values():
+            if analyzer.path not in (cached or {}):
+                analyzer.run()
+        def recursive(start, current, seen):
+            if current in seen:
+                return False
+            seen.add(current)
+            return any(target == start or recursive(start, target, seen) for target in self.functions[current].calls)
+        for info in self.functions.values():
+            if recursive(info.identity, info.identity, set()):
+                info.failures.add("RecursionError")
+        changed = True
+        while changed:
+            changed = False
+            for info in self.functions.values():
+                for target in info.calls:
+                    callee = self.functions[target]
+                    before = (len(info.failures), len(info.dependencies))
+                    info.failures.update(callee.failures)
+                    info.dependencies.update(callee.dependencies)
+                    if before != (len(info.failures), len(info.dependencies)):
+                        changed = True
+        for info in self.functions.values():
+            if info.contract:
+                info.contract.failures = sorted(info.failures)
+                info.contract.dependencies = sorted(info.dependencies | info.calls)
+                info.analyzer.dependencies.update(info.dependencies)
+        # A source dependency carries its own dependencies and initializer assumptions.
+        changed = True
+        while changed:
+            changed = False
+            for analyzer in self.analyzers.values():
+                before = len(analyzer.dependencies)
+                for path in tuple(analyzer.dependencies):
+                    if path in self.analyzers:
+                        analyzer.dependencies.update(self.analyzers[path].dependencies)
+                changed |= before != len(analyzer.dependencies)
+        for analyzer in self.analyzers.values():
+            analyzer.finish()
+        changed = True
+        while changed:
+            changed = False
+            for analyzer in self.analyzers.values():
+                if analyzer.module_mode:
+                    failures = set(analyzer.result.initialization_failures)
+                    for path in analyzer.dependencies:
+                        if path in self.analyzers and self.analyzers[path].module_mode:
+                            failures.update(self.analyzers[path].result.initialization_failures)
+                    new = sorted(failures)
+                    changed |= new != analyzer.result.initialization_failures
+                    analyzer.result.initialization_failures = new
+        for analyzer in self.analyzers.values():
+            if any(self.analyzers[path].result.diagnostics for path in analyzer.dependencies if path in self.analyzers):
+                if not any(d.origin == "dependency gate" for d in analyzer.result.diagnostics):
+                    analyzer.result.diagnostics.append(diagnostic("PAL240", analyzer.path, "a resolved source dependency failed its participating gate", origin="dependency gate"))
+                for contract in analyzer.result.contracts:
+                    contract.source_evidence = "unverified: dependency gate failed"
+                    contract.freshness = "no successful checked claim"
+                if analyzer.module_mode:
+                    analyzer.result.initialization_evidence = "unverified: dependency gate failed"
+        return {path: analyzer.result for path, analyzer in self.analyzers.items()}
+
+
+class FunctionalAnalyzer(ScalarAnalyzer):
+    def __init__(self, source, path, mode, policy, graph):
+        super().__init__(source, path, mode, policy)
+        self.graph = graph
+        self.policy = policy or {}
+        self.tree: ast.Module | None = None
+        self.symbols: dict[str, Symbol] = {}
+        self.constants: dict[str, Value] = {}
+        self.constant_busy: set[str] = set()
+        self.constant_limit: int | None = None
+        self.infos: dict[int, FunctionInfo] = {}
+        self.active: FunctionInfo | None = None
+        self.dependencies: set[str] = set()
+        self.module_mode = False
+        self.initializing = False
+        self.parents: dict[int, ast.AST] = {}
+        self.definition_mode = False
+        self.call_sites: set[int] = set()
+
+    def prepare(self):
+        tree = self._prepare()
+        if isinstance(tree, CheckResult):
+            return
+        self.tree = tree
+        self.parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        doc = tree.body[0] if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant) and type(tree.body[0].value.value) is str else None
+        first = tree.body[1] if doc and len(tree.body) > 1 else (tree.body[0] if not doc and tree.body else None)
+        directives = [t for t in tokenize.generate_tokens(io.StringIO(self.source).readline)
+                      if t.type == tokenize.COMMENT and t.string.strip() == "# mode: fun"]
+        for token in tokenize.generate_tokens(io.StringIO(self.source).readline):
+            if token.type == tokenize.COMMENT and token.string.strip().startswith("# mode:") and token.string.strip() != "# mode: fun":
+                self.result.diagnostics.append(diagnostic("PAL121", self.path, "the only supported directive is the module header # mode: fun; region toggles are unsupported", line=token.start[0]))
+        valid = False
+        for token in directives:
+            if token.start[1] != 0 or (doc and token.start[0] <= doc.end_lineno) or (first and token.start[0] >= first.lineno) or valid:
+                self.result.diagnostics.append(diagnostic("PAL121", self.path, "module directive must occur once in the module header after any docstring", line=token.start[0], column=token.start[1] + 1))
+            else:
+                valid = True
+        relative = _module_name(self.path, self.graph.root)
+        try:
+            source_relative = Path(self.path).resolve().relative_to(self.graph.root).as_posix()
+        except ValueError:
+            source_relative = self.path
+        from pathlib import PurePosixPath
+        import fnmatch
+        required = any(fnmatch.fnmatchcase(source_relative, pattern) or PurePosixPath(source_relative).match(pattern)
+                       or ("**/" in pattern and fnmatch.fnmatchcase(source_relative, pattern.replace("**/", "")))
+                       for pattern in self.policy.get("require_modules", []))
+        self.module_mode = valid or required
+        self.result.module_mode = self.module_mode
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    name = alias.asname or alias.name.split(".")[0]
+                    target = alias.name if alias.asname else alias.name.split(".")[0]
+                    self.symbols[name] = Symbol("module", target, node)
+                    self.module_aliases[name] = target
+            elif isinstance(node, ast.ImportFrom):
+                target = _import_name(node, relative, Path(self.path).name == "__init__.py")
+                for alias in node.names:
+                    self.symbols[alias.asname or alias.name] = Symbol("import", target + ":" + alias.name, node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name) and node.value is not None:
+                    self.symbols[targets[0].id] = Symbol("constant", targets[0].id, node)
+        # Track aliases to local modules as well as the foundation aliases handled by M1.
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in self.module_aliases:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id not in self.module_aliases:
+                            self.module_aliases[target.id] = self.module_aliases[node.value.id]
+                            changed = True
+
+    def discover(self):
+        if self.tree is None:
+            return
+        def visit(body, parent=None, prefix="", strict=False):
+            for node in body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.result.eligible_functions += 1
+                    selected = strict or any(self._marker_like(d) for d in node.decorator_list)
+                    qualified = prefix + node.name
+                    info = None
+                    if selected:
+                        info = FunctionInfo(node, self, qualified, parent)
+                        self.infos[id(node)] = info
+                        self.graph.functions[info.identity] = info
+                        self.selected_nodes.add(id(node))
+                        self.result.selected_functions += 1
+                        if self.parents.get(id(node)) is self.tree:
+                            self.symbols[node.name] = Symbol("function", info.identity, node)
+                    visit(node.body, info, qualified + ".", selected)
+                elif isinstance(node, ast.ClassDef):
+                    visit(node.body, parent, prefix + node.name + ".", strict)
+                else:
+                    for field in ("body", "orelse", "finalbody"):
+                        nested = getattr(node, field, None)
+                        if isinstance(nested, list):
+                            visit(nested, parent, prefix, strict)
+                    for handler in getattr(node, "handlers", []):
+                        visit(handler.body, parent, prefix, strict)
+        visit(self.tree.body, strict=self.module_mode)
+
+    def _symbol_stable(self, name: str, symbol: Symbol) -> bool:
+        writes = self.global_writes.get(name, [])
+        targets = [symbol.node]
+        if isinstance(symbol.node, ast.Assign):
+            targets = symbol.node.targets
+        elif isinstance(symbol.node, ast.AnnAssign):
+            targets = [symbol.node.target]
+        return len(writes) == 1 and writes[0] in targets and "*" not in self.global_writes
+
+    def _module_changed(self, module: str, attribute: str) -> bool:
+        if (module, attribute) in getattr(self.graph, "replaced_foundations", set()):
+            return True
+        for analyzer in self.graph.analyzers.values():
+            if analyzer._attribute_changed(module, attribute):
+                return True
+        return False
+
+    def _foundation_available(self, module):
+        parts = module.split(".")
+        for count in range(1, len(parts) + 1):
+            name = ".".join(parts[:count])
+            target = self.graph.modules.get(name)
+            if target and not _product_source(name, Path(target.path).resolve()):
+                return False
+        return True
+
+    def _resolve_symbol(self, symbol: Symbol, node: ast.AST, quiet: bool, seen: set[tuple[str, str]] | None = None) -> Value:
+        if symbol.kind == "function":
+            info = self.graph.functions[symbol.name]
+            if info.identity in self.graph.replaced_functions:
+                return UNKNOWN
+            if self.constant_limit is not None and symbol.node.lineno >= self.constant_limit:
+                return UNKNOWN
+            self._depend(info.analyzer.path)
+            return info.value()
+        if symbol.kind == "constant":
+            return self._constant(symbol.name, quiet)
+        if symbol.kind == "import":
+            module, name = symbol.name.split(":", 1)
+            if module == "builtins" and name in BUILTINS and self._foundation_available(module) and not self._module_changed(module, name):
+                return Value.exact("builtin:" + name)
+            target = self.graph.modules.get(module)
+            if target:
+                self._depend(target.path)
+                seen = set() if seen is None else seen
+                key = (module, name)
+                if key in seen:
+                    return UNKNOWN
+                seen.add(key)
+                resolved = target.symbols.get(name)
+                if resolved and target._symbol_stable(name, resolved) and not self._module_changed(module, name):
+                    return target._resolve_symbol(resolved, node, quiet, seen)
+                child = self.graph.modules.get(module + "." + name)
+                if child:
+                    return Value.exact("module:" + module + "." + name)
+            return UNKNOWN
+        if symbol.kind == "module":
+            return Value.exact("module:" + symbol.name)
+        return UNKNOWN
+
+    def _depend(self, path: str):
+        if path != self.path:
+            self.dependencies.add(path)
+            if self.active:
+                self.active.dependencies.add(path)
+
+    def _record_call(self, node):
+        if id(node) not in self.call_sites:
+            self.call_sites.add(id(node))
+            self.result.analyzed_call_sites += 1
+
+    def _constant(self, name: str, quiet: bool) -> Value:
+        symbol = self.symbols.get(name)
+        if not symbol or not self._symbol_stable(name, symbol) or name in self.constant_busy:
+            return UNKNOWN
+        if self.constant_limit is not None and symbol.node.lineno >= self.constant_limit:
+            return UNKNOWN
+        if name in self.constants:
+            return self.constants[name]
+        self.constant_busy.add(name)
+        previous = self.constant_limit, self.locals, self.boundary, self.definition_mode, self.failures
+        self.constant_limit, self.locals, self.boundary, self.definition_mode = symbol.node.lineno, set(), "<constant " + name + ">", True
+        self.failures = set()
+        try:
+            value = self._expr(symbol.node.value, {}, quiet=quiet)
+            if isinstance(symbol.node, ast.AnnAssign):
+                expected = self._annotation(symbol.node.annotation)
+                if expected and not self.matches(value, expected):
+                    if not quiet:
+                        self.emit("PAL210", symbol.node, f"constant `{name}` requires {expected}; found {self._describe(value)}")
+                    value = UNKNOWN
+            if value.types:
+                self.constants[name] = value
+            return value
+        finally:
+            self.constant_limit, self.locals, self.boundary, self.definition_mode, self.failures = previous
+            self.constant_busy.remove(name)
+
+    def _type_identity(self, node: ast.expr, env_names: set[str]) -> str | None:
+        if isinstance(node, ast.Name):
+            if node.id in env_names:
+                return None
+            if node.id in {"bool", "int", "str", "bytes", "tuple"} and node.id not in self.global_writes and not self._module_changed("builtins", node.id):
+                return node.id
+            symbol = self.symbols.get(node.id)
+            if symbol and not self._annotation_available(symbol):
+                return None
+            if symbol and self._symbol_stable(node.id, symbol) and symbol.kind == "import":
+                module, name = symbol.name.split(":", 1)
+                if not self._foundation_available(module) or self._module_changed(module, name):
+                    return None
+                if module == "types" and name == "NoneType":
+                    return "None"
+                if module in {"typing", "collections.abc"} and name == "Callable":
+                    return "Callable"
+        if isinstance(node, ast.Attribute):
+            symbol = self.symbols.get(node.value.id) if isinstance(node.value, ast.Name) and node.value.id not in env_names else None
+            if symbol and not self._annotation_available(symbol):
+                return None
+            if symbol and self._symbol_stable(node.value.id, symbol) and symbol.kind == "module" and not self._module_changed(symbol.name, node.attr):
+                if not self._foundation_available(symbol.name):
+                    return None
+                if symbol.name in {"typing", "collections.abc"} and node.attr == "Callable":
+                    return "Callable"
+                if symbol.name == "types" and node.attr == "NoneType":
+                    return "None"
+                if symbol.name == "builtins" and node.attr in {"bool", "int", "str", "bytes", "tuple"}:
+                    return node.attr
+            if (node.attr == "Callable" and isinstance(node.value, ast.Attribute) and node.value.attr == "abc"
+                    and isinstance(node.value.value, ast.Name)):
+                symbol = self.symbols.get(node.value.value.id)
+                if symbol and symbol.name == "collections" and self._foundation_available("collections.abc") and self._symbol_stable(node.value.value.id, symbol) and not self._module_changed("collections.abc", "Callable"):
+                    return "Callable"
+        return None
+
+    def _annotation_available(self, symbol):
+        postponed = self.tree and any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names) for n in self.tree.body)
+        return not self.active or self.active.parent is not None or postponed or symbol.node.lineno < self.active.node.lineno
+
+    def _marker_valid(self, node):
+        if not self._foundation_available("pyalamode") or not super()._marker_valid(node):
+            return False
+        name = node.id if isinstance(node, ast.Name) else node.value.id
+        imported = self.marker_imports.get(name) or self.module_imports.get(name)
+        if self.active:
+            if self.active.parent and name in (set(self.active.parent.parameters) | set(_written_names(self.active.parent.node.body))):
+                return False
+            if self.active.parent is None and self.parents.get(id(self.active.node)) is self.tree and imported.lineno >= self.active.node.lineno:
+                return False
+        return not self._module_changed("pyalamode", "fun")
+
+    def _annotation(self, node):
+        original = node
+        if isinstance(node, ast.Constant) and type(node.value) is str:
+            try:
+                node = ast.parse(node.value, mode="eval").body
+            except (SyntaxError, ValueError):
+                node = None
+        names = set()
+        if self.active:
+            parent = self.parents.get(id(self.active.node))
+            while parent:
+                if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.update(_written_names(parent.body))
+                    names.update(a.arg for a in parent.args.posonlyargs + parent.args.args + parent.args.kwonlyargs)
+                parent = self.parents.get(id(parent))
+        def parse(expression):
+            if isinstance(expression, ast.Constant) and expression.value is None:
+                return TypeSpec("None")
+            identity = self._type_identity(expression, names) if expression is not None else None
+            if identity in SCALARS:
+                return TypeSpec(identity)
+            if isinstance(expression, ast.Subscript):
+                identity = self._type_identity(expression.value, names)
+                parts = expression.slice.elts if isinstance(expression.slice, ast.Tuple) else [expression.slice]
+                if identity == "tuple":
+                    if isinstance(expression.slice, ast.Tuple) and not expression.slice.elts:
+                        return TypeSpec("tuple")
+                    variadic = len(parts) == 2 and isinstance(parts[-1], ast.Constant) and parts[-1].value is Ellipsis
+                    args = [parse(p) for p in (parts[:-1] if variadic else parts)]
+                    if args and all(a is not None and a.name != "Callable" for a in args):
+                        return TypeSpec("tuple", tuple(args), variadic=variadic)
+                if identity == "Callable" and len(parts) == 2 and isinstance(parts[0], ast.List):
+                    args = [parse(p) for p in parts[0].elts]
+                    result = parse(parts[1])
+                    if all(a is not None for a in args) and result is not None:
+                        return TypeSpec("Callable", tuple(args), result)
+            return None
+        schema = parse(node)
+        if schema is None:
+            self.emit("PAL130", original or ast.Constant(value=None), "annotation must identify a closed exact scalar, recursive tuple, or fixed positional Callable contract")
+            return None
+        def register(spec):
+            self.graph.types[str(spec)] = spec
+            for arg in spec.arguments:
+                register(arg)
+            if spec.result:
+                register(spec.result)
+        register(schema)
+        return str(schema)
+
+    def signature(self, info):
+        previous = self.active, self.boundary
+        self.active, self.boundary = info, info.qualified
+        node = info.node
+        for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            annotation = self._annotation(arg.annotation)
+            info.parameters[arg.arg] = annotation or "<unknown>"
+            info.kinds[arg.arg] = ("positional_only" if arg in node.args.posonlyargs else "keyword_only" if arg in node.args.kwonlyargs else "positional_or_keyword")
+        info.returns = self._annotation(node.returns)
+        self.active, self.boundary = previous
+
+    def annotation_value(self, kind):
+        schema = self.graph.types.get(kind)
+        if schema and schema.name == "Callable":
+            return Value.exact(kind).with_callable(CallableValue(tuple(map(str, schema.arguments)), str(schema.result), conditional=True))
+        return Value.exact(kind) if schema else UNKNOWN
+
+    def matches(self, value: Value, expected: str) -> bool:
+        schema = self.graph.types.get(expected)
+        if schema is None or not value.types:
+            return False
+        if schema.name == "tuple":
+            if value.items is not None:
+                if schema.variadic:
+                    return all(self.matches(v, str(schema.arguments[0])) for v in value.items)
+                return len(value.items) == len(schema.arguments) and all(self.matches(v, str(t)) for v, t in zip(value.items, schema.arguments))
+            return all(self._schema_matches(self.graph.types.get(kind), schema) for kind in value.types)
+        if schema.name == "Callable":
+            callback = value.callable
+            if callback is None or (not callback.targets and not callback.conditional):
+                return False
+            if callback.parameters != tuple(map(str, schema.arguments)) or callback.returns != str(schema.result):
+                return False
+            for target in callback.targets:
+                info = self.graph.functions[target]
+                if any(k == "keyword_only" for k in info.kinds.values()):
+                    return False
+            return True
+        return value.types == frozenset({expected})
+
+    def _schema_matches(self, actual, expected):
+        if actual is None or actual.name != expected.name:
+            return False
+        if expected.name != "tuple":
+            return actual == expected
+        if expected.variadic:
+            return all(self._schema_matches(t, expected.arguments[0]) for t in actual.arguments)
+        return not actual.variadic and len(actual.arguments) == len(expected.arguments) and all(self._schema_matches(a, b) for a, b in zip(actual.arguments, expected.arguments))
+
+    def run(self):
+        if self.tree is None:
+            return
+        # Analyze top-level selected functions; nested definitions are checked at their enclosing definition site.
+        for info in self.infos.values():
+            if info.parent is None:
+                if self.parents.get(id(info.node)) is not self.tree:
+                    # An ordinary enclosing scope can supply only statically known, single initialized captures.
+                    parent = self.parents.get(id(info.node))
+                    while parent and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        parent = self.parents.get(id(parent))
+                    if isinstance(parent, ast.ClassDef):
+                        self.boundary = info.qualified
+                        self.emit("PAL120", info.node, "class-bound declarations are outside the functional subset")
+                    elif parent:
+                        info.enclosing = self._ordinary_capture_env(parent, info.node)
+                        ancestor = parent
+                        while ancestor:
+                            if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                info.enclosing_names.update(_written_names(ancestor.body))
+                                info.enclosing_names.update(a.arg for a in ancestor.args.posonlyargs + ancestor.args.args + ancestor.args.kwonlyargs)
+                            ancestor = self.parents.get(id(ancestor))
+                self.function(info)
+        if self.module_mode:
+            self.initializing = True
+            self.active = None
+            self.boundary, self.locals = "<module initialization>", set(self.global_writes)
+            self.failures = set()
+            env = {}
+            for node in self.tree.body:
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    self._check_import(node)
+                    for name, symbol in self.symbols.items():
+                        if symbol.node is node:
+                            env[name] = Binding(self._resolve_symbol(symbol, node, False), (node.lineno,))
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    info = self.infos.get(id(node))
+                    if info:
+                        env[node.name] = Binding(info.value(), (node.lineno,))
+                        self.failures.update(info.definition_failures)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.If, ast.Pass)) or (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and type(node.value.value) is str):
+                    env = self._statement(node, env) or env
+                else:
+                    self.emit("PAL241", node, f"{type(node).__name__} is outside checked module initialization")
+            self.initializing = False
+            self.result.initialization_failures = sorted(self.failures)
+            self.result.initialization_evidence = "checked pure source initialization"
+        else:
+            for name, symbol in self.symbols.items():
+                if symbol.kind == "import" and self._symbol_stable(name, symbol):
+                    value = self._resolve_symbol(symbol, symbol.node, True)
+                    if value.callable and len(value.callable.targets) == 1:
+                        info = self.graph.functions[value.callable.targets[0]]
+                        self.contracts[name] = info.contract or FunctionContract(info.qualified, info.analyzer.path, info.node.lineno, dict(info.parameters), info.returns, dict(info.kinds))
+            self._ordinary_calls(self.tree)
+
+    def _ordinary_capture_env(self, parent, selected):
+        writes = _written_names(parent.body)
+        changing_cells = {name for sub in ast.walk(parent) if isinstance(sub, ast.Nonlocal) for name in sub.names}
+        env = {}
+        previous = self.locals, self.active, self.definition_mode
+        self.locals, self.active, self.definition_mode = set(writes) | {a.arg for a in parent.args.posonlyargs + parent.args.args + parent.args.kwonlyargs}, None, True
+        for statement in parent.body:
+            if statement.lineno >= selected.lineno:
+                break
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id not in changing_cells and writes.get(targets[0].id) == [statement.target if isinstance(statement, ast.AnnAssign) else targets[0]]:
+                    value = self._expr(statement.value, env, quiet=True)
+                    env[targets[0].id] = Binding(value, (statement.lineno,))
+        self.locals, self.active, self.definition_mode = previous
+        return env
+
+    def _check_import(self, node):
+        declared = [(alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name)) for alias in node.names]
+        for name in declared:
+            writes = self.global_writes.get(name, [])
+            if writes != [node]:
+                self.emit("PAL101", node, f"import binding `{name}` has another analyzed initialization", first=writes[0].lineno if writes else None)
+        for name, symbol in self.symbols.items():
+            if symbol.node is not node:
+                continue
+            if not self._symbol_stable(name, symbol):
+                self.emit("PAL101", node, f"import binding `{name}` has another initialization", first=self.global_writes[name][0].lineno)
+            module = symbol.name.split(":", 1)[0]
+            if module in {"pyalamode", "types", "builtins", "typing", "collections", "collections.abc", "__future__"} and self._foundation_available(module):
+                if symbol.kind == "import":
+                    allowed = {"pyalamode": {"fun"}, "types": {"NoneType"}, "builtins": BUILTINS | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
+                    if symbol.name.split(":", 1)[1] not in allowed.get(module, set()):
+                        self.emit("PAL241", node, f"foundation import `{symbol.name}` has no supported contract")
+                continue
+            target = self.graph.modules.get(module)
+            if target is None:
+                self.emit("PAL241", node, f"import `{module}` cannot be resolved to checked local source")
+            else:
+                self._depend(target.path)
+                if symbol.kind == "import":
+                    exported = symbol.name.split(":", 1)[1]
+                    if exported not in target.symbols and module + "." + exported not in self.graph.modules:
+                        self.emit("PAL241", node, f"imported binding `{module}.{exported}` is absent from resolved source")
+                if not target.module_mode:
+                    self.emit("PAL241", node, f"import `{module}` has unchecked initialization; strict modules require a functional module")
+                # Python imports each package initializer before its submodule.
+                parts = module.split(".")
+                for count in range(1, len(parts)):
+                    package = self.graph.modules.get(".".join(parts[:count]))
+                    if package:
+                        self._depend(package.path)
+                        if not package.module_mode:
+                            self.emit("PAL241", node, f"package `{'.'.join(parts[:count])}` has unchecked initialization")
+
+    def function(self, info):
+        if info.analyzed or info.analyzing:
+            return
+        info.analyzing = True
+        previous = self.active, self.boundary, self.locals, self.failures, getattr(self, "return_type", None), self.in_dead
+        self.active, self.boundary, self.failures, self.in_dead = info, info.qualified, info.failures, False
+        node = info.node
+        if isinstance(node, ast.AsyncFunctionDef) or node.args.vararg or node.args.kwarg or getattr(node, "type_params", []):
+            self.emit("PAL120", node, "async, variadic and generic functions have no supported contract")
+        if info.parent is None and self.parents.get(id(node)) is self.tree:
+            if self.global_writes.get(node.name) != [node]:
+                self.emit("PAL240", node, f"participating binding `{node.name}` has another analyzed initialization")
+        if info.identity in self.graph.replaced_functions:
+            self.emit("PAL240", node, f"checked callable `{info.qualified}` has an analyzed attribute/behavior replacement")
+        decorators = node.decorator_list
+        if decorators and (len(decorators) != 1 or not self._marker_valid(decorators[0])):
+            self.emit("PAL120", node, "only one unchanged pyalamode.fun identity declaration is supported")
+        if not decorators and not (self.module_mode or info.parent):
+            self.emit("PAL120", node, "function is not selected by module mode or a resolved marker")
+        if info.parent:
+            enclosing_writes = _written_names(info.parent.node.body)
+            enclosing_parameters = set(info.parent.parameters)
+            info.enclosing_names = set(enclosing_writes) | enclosing_parameters
+            info.enclosing_names.update(info.parent.enclosing_names)
+            changing_cells = {name for sub in ast.walk(info.parent.node) if isinstance(sub, ast.Nonlocal) for name in sub.names}
+            for name, binding in info.enclosing.items():
+                occurrences = enclosing_writes.get(name, [])
+                if name in changing_cells or (name not in enclosing_parameters and name not in info.parent.captures and len(occurrences) != 1):
+                    continue
+                if binding.definite and binding.value.types:
+                    info.captures[name] = binding.value
+            # A stable sibling definition may be referenced through a closure cell for mutual recursion.
+            for sibling in self.infos.values():
+                if sibling.parent is info.parent and enclosing_writes.get(sibling.node.name) == [sibling.node]:
+                    info.captures[sibling.node.name] = sibling.value()
+        else:
+            info.captures = {name: b.value for name, b in info.enclosing.items() if b.definite and b.value.types}
+        local_writes = _written_names(node.body)
+        self.locals = set(local_writes) | set(info.parameters)
+        env = {name: Binding(self.annotation_value(kind), (node.lineno,)) for name, kind in info.parameters.items()}
+        positional = node.args.posonlyargs + node.args.args
+        default_nodes = {arg.arg: value for arg, value in zip(positional[-len(node.args.defaults):] if node.args.defaults else [], node.args.defaults)}
+        default_nodes.update({arg.arg: value for arg, value in zip(node.args.kwonlyargs, node.args.kw_defaults) if value is not None})
+        self.definition_mode = True
+        body_failures = self.failures
+        self.failures = info.definition_failures
+        default_env = info.enclosing
+        body_locals = self.locals
+        self.locals = set(info.parent.parameters) | set(_written_names(info.parent.node.body)) if info.parent else set()
+        prior_limit = self.constant_limit
+        if info.parent is None and self.parents.get(id(node)) is self.tree:
+            self.constant_limit = node.lineno
+        for name, value_node in default_nodes.items():
+            value = self._expr(value_node, default_env)
+            if not self.matches(value, info.parameters[name]):
+                self.emit("PAL221", value_node, f"default `{name}` does not establish {info.parameters[name]}", origin="definition-time default")
+            info.defaults[name] = value
+        self.definition_mode = False
+        self.failures = body_failures
+        self.constant_limit = prior_limit
+        self.locals = body_locals
+        self.return_type = info.returns
+        continuing = self._block(node.body, env)
+        if continuing is not None and info.returns != "None":
+            self.emit("PAL211", node, "a completing path falls through with None instead of the declared result")
+        contract = FunctionContract(info.qualified, self.path, node.lineno, dict(info.parameters), info.returns, dict(info.kinds),
+                                    defaults={n: v.kind or "unknown" for n, v in info.defaults.items()},
+                                    captures={n: info.captures[n].kind or "unknown" for n in info.capture_uses},
+                                    callable_targets={n: list(info.captures[n].callable.targets) for n in info.capture_uses if info.captures[n].callable},
+                                    callable_defaults={n: list(v.callable.targets) for n, v in info.defaults.items() if v.callable},
+                                    return_callable_targets=list(info.return_value.callable.targets) if info.return_value and info.return_value.callable else [],
+                                    definition_failures=sorted(info.definition_failures))
+        contract.caller_obligations = [f"{name}: exact {kind}; recursively admitted contents and checked callable/capture evidence where applicable" for name, kind in info.parameters.items()]
+        contract.caller_obligations.extend(["Resolved constant, callable, capture, marker, annotation and builtin bindings remain unchanged during execution.",
+                                            "Callable inputs satisfy their declared pure invocation contract with stable captures; annotations alone do not establish that evidence.",
+                                            "Callable invocation failure upper bound: ZeroDivisionError and RecursionError, the closed supported callable failure universe.",
+                                            "Ordinary callers receive no runtime guards; unchecked import initialization has no purity claim.",
+                                            "Recursion may diverge or raise RecursionError; resource exhaustion and interruption are outside the failure contract."])
+        info.contract = contract
+        self.result.contracts.append(contract)
+        if info.parent is None and self.parents.get(id(node)) is self.tree:
+            self.contracts[node.name] = contract
+        info.analyzed, info.analyzing = True, False
+        self.active, self.boundary, self.locals, self.failures, self.return_type, self.in_dead = previous
+
+    def _merge(self, left, right):
+        if left is None:
+            return right
+        if right is None:
+            return left
+        merged = {}
+        for name in left.keys() | right.keys():
+            a, b = left.get(name), right.get(name)
+            if a and b:
+                value = self.merge_values(a.value, b.value)
+                merged[name] = Binding(value, tuple(sorted(set(a.first + b.first))), a.definite and b.definite)
+            else:
+                binding = a or b
+                merged[name] = Binding(binding.value, binding.first, False)
+        return merged
+
+    def merge_values(self, a, b):
+        literal = a.literal if a.literal is not _UNKNOWN and type(a.literal) is type(b.literal) and a.literal == b.literal else _UNKNOWN
+        callback = None
+        if a.callable and b.callable and a.callable.parameters == b.callable.parameters and a.callable.returns == b.callable.returns:
+            callback = CallableValue(a.callable.parameters, a.callable.returns,
+                                     tuple(sorted(set(a.callable.targets + b.callable.targets))),
+                                     tuple(sorted(set(a.callable.captures + b.callable.captures))),
+                                     a.callable.conditional or b.callable.conditional)
+        return Value(a.types | b.types, literal, a.items if a.items == b.items else None, callback)
+
+    def _statement(self, node, env):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            info = self.infos.get(id(node))
+            if info is None:
+                self.emit("PAL120", node, "nested function lacks a checked declaration")
+                return env
+            if node.name in env and not self.in_dead:
+                self.emit("PAL101", node, f"`{node.name}` is already initialized", first=env[node.name].first[0])
+            info.enclosing = dict(env)
+            if self.active:
+                info.enclosing.update({n: Binding(v, (self.active.node.lineno,)) for n, v in self.active.captures.items() if n not in self.locals})
+            self.function(info)
+            if self.active:
+                self.active.capture_uses.update(info.capture_uses & self.active.captures.keys())
+            self.failures.update(info.definition_failures)
+            env[node.name] = Binding(info.value(), (node.lineno,))
+            return env
+        if isinstance(node, ast.Return):
+            value = self._expr(node.value, env) if node.value else Value.exact("None", None)
+            self._ready_callable(value, env, node)
+            if self.active:
+                self.active.return_value = self.merge_values(self.active.return_value, value) if self.active.return_value else value
+            if not self.matches(value, self.return_type):
+                self.emit("PAL211", node, f"return requires {self.return_type}; found {self._describe(value)}")
+            return None
+        if isinstance(node, ast.AnnAssign):
+            value = self._expr(node.value, env) if node.value is not None else UNKNOWN
+            if not isinstance(node.target, ast.Name) or node.value is None:
+                self.emit("PAL110", node, "annotated initialization requires one name and a value")
+                return env
+            expected = self._annotation(node.annotation)
+            if expected and not self.matches(value, expected):
+                self.emit("PAL210", node, f"binding `{node.target.id}` requires {expected}; found {self._describe(value)}")
+            if node.target.id in env and not self.in_dead:
+                self.emit("PAL101", node, f"`{node.target.id}` is already initialized", first=env[node.target.id].first[0])
+            else:
+                env[node.target.id] = Binding(value, (node.lineno,))
+            return env
+        return super()._statement(node, env)
+
+    def _expr(self, node, env, *, quiet=False):
+        def reject(rule, reason):
+            if not quiet:
+                self.emit(rule, node, reason)
+            return UNKNOWN
+        if isinstance(node, ast.Name):
+            binding = env.get(node.id)
+            if binding:
+                if not binding.definite:
+                    return reject("PAL102", f"`{node.id}` is not initialized on every continuing path")
+                return binding.value
+            if node.id in self.locals:
+                return reject("PAL240" if node.id in BUILTINS else "PAL102", f"local `{node.id}` is not initialized or shadows an approved operation")
+            if self.active and node.id in self.active.captures:
+                value = self.active.captures[node.id]
+                self.active.capture_uses.add(node.id)
+                return value
+            if self.active and node.id in self.active.enclosing_names:
+                return reject("PAL240", f"captured binding `{node.id}` is not established as stable and initialized")
+            symbol = self.symbols.get(node.id)
+            if symbol and self._symbol_stable(node.id, symbol):
+                value = self._resolve_symbol(symbol, node, quiet)
+                if value.types:
+                    return value
+            if node.id in BUILTINS and node.id not in self.global_writes and not self._module_changed("builtins", node.id):
+                return Value.exact("builtin:" + node.id)
+            return reject("PAL240", f"binding `{node.id}` is not a statically established stable dependency")
+        if isinstance(node, ast.Attribute):
+            owner = self._expr(node.value, env, quiet=quiet)
+            if owner.kind and owner.kind.startswith("module:"):
+                module = owner.kind.split(":", 1)[1]
+                if self._module_changed(module, node.attr):
+                    return reject("PAL240", f"resolved dependency `{module}.{node.attr}` has an analyzed replacement")
+                if module == "builtins" and node.attr in BUILTINS:
+                    return Value.exact("builtin:" + node.attr)
+                target = self.graph.modules.get(module)
+                if target:
+                    symbol = target.symbols.get(node.attr)
+                    if symbol and target._symbol_stable(node.attr, symbol):
+                        self._depend(target.path)
+                        return target._resolve_symbol(symbol, node, quiet)
+                if module + "." + node.attr in self.graph.modules:
+                    return Value.exact("module:" + module + "." + node.attr)
+            return reject("PAL201", "attribute access is admitted only for statically resolved module dependencies")
+        if isinstance(node, ast.Tuple):
+            if any(isinstance(item, ast.Starred) for item in node.elts):
+                return reject("PAL201", "tuple unpacking has no supported construction contract")
+            items = tuple(self._expr(item, env, quiet=quiet) for item in node.elts)
+            if any(not value.types or value.callable or (value.kind and value.kind.startswith(("module:", "builtin:"))) for value in items):
+                return reject("PAL221", "tuple contents must be recursively admitted immutable data; callable/module objects are not tuple data")
+            args = tuple(self.graph.types[value.kind] for value in items if value.kind in self.graph.types)
+            if len(args) != len(items):
+                return reject("PAL221", "tuple element exact contract is ambiguous")
+            schema = TypeSpec("tuple", args)
+            self.graph.types[str(schema)] = schema
+            return Value(frozenset({str(schema)}), items=items)
+        if isinstance(node, ast.IfExp):
+            condition = self._expr(node.test, env, quiet=quiet)
+            yes, no = self._expr(node.body, env, quiet=quiet), self._expr(node.orelse, env, quiet=quiet)
+            if condition.kind != "bool":
+                return reject("PAL210", "conditional expression requires exact bool")
+            return self.merge_values(yes, no)
+        if isinstance(node, ast.Call):
+            target = self._expr(node.func, env, quiet=quiet)
+            if target.kind and target.kind.startswith("builtin:"):
+                name = target.kind.split(":", 1)[1]
+                if node.keywords or any(isinstance(arg, ast.Starred) for arg in node.args):
+                    return reject("PAL230", f"{name} admits only its published positional signature")
+                values = [self._expr(arg, env, quiet=quiet) for arg in node.args]
+                kinds = [v.kind for v in values]
+                if name == "abs" and kinds == ["int"]:
+                    return Value.exact("int")
+                if name == "len" and len(kinds) == 1 and (kinds[0] in {"str", "bytes"} or self.graph.types.get(kinds[0], TypeSpec("")).name == "tuple"):
+                    return Value.exact("int")
+                if name in {"min", "max"} and len(kinds) >= 2 and len(set(kinds)) == 1 and kinds[0] in {"int", "str", "bytes"}:
+                    return Value.exact(kinds[0])
+                return reject("PAL210", f"{name} inputs do not establish its exact supported signature")
+            if not target.callable:
+                return reject("PAL230", "call target is not a resolved checked callable or characterized builtin")
+            if self.definition_mode or self.initializing:
+                return reject("PAL230", "definition-time values use closed stable data expressions and approved builtins; checked application invocation is confined to function bodies")
+            callback = target.callable
+            if not quiet:
+                self._record_call(node)
+                self._ready_callable(target, env, node)
+            if callback.targets:
+                infos = [self.graph.functions[identity] for identity in callback.targets]
+                for info in infos:
+                    self._checked_inputs(node, info, env, quiet)
+                    if self.active:
+                        self.active.calls.add(info.identity)
+                        self.active.dependencies.update(info.dependencies)
+                    self._depend(info.analyzer.path)
+                returns = {info.returns for info in infos}
+                if len(infos) == 1 and self.graph.types.get(infos[0].returns, TypeSpec("")).name == "Callable":
+                    info = infos[0]
+                    if info.parent is None and not info.analyzed and not info.analyzing:
+                        info.analyzer.function(info)
+                    if info.return_value and info.return_value.callable:
+                        return info.return_value
+                return self.annotation_value(next(iter(returns))) if len(returns) == 1 else UNKNOWN
+            if callback.conditional:
+                if node.keywords or len(node.args) != len(callback.parameters) or any(isinstance(a, ast.Starred) for a in node.args):
+                    return reject("PAL221", "callback invocation requires its exact fixed positional signature")
+                for arg, expected in zip(node.args, callback.parameters):
+                    value = self._expr(arg, env, quiet=quiet)
+                    if not self.matches(value, expected):
+                        if not quiet:
+                            self.emit("PAL221", arg, f"callback argument requires {expected}; found {self._describe(value)}")
+                if not quiet:
+                    self.failures.update({"ZeroDivisionError", "RecursionError"})
+                return self.annotation_value(callback.returns)
+            return reject("PAL230", "callable annotation alone does not establish invocation evidence")
+        return super()._expr(node, env, quiet=quiet)
+
+    def _checked_inputs(self, node, info, env, quiet=False):
+        positional = [n for n, kind in info.kinds.items() if kind != "keyword_only"]
+        supplied = dict(zip(positional, node.args))
+        malformed = len(node.args) > len(positional) or any(isinstance(arg, ast.Starred) for arg in node.args)
+        for keyword in node.keywords:
+            if keyword.arg is None or keyword.arg not in info.parameters or keyword.arg in supplied or info.kinds.get(keyword.arg) == "positional_only":
+                malformed = True
+            else:
+                supplied[keyword.arg] = keyword.value
+        # Default existence is syntactic so forward/recursive calls do not depend on analysis order.
+        args = info.node.args
+        pos = args.posonlyargs + args.args
+        default_names = {arg.arg for arg in pos[-len(args.defaults):]} if args.defaults else set()
+        default_names |= {arg.arg for arg, value in zip(args.kwonlyargs, args.kw_defaults) if value is not None}
+        if malformed or set(info.parameters) - set(supplied) - default_names:
+            if not quiet:
+                self.emit("PAL221", node, f"call to `{info.qualified}` does not establish its required signature")
+        for name, arg in supplied.items():
+            value = self._expr(arg, env, quiet=quiet)
+            expected = info.parameters.get(name)
+            if expected and not self.matches(value, expected) and not quiet:
+                self.emit("PAL221", arg, f"argument `{name}` of `{info.qualified}` requires {expected}; found {self._describe(value)}")
+
+    def _call_inputs(self, node, contract, env):
+        info = self.graph.functions.get(contract.path + "::" + contract.name)
+        if info:
+            self._checked_inputs(node, info, env)
+
+    def _ordinary_resolved_info(self, expression, env):
+        value = self._expr(expression, env, quiet=True)
+        if value.callable and len(value.callable.targets) == 1:
+            return self.graph.functions[value.callable.targets[0]]
+        return None
+
+    def _ready_callable(self, value, env, node, seen=None):
+        if not value.callable or not self.active:
+            return
+        seen = set() if seen is None else seen
+        for target in value.callable.targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            info = self.graph.functions[target]
+            if info.parent is self.active:
+                for name in info.capture_uses:
+                    capture = info.captures[name]
+                    binding = env.get(name)
+                    if binding is None and self.active and name in self.active.captures:
+                        binding = Binding(self.active.captures[name], (self.active.node.lineno,))
+                    if not binding or not binding.definite:
+                        self.emit("PAL240", node, f"callable `{info.qualified}` requires captured cell `{name}` initialized before invocation or escape")
+                    elif capture.callable:
+                        self._ready_callable(binding.value, env, node, seen)
+
+    def finish(self):
+        self.result.dependencies = {path: hashlib.sha256(self.graph.analyzers[path].source.encode()).hexdigest()
+                                    for path in sorted(self.dependencies) if path in self.graph.analyzers and path != self.path}
+        if self.result.mode == "audit" or self.result.diagnostics:
+            self.result.initialization_evidence = "unverified initialization" if self.module_mode else self.result.initialization_evidence
+            for contract in self.result.contracts:
+                contract.enforcement = self.result.mode
+                contract.source_evidence = "unverified: audit or failed selected gate"
+                contract.freshness = "no successful checked claim"
+        self.result.diagnostics.sort(key=lambda d: (d.line, d.column, d.rule))
+
+
+def analyze_sources(sources: dict[str, str], *, root: str | Path, audit: bool = False,
+                    policy: dict | None = None) -> dict[str, CheckResult]:
+    """Analyze a captured source graph without application imports or user evaluation."""
+    return SourceGraph(sources, Path(root).resolve(), audit, policy).analyze()
+
+
 def analyze_source(source: str, path: str = "<source>", *, audit: bool = False,
                    policy: dict | None = None) -> CheckResult:
-    """Analyze text only; this API does not certify the caller's runtime environment."""
-    return ScalarAnalyzer(source, path, "audit" if audit else "strict", policy).analyze()
+    """Analyze text only. Cross-module callers use analyze_sources or analyze_file."""
+    return analyze_sources({path: source}, root=Path(path).resolve().parent, audit=audit, policy=policy)[path]
 
 
 def analyze_file(path: str | Path, *, audit: bool = False, policy: dict | None = None) -> CheckResult:
     resolved = Path(path).resolve()
-    try:
-        with tokenize.open(resolved) as stream:
-            source = stream.read()
-    except (OSError, UnicodeError, SyntaxError) as error:
-        result = CheckResult(str(resolved), "", mode="audit" if audit else "strict")
-        result.diagnostics.append(diagnostic("PAL001", str(resolved), f"cannot read source: {error}"))
+    sources, errors = load_sources([resolved], resolved.parent)
+    if errors:
+        result = CheckResult(str(resolved), "", diagnostics=errors, mode="audit" if audit else "strict")
         return result
-    return analyze_source(source, str(resolved), audit=audit, policy=policy)
+    results = analyze_sources(sources, root=resolved.parent, audit=audit, policy=policy)
+    result = results[str(resolved)]
+    # Dependency failures cannot be hidden by requesting only one entry file.
+    for other in results.values():
+        if other is not result:
+            result.diagnostics.extend(other.diagnostics)
+    return result

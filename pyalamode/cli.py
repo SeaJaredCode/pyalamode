@@ -1,4 +1,4 @@
-"""Small usable command interface for the scalar milestone."""
+"""Local static check/build and finite contract explanations."""
 
 import argparse
 import json
@@ -23,16 +23,17 @@ def _show(result, structured: bool) -> None:
     elif result.status:
         print("Verification failed; no successful checked claim.")
     else:
-        print(f"Strict gate passed: {selected} selected scalar functions; ordinary shell and module initialization are unchecked.")
+        modules = sum(file.module_mode for file in result.results)
+        print(f"Strict gate passed: {selected} selected functions and {modules} functional modules; ordinary shells and ordinary initialization are unchecked.")
         if not selected:
-            print("No participating exports were selected; this check establishes no export claim.")
+            print("No participating functions were selected; module initialization coverage is reported separately.")
     if result.output:
         print(f"Built ordinary Python source: {result.output}")
-    print(f"{coverage['analyzed_call_sites']} ordinary same-file call sites inspected; elapsed {result.elapsed_seconds:.6f}s.")
+    print(f"{coverage['analyzed_call_sites']} checked or resolved ordinary caller sites inspected; elapsed {result.elapsed_seconds:.6f}s.")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="pyalamode", description="Statically check the closed scalar subset of ordinary Python.")
+    parser = argparse.ArgumentParser(prog="pyalamode", description="Statically check functional modules and the closed immutable subset of ordinary Python.")
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("check", "build"):
         command = commands.add_parser(name)
@@ -58,10 +59,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         operations = {
             "abs": "abs(exact int) -> exact int; one positional argument.",
-            "len": "len(exact str or bytes) -> exact int; one positional argument.",
+            "len": "len(exact str, bytes or recursively admitted tuple) -> exact int; one positional argument.",
             "min": "min(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "max": "max(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "fun": "Runtime identity marker. Execution adds no checked evidence and performs no input validation.",
+            "tuple": "Exact recursive tuple[T1, T2], homogeneous tuple[T, ...], or empty tuple[()]; immutable data only, no subclasses or callable payloads. Construction and len are admitted; indexing and iteration remain unsupported.",
+            "Callable": "typing/collections.abc Callable[[T1, T2], R]: fixed positional pure invocation, exact inputs/result and stable captures; failure upper bound ZeroDivisionError and RecursionError. Analyzed callers supply resolved checked callable evidence; annotations do not prove actual callbacks pure.",
+            "module": "# mode: fun after the optional shebang/encoding/docstring and before executable source, or project require_modules globs; initialization is checked without application imports or evaluation.",
         }
         if args.symbol in operations:
             print(operations[args.symbol])

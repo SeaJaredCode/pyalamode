@@ -5,10 +5,10 @@ from typing import Any
 import hashlib
 from pathlib import Path
 
-CHECKER_VERSION = "scalar-1.0"
+CHECKER_VERSION = "modules-2.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-ops-1"
+OPERATION_VERSION = "scalar-tuple-call-ops-2"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -24,14 +24,16 @@ RULES = {
     "PAL101": ("binding already initialized", "Derive a new local name; exclusive branches can initialize one name once."),
     "PAL102": ("binding not initialized on every path", "Initialize the name in every continuing branch before using it."),
     "PAL110": ("unsupported statement or binding", "Extract scalar decision logic using simple assignments, if, return, and pass."),
-    "PAL120": ("unsupported declaration", "Use one statically resolved @fun on a top-level function without defaults or nesting."),
-    "PAL130": ("annotation contract unknown", "Use explicit exact int, bool, str, bytes, or None annotations, without executing expressions."),
+    "PAL120": ("unsupported declaration", "Use module mode or a resolved @fun, checked nested functions, and stable supported defaults."),
+    "PAL121": ("misplaced module directive", "Place # mode: fun after the optional shebang, encoding declaration and docstring, before executable statements."),
+    "PAL130": ("annotation contract unknown", "Use explicit exact scalars, recursive tuple types, or Callable[[exact types], exact result]; annotation expressions are never evaluated."),
     "PAL201": ("unsupported expression", "Use the published scalar expression vocabulary; move integration to ordinary Python."),
     "PAL210": ("operation operand contract not established", "Supply the exact operand types in the published operation contract; no coercion is implicit."),
     "PAL211": ("return contract not established", "Return the exact declared scalar type on every completing path."),
     "PAL221": ("input contract not established", "Supply a statically established exact scalar; ordinary unknown inputs remain caller obligations."),
-    "PAL230": ("call target unknown or unsupported", "Use an unshadowed approved builtin signature; checked call graphs arrive separately."),
-    "PAL240": ("dependency binding is not approved", "Pass application data as explicit scalar parameters and leave approved bindings unchanged."),
+    "PAL230": ("call target unknown or unsupported", "Use a resolved checked callable or an unchanged approved builtin with its supported signature."),
+    "PAL240": ("dependency binding is not approved", "Use statically established stable values/callables and leave dependency bindings unchanged."),
+    "PAL241": ("module initialization is not characterized", "Use supported stable initialization and import only characterized foundations or checked functional modules."),
 }
 
 
@@ -64,11 +66,18 @@ class FunctionContract:
     enforcement: str = "strict"
     behavior: str = "pure"
     source_evidence: str = "checked participating source"
-    trust: list[str] = field(default_factory=lambda: ["CPython 3.13.1 standard scalar operations", "pyalamode.fun identity marker"])
+    trust: list[str] = field(default_factory=lambda: ["CPython 3.13.1 standard scalar, tuple, function and annotation operations", "pyalamode.fun identity marker"])
     failures: list[str] = field(default_factory=list)
     freshness: str = "current for recorded inputs"
     boundary_protection: str = "unguarded"
     caller_obligations: list[str] = field(default_factory=list)
+    defaults: dict[str, str] = field(default_factory=dict)
+    captures: dict[str, str] = field(default_factory=dict)
+    dependencies: list[str] = field(default_factory=list)
+    callable_targets: dict[str, list[str]] = field(default_factory=dict)
+    callable_defaults: dict[str, list[str]] = field(default_factory=dict)
+    return_callable_targets: list[str] = field(default_factory=list)
+    definition_failures: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +91,11 @@ class CheckResult:
     analyzed_call_sites: int = 0
     cache_hit: bool = False
     mode: str = "strict"
+    module_mode: bool = False
+    initialization_evidence: str = "unchecked ordinary module initialization"
+    dependencies: dict[str, str] = field(default_factory=dict)
+    initialization_failures: list[str] = field(default_factory=list)
+    binding_context: list[str] = field(default_factory=list)
 
     @property
     def verified(self) -> bool:

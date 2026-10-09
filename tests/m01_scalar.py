@@ -73,7 +73,7 @@ class ScalarAcceptance(unittest.TestCase):
         self.assertTrue(result.diagnostics)
 
     def test_A06_unknown_calls_shadowing_and_constructs(self):
-        for expression in ["print(x)", "hash(x)", "x / 2", "x ** 2", "x.__add__(1)", "f(x)", "[x]", "(x,)", "x[0]", "f'{x}'", "(y := x)"]:
+        for expression in ["print(x)", "hash(x)", "x / 2", "x ** 2", "x.__add__(1)", "unknown(x)", "[x]", "(x,)", "x[0]", "f'{x}'", "(y := x)"]:
             with self.subTest(expression=expression):
                 result = self.check(f"@fun\ndef f(x: int) -> int:\n    return {expression}\n")
                 self.assertFalse(result.verified, result.to_dict())

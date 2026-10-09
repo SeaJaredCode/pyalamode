@@ -1,12 +1,10 @@
 # Pyalamode
 
-Pyalamode checks a small functional core in ordinary Python. Milestone 1 provides an installable local library, a static scalar checker, an audit mode, and a checked build that copies accepted Python source. Accepted code runs with normal Python commands and imports.
+Pyalamode checks a functional core in ordinary Python. The current M2 increment supports scalar functions, functional modules, recursively immutable tuples, stable source constants, checked calls and recursion, nested functions, stable captures, and controlled defaults. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
-The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux** (`cpython-3.13.1`). Other patch versions, free-threaded builds, other interpreters, and Windows fail the target gate. Installing the package under another Python 3.13 patch does not establish target compatibility.
+The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux** (`cpython-3.13.1`). Other patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Installation under another Python 3.13 patch does not establish compatibility.
 
-## Install and try it
-
-From this checkout, use a `python3.13` executable whose `--version` reports `Python 3.13.1`:
+## Install and run
 
 ```sh
 python3.13 --version
@@ -15,16 +13,13 @@ python3.13 -m venv .venv
 python -m pip install -e .
 pyalamode check examples/scalar.py
 python examples/scalar.py
+pyalamode check examples/modules --no-cache
+python -m examples.modules.demo
 ```
 
-The strict check passes with one selected function and two inspected ordinary same-file calls. Execution prints:
+The scalar example prints `1300` and `0`. The module example prints `1500`, `6`, `6`, and `2`. Its checked core uses stable imports, defaults, a closure, a recursive calculation, and tuple inputs; its ordinary demo prints those results without receiving a purity claim.
 
-```text
-1300
-0
-```
-
-The calculation in [examples/scalar.py](examples/scalar.py) is ordinary Python:
+One function can opt in with the runtime identity marker:
 
 ```python
 from pyalamode import fun
@@ -39,92 +34,83 @@ def discounted_total(cents: int, discount_cents: int) -> int:
     return result
 ```
 
-Each continuing branch initializes `result` once. The example's ordinary shell calls it with exact integer literals, then prints the results. Printing and unrelated module initialization receive no purity claim.
-
-Build into a fresh output directory, then execute the copied file:
-
-```sh
-pyalamode build examples/scalar.py --output build/scalar-first-use
-python build/scalar-first-use/examples/scalar.py
-```
-
-The build freshly checks source and writes ordinary `.py` files plus `pyalamode-evidence.json`. It requires at least one participating function and refuses an existing output directory. Choose a new directory for another build. This is a local source artifact; checked package distribution and consumer verification are planned milestones.
-
-The same command interface is available as `python -m pyalamode`.
-
-## See a rejected change
-
-Save this as `bad_scalar.py`:
+A module can opt in without importing that marker:
 
 ```python
-from pyalamode import fun
+"""Calculation core."""
+# mode: fun
 
-@fun
-def bad_total(cents: int) -> int:
-    total = cents
-    total = total + 1
-    return total
+SERVICE_FEE = 200
+
+def quote(cents: int, discount_cents: int = 0) -> int:
+    return cents - discount_cents + SERVICE_FEE
 ```
 
-```sh
-pyalamode check bad_scalar.py
-pyalamode build bad_scalar.py --output build/rejected-scalar
-pyalamode explain PAL101
+The directive occurs once after any shebang, encoding declaration, and module docstring, before executable statements. A misplaced directive or region toggle fails. Module mode selects functions, nested definitions, and initialization. In an ordinary module, `@fun` selects that function and its nested definitions, defaults, annotations, captures, and dependencies; unrelated initialization stays unchecked.
+
+Projects can require module mode without source markers:
+
+```toml
+[tool.pyalamode]
+schema = 1
+require_modules = ["core/**/*.py"]
 ```
 
-Both strict commands fail with `PAL101`, including the first binding's location, and the build produces no artifact. Derive a new name instead of assigning `total` again.
+Patterns are project-relative, case-sensitive glob patterns; `**/` may match zero directories. Absolute paths, parent traversal, and non-string patterns fail policy validation. Required mode also applies to discovered local dependencies matching the policy. Other accepted configuration values remain the closed defaults documented in the specification.
 
-Unknown operations also fail. For example, replacing the function body with `return round(cents)` produces `PAL230`: `round` is outside M1's approved call vocabulary. A call to another `@fun` function inside a selected function is also outside M1; checked call graphs are planned for milestone 2.
+## Exact contracts
 
-To inspect findings without establishing strict evidence:
+Every parameter and result has an explicit supported annotation. Analyzed calls establish the actual value and callable contracts; ordinary annotations alone cannot establish exact runtime inputs.
 
-```sh
-pyalamode check --audit bad_scalar.py
-pyalamode check --audit --json bad_scalar.py
-pyalamode explain PAL230
-pyalamode explain abs
-pyalamode explain fun
-```
-
-Audit reports violations and labels its contracts unverified. Findings alone return status 0 in audit mode. Strict verification failures return 1; tooling, syntax, policy, and unsupported-target failures return 2. Audit still fails for tooling errors. The checker parses application source without importing it or executing annotations, defaults, or decorators.
-
-## What M1 checks
-
-Selected code consists of top-level functions with one statically resolved `@fun` marker, explicit scalar parameter/result annotations, and no defaults, nesting, or other decorators. The marker may be imported from `pyalamode`; exact types are `int`, `bool`, `str`, `bytes`, and `None` (or `NoneType` imported from `types`). An `int` contract excludes `bool` and all `int` subclasses.
-
-| Area | Supported vocabulary |
+| Contract | Admitted syntax and meaning |
 | --- | --- |
-| Statements | Simple local assignments, `if`/`elif`/`else`, `return`, `pass` |
-| Integers | Unary `+`/`-`; binary `+`, `-`, `*`, `//`, `%`; same-type comparisons |
-| Strings and bytes | Same-type concatenation, equality and ordering |
-| Booleans | `not`, `and`, `or`, equality; exact boolean branch conditions |
-| Other expressions | Scalar literals and names, conditional expressions, supported `is None`/`is not None` tests |
-| Calls | `abs(int)`; `len(str_or_bytes)`; `min`/`max` with two or more positional arguments of one exact `int`, `str`, or `bytes` type |
+| Scalars | Exact `int`, `bool`, `str`, `bytes`, `None`; stable `types.NoneType` imports; supported quoted annotations |
+| Tuples | Fixed `tuple[int, str]`, homogeneous `tuple[int, ...]`, empty `tuple[()]`; recursive exact immutable data, excluding subclasses and callable payloads |
+| Callables | Stable `typing` or `collections.abc` `Callable[[int, str], int]`; fixed positional pure invocation with exact admitted inputs/result and stable captures |
 
-Floor division and remainder disclose `ZeroDivisionError`. M1 rejects loops, comprehensions, mutable containers, imports inside selected functions, application globals, arbitrary calls, methods, recursion, exceptions written by the user, async code, and unsupported operators. It also rejects analyzed replacement of approved bindings. No configuration is required for this subset. `# mode: fun` and policy-selected modules belong to the planned functional-modules milestone.
+Callable parameters express a required input contract. They do not turn an unknown function, lambda, protocol, or ordinary annotated parameter into checked pure evidence. Checked callers supply resolved checked functions or pass a callable already established by their own input contract. Callable annotations allow nested callable inputs/results, but exclude `Any`, ellipsis signatures, variadics, and keyword-only callback shapes. Optional positional defaults and positional-only parameters are compatible when the complete fixed positional call fits. Direct checked calls also support normal positional-only, positional-or-keyword, keyword-only, and default arguments.
 
-## Caller obligations and evidence
+A generic admitted callable has the finite invocation failure upper bound **`ZeroDivisionError` and `RecursionError`**, the current closed operation universe. Conditional callback invocation propagates that bound. Concrete direct targets retain their characterized transitive failures. Reports disclose concrete callback defaults, captures, and returned targets when established.
 
-A successful strict gate covers the selected scalar functions and inspected direct same-file calls. It does not certify ordinary shell behavior or unrelated module initialization. An empty selection can pass `check`, but establishes no participating export claim; `build` rejects an empty selection.
+Stable constants require a single characterized source initialization and no analyzed replacement. Upper-case spelling, `Final`, hashability, a current integer object, and an annotation do not establish stability. A nested function can capture admitted immutable values and checked callables. Changing cells fail, and every required cell must be initialized before a closure is invoked or escapes. Recursion is admitted without a termination claim.
 
-An ordinary caller must supply the exact declared scalar types. Unknown inputs at an inspected same-file call produce `PAL221`; an ordinary parameter annotation alone does not establish an exact runtime input. Calls from other files and dynamic dispatch remain the caller's responsibility. Public contracts and caller obligations appear in `check --json` and build evidence.
+## Supported source
 
-The behavior claim assumes approved builtin, marker, annotation, and function bindings remain unchanged during execution. An unchecked caller that monkey-patches those dependencies or passes a subclass violates that claim's preconditions. The trusted foundation is CPython 3.13.1's supported scalar operations and the Pyalamode marker; arbitrary external operations are excluded. Resource exhaustion and interruption are outside the characterized failures. The checker does not prove termination or business-rule correctness.
+The scalar operations remain integer unary `+`/`-`, integer `+`/`-`/`*`/`//`/`%`, same-type integer/string/bytes comparisons, string/bytes concatenation, boolean `not`/`and`/`or`/equality, right-hand literal `is None`/`is not None`, and conditional expressions. Approved builtin signatures are `abs(int)`, `len(str|bytes|admitted_tuple)`, and two-or-more homogeneous positional `min`/`max` over exact `int`, `str`, or `bytes`. Division and remainder disclose `ZeroDivisionError`.
 
-At runtime, `fun(function)` returns that same function object. It does not wrap, register, validate arguments, enforce purity, or create checked evidence. Running a file containing `@fun` is ordinary Python execution; a successful current check/build supplies the static evidence. Boundary guards are planned for milestone 4.
+Statements include one-name initialization, annotated initialization, `if`/`elif`/`else`, `return`, `pass`, docstrings, and checked nested function definitions. Each reachable binding initializes once. Exclusive branches may initialize the same name; missing initialization and reachable reinitialization fail. Imports are module-level dependencies.
 
-Checks store disposable per-file analysis in `.pyalamode-cache/`. The cache includes source bytes, path, policy, checker/operation identities, and target/dependency identities. An unchanged warm check can reuse evidence; editing a file invalidates that file's entry. `check --no-cache` freshly analyzes every selected file, and builds always freshly analyze. Evidence describes the recorded inputs, rather than monitoring a running process.
+Module initializers and defaults use closed stable data expressions, earlier stable bindings, approved builtin calls, and checked callable references. **Calling application functions in initialization/default expressions is excluded in this increment**, even if their invocation contract is checked. Annotation expressions are parsed from the finite whitelist, and the only supported decorator is the resolved identity `fun`. Initialization failures and definition-time default failures are reported separately from function invocation failures.
 
-## Local commands and measurements
+Local imports resolve from the project root with package-before-module precedence and required package initializers. A strict module imports only characterized foundations or functional local modules. An ordinary module may separately perform unchecked initialization before using checked exports. Unresolved external APIs receive no trusted admission. A local file named `pyalamode`, `typing`, `types`, or `collections` cannot acquire foundation behavior through its spelling.
+
+Loops, comprehensions, destructuring, tuple indexing/slicing/comparison, classes/records, mutable containers, arbitrary methods, reflection, generators, async, user exceptions/handlers, persistent collections, external trust approvals, and effects remain excluded. Dynamic ordinary dispatch stays the ordinary caller's responsibility. The checker is conservative about unknown aliases, ordinary control flow, and cells outside a checked enclosing scope.
+
+## Check, build, and inspect
 
 ```sh
-pyalamode check examples/scalar.py --json
-pyalamode check examples/scalar.py --no-cache
-pyalamode check examples/scalar.py --root . --target cpython-3.13.1
-python -m unittest discover -s tests -p 'm01*.py'
-python benchmarks/m01_scalar.py --output /tmp/pyalamode-m01-scalar.json
+pyalamode check examples/modules --json
+pyalamode build examples/modules --output build/modules-first-use
+python -m examples.modules.demo
+pyalamode check --audit tests/fixtures/m02/changing_capture.py
+pyalamode explain PAL240
+pyalamode explain tuple
+pyalamode explain Callable
 ```
 
-The dependency-free benchmark generates a temporary scalar workload, checks an empty cache, repeats with unchanged sources, then edits one file. It verifies every file's expected cache behavior and records timings and Python allocations from `tracemalloc`. Its JSON includes workload size, dependency fanout, Python/build details, OS, hardware, conditions, and per-file cache hits. Run it on the exact supported interpreter; compare measurements only with their recorded conditions. These results do not establish a universal performance target.
+A build freshly checks the selected source and its resolved local dependencies, copies unchanged Python bytes into a fresh output directory, and writes `pyalamode-evidence.json`. To run that copied module example, enter the output directory and run `python -m examples.modules.demo` with the installed Pyalamode library available. Builds require a participating function or functional module, reject existing outputs, and publish no artifact after a failed gate or freshness check. Package distribution and consumer verification are later milestones.
 
-The planned roadmap adds functional modules and checked call graphs, persistent collections, records and boundary guards, characterized effects and integrations, editor/migration tools, and checked package distribution. Those capabilities are not supplied by M1. See [the composite specification](SPEC-sol6.1-composite.md) for proposed later milestones.
+Strict failures return status 1. Tooling, syntax, policy, and unsupported-target errors return 2. Audit findings alone return 0, label evidence unverified, and leave ordinary behavior unchanged. An empty ordinary selection may pass `check` but supplies no participating function or module claim. The same commands are available as `python -m pyalamode`.
+
+At runtime, `fun(function)` returns that identical function object. It does not wrap, register, guard, or create check evidence. Ordinary callers must provide exact recursively admitted inputs and checked callable contracts, and leave resolved dependencies/captures unchanged. Unchecked monkey-patching violates the execution precondition; no runtime dependency monitor or argument guard is installed. Resource exhaustion, interruption, interpreter tampering, and arbitrary dynamic Python are outside the guarantee.
+
+Disposable `.pyalamode-cache` entries include source bytes, target, policy, product identities, transitive local import bytes, resolution identities, and relevant analyzed binding replacements. An unchanged warm check reuses body evidence. A dependency edit invalidates its import closure; unrelated modules can retain hits. Adding an ordinary writer that replaces a referenced callable or foundation binding also invalidates affected evidence. Import closures are conservative: unused local imports and unrelated edits within an imported file can invalidate callers. Missing or corrupt cache entries trigger fresh checking. Builds bypass the cache and recheck source/dependency bytes and policy before publication.
+
+## Verification and handoff
+
+```sh
+python -m unittest discover -s tests -p 'm0*.py' -v
+python benchmarks/m01_scalar.py --output /tmp/pyalamode-m01.json
+```
+
+The M2 suite inherits M1's adversarial guarantees and covers module selection, recursive tuple contents, closure timing, defaults/annotation hooks, callable shapes/failures, source resolution, analyzed replacements, affected-file gate failure, normal artifacts, and selective cache freshness. See [the M2 handoff](Docs/milestones/02-modules.md) for concrete interfaces and limits, and [the composite specification](SPEC-sol6.1-composite.md) for later milestones.
