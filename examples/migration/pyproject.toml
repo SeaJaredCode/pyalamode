@@ -1,0 +1,4 @@
+[tool.pyalamode.migration]
+schema = 1
+reject_new_findings = true
+reject_lost_strict_coverage = true

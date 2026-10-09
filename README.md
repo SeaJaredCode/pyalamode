@@ -1,6 +1,6 @@
 # Pyalamode
 
-Pyalamode checks a functional core in ordinary Python. The current M9 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, characterized failure handlers, and a bounded standard toolkit for text, integers, UTF-8/hex, eager scan/grouping, composition, partial application and Result traversal, reviewed exact installed external operations, and local editor diagnostics, contracts, authored navigation and read-only repair previews. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
+Pyalamode checks a functional core in ordinary Python. The current M10 increment supports scalar functions, functional modules, recursive tuples, eager persistent collections, fixed typed records, persistent replacements, explicit shell snapshots and fresh exports, finite dataclass/namedtuple adapters, optional generated data guards, finite checked effectful shells with opaque capabilities, closed variants, Option/Result values, ordered validation accumulation, exhaustive finite patterns, characterized failure handlers, and a bounded standard toolkit for text, integers, UTF-8/hex, eager scan/grouping, composition, partial application and Result traversal, reviewed exact installed external operations, local editor diagnostics and repair previews, adoption queues, reviewed audit baselines and independent team policy gates. Checked callbacks, stable constants, recursion, captures, and defaults retain their existing contracts. Accepted code runs through normal Python imports and commands. Checking parses application source without importing it or evaluating its hooks.
 
 The supported check/build target is **CPython 3.13.1, standard GIL build, on macOS or Linux**, with native filesystem encoding `utf-8` and errors `surrogateescape` (`cpython-3.13.1`). Reports/cache inputs record the observed encoding, error mode and UTF-8 mode. Other native filesystem configurations, patches/minors, free-threaded builds, interpreters, and platforms fail the target gate. Ordinary live IO/environment setup checks the same filesystem condition. Installation under another Python 3.13 patch does not establish compatibility.
 
@@ -306,6 +306,43 @@ An eligible code action opens a read-only before/after diff with its source vers
 ```
 
 This command requires Pyalamode installed in that environment and speaks bounded LSP-style JSON-RPC frames on stdin/stdout. The installed console command `pyalamode editor --stdio --root /absolute/project` is also available under ordinary Python startup assumptions; it does not add interpreter isolation. The [M9 handoff](Docs/milestones/09-editor.md) specifies supported methods, UTF-16 ranges, producer coordinate metadata, provenance, freshness and preview limits. Copy [the editor core](examples/editor/core.py) into an isolated project and use [the repair cases](examples/editor/repair-cases.txt) for a feedback walkthrough. The ordinary demo prints `1300`, `Vector.of(1, 2)` and `Vector.of(1, 2, 3)`. Target-user editor repair usefulness and authoring time remain **UNMEASURED**, with zero participants/attempts; translated-source navigation remains the M14 gate.
+
+## Migration and team policy
+
+Migration views observe the full project, including dependencies and ordinary analyzed writers. Path arguments filter the displayed regions and adoption queue; eligible module/function counts still describe every captured source file and declaration. Ordinary async, methods and unsafe adapters remain visible without a checked claim. Readiness groups actual direct and retained callable edges, orders prerequisites before callers, and keeps recursive components together. Its candidate contracts are hypothetical analysis evidence; checked prerequisites require current strict source proof on disk.
+
+```sh
+pyalamode baseline --root /path/to/project --owner "maintainer" --rationale "reviewed current debt"
+pyalamode regions --root /path/to/project
+pyalamode ready --root /path/to/project
+pyalamode convert function:core:total --preview --root /path/to/project
+pyalamode convert module:core --preview --root /path/to/project
+pyalamode report --root /path/to/project --save --json
+```
+
+Conversion only proposes a finite module marker, an already available identity `@fun` marker, or an inherited conservative reassignment/persistent-update repair. The complete overlay is checked again by the actual engine with current policy and history. No command applies an edit or inserts imports, effects, approvals or suppressions. Existing source and policy files remain available for your review. Follow [the isolated migration walkthrough](examples/migration/README.md) for an existing-debt repair and ordinary function adoption.
+
+```toml
+[tool.pyalamode]
+required_exports = ["core:total"]
+
+[tool.pyalamode.migration]
+schema = 1
+baseline = ".pyalamode/baseline.json"
+reject_new_findings = true
+reject_lost_strict_coverage = true
+reject_new_trust = true
+reject_expanded_effects = true
+reject_expired_approvals = true
+reject_unsafe_weakening = true
+reject_policy_weakening = true
+```
+
+Each gate is independent and defaults to false. Exact current required exports must already be selected and verified. Historical gates require a valid local reference; first-baseline capture bypasses that missing history only. A baseline can record current non-tooling source or policy debt with command status 0 and an unverified receipt, preserving the strict/current-policy statuses and events. It never waives a source, export or expiry failure. Audit returns 0 for unchanged reviewed findings when current requirements and chosen ratchets pass; introducing a new finding fails even when other debt was fixed. Identical repeated contexts carry explicit occurrence counts; ambiguous identity requires review.
+
+`baseline --replace` requires an explicit owner/rationale and valid predecessor. Baseline history is immutable and records any validated relocation lineage. `report --compare .pyalamode/history/ID.json` compares an explicit local reference. `report --save` keeps the report command's actual status: a failing report is 1 although its successful write receipt is 0. JSON write commands return `{report, written}`. Saved records remain historical evidence; observations and publication refresh current source/writers, policy, product, installed external identities, UTC expiry and reference bytes. Approval-failure visibility follows actual required operations and preserves the inherited audit behavior; unused denied catalog entries are not source failures.
+
+`.pyalamode` records are excluded from source, alongside `.git`, `.venv`, `__pycache__`, build/dist, caches and egg-info directories. The reserved `.pyalamode-build-` directory prefix excludes temporary product staging. A user-owned output subtree outside those exclusions becomes source at the next observation. Only baseline and report-save commands write migration records. Other migration views are read-only. [The M10 handoff](Docs/milestones/10-migration.md) and [record contract](Docs/evidence/m10-policy.md) define exact identity, status and IO limits. Migration usefulness remains **UNMEASURED**, with zero participants/attempts.
 
 ## Check, build, and inspect
 

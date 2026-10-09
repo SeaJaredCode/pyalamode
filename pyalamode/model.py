@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "editor-experience-9.0"
+CHECKER_VERSION = "migration-team-policy-10.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
 OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
@@ -22,7 +22,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -47,6 +47,14 @@ RULES = {
     "PAL350": ("external operation approval is not current", "Review the exact operation contract and installed dependency identity, then record explicit owner/rationale/provenance approval within its expiry; drafts and stale approvals cannot admit."),
     "PAL351": ("unsafe ordinary adapter declaration unsupported", "Use an ordinary @unsafe(scope=nonempty_text,rationale=nonempty_text) adapter outside participating code; explicitly snapshot and validate output before a new checked computation."),
     "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
+    "PAL360": ("new reviewed audit debt", "Review each new normalized finding; fixing other debt does not offset it."),
+    "PAL361": ("strict coverage requirement failed", "Restore the selected boundary or satisfy the exact current required export."),
+    "PAL362": ("new external trust assumption", "Review the actual operation, contract and installed dependency identities."),
+    "PAL363": ("effect coverage expanded", "Review declared and required effects separately at the affected boundary."),
+    "PAL364": ("configured approval expired", "Review and renew the exact configured approval; a baseline cannot waive current expiry."),
+    "PAL365": ("unsafe adapter changed", "Review the ordinary adapter scope and behavior outside checked source."),
+    "PAL366": ("migration identity requires review", "Resolve duplicate or unavailable current identities; explicitly review ambiguous historical relocation."),
+    "PAL367": ("team policy protection weakened", "Review the explicit policy change independently of finding totals."),
 }
 
 

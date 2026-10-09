@@ -164,6 +164,23 @@ def main(argv: list[str] | None = None) -> int:
     editor = commands.add_parser("editor", help="local read-only editor protocol over stdio")
     editor.add_argument("--stdio", action="store_true", required=True)
     editor.add_argument("--root", required=True, help="existing project root")
+    for name in ("regions", "ready", "report", "baseline", "convert"):
+        command = commands.add_parser(name, help="local migration evidence and read-only adoption proposals")
+        command.add_argument("--root", help="project root")
+        command.add_argument("--target", default=TARGET)
+        command.add_argument("--json", action="store_true")
+        if name in {"regions", "ready", "report"}:
+            command.add_argument("paths", nargs="*")
+        if name == "report":
+            command.add_argument("--compare", help="project-local .pyalamode JSON reference")
+            command.add_argument("--save", action="store_true", help="save this exact report without changing the baseline")
+        elif name == "baseline":
+            command.add_argument("--owner", required=True)
+            command.add_argument("--rationale", required=True)
+            command.add_argument("--replace", action="store_true")
+        elif name == "convert":
+            command.add_argument("target_selection")
+            command.add_argument("--preview", action="store_true", required=True)
     args = parser.parse_args(argv)
     if args.command == "explain":
         explanation = explain_symbol(args.symbol, root=args.root)
@@ -175,6 +192,69 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "editor":
         from .editor import serve
         return serve(root=args.root)
+    if args.command in {"regions", "ready", "report", "baseline", "convert"}:
+        from pathlib import Path
+        from .migration import MigrationError, write_baseline, save_report
+        from .migration_views import observe, regions_view, ready_view, convert_preview, make_prepublish
+        from .project import load_policy
+        root = Path(args.root or Path.cwd()).resolve()
+        try:
+            bootstrap = False
+            if args.command == "baseline" and not args.replace:
+                policy, error = load_policy(root, root)
+                if error:
+                    raise MigrationError(error)
+                active = policy.get("migration", {}).get("baseline", ".pyalamode/baseline.json")
+                bootstrap = not (root / active).exists()
+            snapshot, state, report, reference = observe(root, getattr(args, "paths", None), target=args.target,
+                        compare=getattr(args, "compare", None), bootstrap=bootstrap)
+            status, output = report["status"], report
+            if args.command == "regions":
+                output = regions_view(snapshot, state)
+                output["status"] = status
+                output["report"] = report
+            elif args.command == "ready":
+                output = ready_view(snapshot, state)
+                output["status"] = status
+                output["report"] = report
+            elif args.command == "convert":
+                output = convert_preview(snapshot, state, args.target_selection)
+                output["report"] = report
+                if output["candidate"] is None:
+                    output["status"] = max(output["status"], report["status"])
+                status = output["status"]
+            elif args.command == "baseline" or args.command == "report" and args.save:
+                callback = make_prepublish(snapshot, state, [reference["receipt"]] if reference else [])
+                written = (write_baseline(root, state, owner=args.owner, rationale=args.rationale, replace=args.replace, prepublish=callback)
+                           if args.command == "baseline" else save_report(root, report, prepublish=callback))
+                output = {"report": report, "written": written}
+                if args.command == "baseline":
+                    status = written["status"]
+            if args.json:
+                print(json.dumps(output, indent=2, sort_keys=True))
+            else:
+                print(f"{args.command}: status {status}; current strict source {state['strict_status']}; current policy {state['current_policy_status']}; no automatic source edits.")
+                print(f"Project: {state['coverage']['selected_functions']} selected / {state['coverage']['eligible_functions']} eligible functions; {state['coverage']['checked_exports']} checked exports.")
+                if "written" in output:
+                    print(f"Recorded {output['written']['id']}: {output['written']['path']}; verified=false.")
+                    if output["written"]["history_path"]:
+                        print("History: " + output["written"]["history_path"])
+                if args.command == "ready":
+                    for group in output["groups"]:
+                        print(", ".join(group["members"]) + (": ready" if group["ready"] else ": review blockers") + "; " + json.dumps(group["blockers"]))
+                if args.command == "convert":
+                    for edit in output["edits"]:
+                        print(edit["diff"])
+                    for blocker in output["blockers"]:
+                        print(str(blocker))
+                for category, rows in report["comparison"].items():
+                    if type(rows) is list and rows:
+                        print(f"{category}: {len(rows)} event(s)")
+            return status
+        except (MigrationError, OSError, ValueError, TypeError, RecursionError, KeyError) as error:
+            output = {"schema": 1, "kind": "pyalamode-migration-tooling-error", "status": 2, "verified": False, "error": str(error)[:1024]}
+            print(json.dumps(output, indent=2, sort_keys=True) if args.json else "Migration tooling failure: " + output["error"])
+            return 2
     if args.command == "check":
         result = check_paths(args.paths, root=args.root, audit=args.audit, target=args.target, cache=not args.no_cache)
     else:

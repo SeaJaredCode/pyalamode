@@ -762,6 +762,7 @@ class FunctionInfo:
     patterns: list[dict] = field(default_factory=list)
     handlers: list[dict] = field(default_factory=list)
     direct_failures: set[str] = field(default_factory=set)
+    external_operation_sites: dict[str, set[int]] = field(default_factory=dict)
 
     @property
     def identity(self) -> str:
@@ -926,8 +927,11 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
 class SourceGraph:
     """One closed source snapshot. Local imports never fall back to executing Python."""
 
-    def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None):
+    def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None,
+                 candidate_selection: dict | None = None):
         self.root, self.policy = root, policy or {}
+        self.candidate_functions = set((candidate_selection or {}).get("functions", []))
+        self.candidate_modules = set((candidate_selection or {}).get("modules", []))
         self.integration_snapshot = self.policy.get("_integration_snapshot") or integration_snapshot(self.policy, root)
         self.integrations = {row["identity"].rsplit(".", 1)[-1]: row for row in self.integration_snapshot["catalog"]}
         self.types = {kind: TypeSpec(kind) for kind in SCALARS}
@@ -1645,7 +1649,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         required = any(fnmatch.fnmatchcase(source_relative, pattern) or PurePosixPath(source_relative).match(pattern)
                        or ("**/" in pattern and fnmatch.fnmatchcase(source_relative, pattern.replace("**/", "")))
                        for pattern in self.policy.get("require_modules", []))
-        self.module_mode = valid or required
+        self.module_mode = valid or required or self.path in self.graph.candidate_modules
         self.result.module_mode = self.module_mode
         for node in tree.body:
             if isinstance(node, ast.Import):
@@ -1688,8 +1692,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             for node in body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self.result.eligible_functions += 1
-                    selected = strict or any(self._marker_like(d) or self._effects_like(d) for d in node.decorator_list)
                     qualified = prefix + node.name
+                    selected = (strict or self.path + "::" + qualified in self.graph.candidate_functions
+                                or any(self._marker_like(d) or self._effects_like(d) for d in node.decorator_list))
                     for declaration in node.decorator_list:
                         if isinstance(declaration, ast.Call) and self.graph.reference(self, declaration.func) == "foundation:pyalamode:unsafe":
                             values = {keyword.arg: keyword.value.value for keyword in declaration.keywords if isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is str}
@@ -2617,7 +2622,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
         ordinary = [d for d in decorators if not self._effects_like(d)]
         if ordinary and (len(ordinary) != 1 or not self._marker_valid(ordinary[0])):
             self.emit("PAL120", node, "only one unchanged @fun and one finite @effects declaration are supported")
-        if not decorators and not (self.module_mode or info.parent):
+        if not decorators and not (self.module_mode or info.parent or info.identity in self.graph.candidate_functions):
             self.emit("PAL120", node, "function is not selected by module mode or a resolved marker")
         if info.parent:
             enclosing_writes = _written_names(info.parent.node.body)
@@ -2890,6 +2895,8 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if not quiet:
                 self.emit("PAL240", node, "external adapter/native/importer dependencies have analyzed replacements: " + ", ".join(sorted(self.graph.integration_dependency_replacements)))
             return UNKNOWN
+        if not quiet:
+            self.active.external_operation_sites.setdefault("integrations." + name, set()).add(node.lineno)
         if row["admission"] != "approved":
             if not quiet:
                 self.emit("PAL350", node, row["identity"] + " approval is " + row["admission"] + (": " + row["identity_error"] if row["identity_error"] else ""), origin="external operation policy")

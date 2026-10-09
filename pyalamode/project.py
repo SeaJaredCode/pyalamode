@@ -24,7 +24,7 @@ from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckRe
 from .standard_contracts import STANDARD_VERSION, operation_catalog
 from .integration_contracts import INTEGRATION_VERSION, integration_snapshot, validate_policy
 
-_EXCLUDED = frozenset({".git", ".venv", "__pycache__", "build", "dist", ".pyalamode-cache"})
+_EXCLUDED = frozenset({".git", ".venv", "__pycache__", "build", "dist", ".pyalamode-cache", ".pyalamode"})
 
 
 @dataclass
@@ -39,10 +39,22 @@ class ProjectResult:
     debug_coverage: list[dict] = field(default_factory=list)
     integration_catalog: list[dict] = field(default_factory=list)
     integration_approvals: list[dict] = field(default_factory=list)
+    source_status: int | None = None
+    current_policy_status: int = 0
+    historical_policy_status: int = 0
+    policy_diagnostics: list[Diagnostic] = field(default_factory=list)
+    migration: dict | None = None
+    current_policy_events: dict = field(default_factory=lambda: {"required_exports": [], "expired_approvals": [], "approval_failures": []})
 
     @property
     def status(self) -> int:
-        return max([0] + [r.status for r in self.results] + ([2] if self.tooling else []))
+        # Source refusals can arrive during build publication after the initial
+        # source axis was saved. Policy projections are not source diagnostics.
+        source = self.source_status or 0
+        for file in self.results:
+            rows = [d for d in file.diagnostics if d.rule not in {"PAL360", "PAL361", "PAL362", "PAL363", "PAL364", "PAL365", "PAL366", "PAL367"}]
+            source = max(source, 2 if any(d.rule in {"PAL001", "PAL002"} for d in rows) else int(bool(rows) and file.mode == "strict"))
+        return max(source, self.current_policy_status, self.historical_policy_status, 2 if self.tooling else 0)
 
     @property
     def verified(self) -> bool:
@@ -58,6 +70,11 @@ class ProjectResult:
                 "integration_approvals": copy.deepcopy(self.integration_approvals),
                 "mode": "audit" if self.audit else "strict",
                 "verified": self.verified, "status": self.status,
+                "source_status": self.source_status if self.source_status is not None else self.status,
+                "current_policy_status": self.current_policy_status,
+                "historical_policy_status": self.historical_policy_status,
+                "policy_diagnostics": [asdict(d) for d in self.policy_diagnostics],
+                "migration": copy.deepcopy(self.migration),
                 "elapsed_seconds": self.elapsed_seconds, "output": self.output,
                 "boundary_guards": self.boundary_guards, "guarded_exports": self.guarded_exports,
                 "debug_coverage": self.debug_coverage,
@@ -89,8 +106,15 @@ def _policy_identity(root):
     return hashlib.sha256(path.resolve().read_bytes()).hexdigest() if path.exists() else None
 
 
+def _owned_source_bytes(path, root):
+    resolved = Path(path).resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("source resolves outside project; refused before reading")
+    return resolved.read_bytes()
+
+
 def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=True,
-                   overlays=None) -> ProjectSnapshot:
+                   overlays=None, _candidate_selection=None, _migration_history=True) -> ProjectSnapshot:
     """Use the same policy/resolution/writer/approval/guard engine as check/build.
 
     Overlays are existing project-local .py files with decoded text and versions.
@@ -111,18 +135,19 @@ def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=T
             errors.append(diagnostic("PAL001", str(candidate), "editor overlay requires existing project-local Python source, decoded text and nonnegative integer version", origin="editor snapshot"))
         else:
             normalized[str(candidate)] = entry
-    captured = {}
+    captured = {"overlay_versions": {path: entry["version"] for path, entry in normalized.items()}}
     products = foundation_identities()
     try:
         policy_hash = _policy_identity(project_root)
-        overlay_disk = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in normalized}
+        overlay_disk = {path: hashlib.sha256(_owned_source_bytes(path, project_root)).hexdigest() for path in normalized}
         if (project_root / "pyproject.toml").exists() and not (project_root / "pyproject.toml").resolve().is_relative_to(project_root):
             errors.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), "editor project policy resolves outside workspace", origin="editor snapshot"))
         if errors:
             result = ProjectResult(tooling=errors, audit=audit)
         else:
             result = check_paths(selected, root=project_root, audit=audit, target=target, cache=cache,
-                                 _overlays={path: entry["text"] for path, entry in normalized.items()}, _capture=captured, _read_root=project_root)
+                                 _overlays={path: entry["text"] for path, entry in normalized.items()}, _capture=captured, _read_root=project_root,
+                                 _candidate_selection=_candidate_selection, _migration_history=_migration_history)
         raw_sources = captured.get("raw_sources", {})
         source_inputs = {path: {"sha256": hashlib.sha256(raw).hexdigest(),
                                "origin": "overlay" if path in normalized else "disk",
@@ -131,13 +156,14 @@ def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=T
                          for path, raw in raw_sources.items()}
         inputs = {"root": str(project_root), "paths": [str(Path(p).resolve()) for p in selected],
                   "audit": audit, "target": target, "sources": source_inputs, "policy_sha256": policy_hash,
+                  "analysis": {"candidate_selection": copy.deepcopy(_candidate_selection), "migration_history": _migration_history},
                   "product_artifacts": products,
                   "integration_inputs": captured.get("integration_snapshot", {}).get("inputs", {})}
         stale = []
         for path, entry in source_inputs.items():
             if not Path(path).is_relative_to(project_root):
                 stale.append("source resolves outside workspace: " + path)
-            elif hashlib.sha256(Path(path).read_bytes()).hexdigest() != entry["disk_sha256"]:
+            elif hashlib.sha256(_owned_source_bytes(path, project_root)).hexdigest() != entry["disk_sha256"]:
                 stale.append("source changed during snapshot: " + path)
         if policy_hash != _policy_identity(project_root):
             stale.append("policy changed during snapshot")
@@ -155,6 +181,7 @@ def check_snapshot(paths=None, *, root=None, audit=False, target=TARGET, cache=T
     except (OSError, UnicodeError, ValueError, TypeError) as error:
         result = ProjectResult(tooling=[diagnostic("PAL001", str(project_root), "cannot capture editor project snapshot: " + str(error), origin="editor snapshot")], audit=audit)
         inputs = {"root": str(project_root), "paths": [str(p) for p in selected], "audit": audit, "target": target,
+                  "analysis": {"candidate_selection": copy.deepcopy(_candidate_selection), "migration_history": _migration_history},
                   "sources": {}, "policy_sha256": None, "product_artifacts": products, "integration_inputs": {}}
         stale = ["snapshot input capture failed"]
     freshness = "current overlay snapshot; unsaved" if normalized else "current disk snapshot"
@@ -198,7 +225,7 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
     path = root / "pyproject.toml"
     if not path.exists():
         return {}, None
-    if read_root is not None and not path.resolve().is_relative_to(read_root):
+    if not path.resolve().is_relative_to(read_root or root):
         return {}, "editor project policy resolves outside workspace; refused before reading"
     try:
         data = tomllib.loads(path.resolve().read_text(encoding="utf-8"))
@@ -211,7 +238,7 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
                     "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": [],
-                    "integration_manifests": [], "integration_approvals": []}
+                    "integration_manifests": [], "integration_approvals": [], "required_exports": [], "migration": {}}
         for key, value in policy.items():
             if key in {"external_trust", "integration_manifests", "integration_approvals"}:
                 error = validate_policy(policy)
@@ -240,6 +267,22 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
                     return policy, "guarded_exports must list exact public module:function selections"
                 if len(set(value)) != len(value):
                     return policy, "guarded_exports contains duplicate selections"
+            elif key == "required_exports":
+                if (type(value) is not list or any(type(selection) is not str or selection.count(":") != 1
+                        or any(not part.isidentifier() for part in selection.split(":", 1)[0].split("."))
+                        or not selection.split(":", 1)[1].isidentifier() or selection.split(":", 1)[1].startswith("_") for selection in value)
+                        or len(set(value)) != len(value)):
+                    return policy, "required_exports must list unique exact public top-level module:function selections"
+            elif key == "migration":
+                allowed = {"schema", "baseline", "reject_new_findings", "reject_lost_strict_coverage", "reject_new_trust", "reject_expanded_effects", "reject_expired_approvals", "reject_unsafe_weakening", "reject_policy_weakening"}
+                if type(value) is not dict or set(value) - allowed or type(value.get("schema")) is not int or value["schema"] != 1:
+                    return policy, "migration requires closed schema 1"
+                relative = value.get("baseline", ".pyalamode/baseline.json")
+                if (type(relative) is not str or "\\" in relative or not relative.startswith(".pyalamode/")
+                        or not relative.endswith(".json") or any(part in {"", ".", ".."} for part in relative.split("/"))):
+                    return policy, "migration baseline must be a project-relative JSON reference below .pyalamode"
+                if any(type(v) is not bool for k, v in value.items() if k.startswith("reject_")):
+                    return policy, "migration gates require exact boolean values"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
                 return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 8 configuration"
         if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
@@ -260,7 +303,7 @@ def discover_paths(paths: list[str | Path], root: Path) -> tuple[list[Path], lis
             discovered.add(path)
         elif path.is_dir():
             for directory, children, files in os.walk(path):
-                children[:] = sorted(c for c in children if c not in _EXCLUDED and not c.endswith(".egg-info"))
+                children[:] = sorted(c for c in children if c not in _EXCLUDED and not c.endswith(".egg-info") and not c.startswith(".pyalamode-build-"))
                 for name in files:
                     if name.endswith(".py"):
                         discovered.add((Path(directory) / name).resolve())
@@ -315,7 +358,8 @@ def _cache_write(cache: Path, result: CheckResult) -> None:
 
 def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | None = None,
                 audit: bool = False, target: str = TARGET, cache: bool = True,
-                _overlays=None, _capture=None, _read_root=None) -> ProjectResult:
+                _overlays=None, _capture=None, _read_root=None,
+                _candidate_selection=None, _migration_history=True) -> ProjectResult:
     started = time.perf_counter()
     project_root = Path(root or Path.cwd()).resolve()
     result = ProjectResult(audit=audit)
@@ -326,6 +370,15 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     result.boundary_guards = policy.get("boundary_guards", "off")
     if error:
         result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), error, origin="project policy"))
+    if _candidate_selection is not None:
+        if (type(_candidate_selection) is not dict or set(_candidate_selection) != {"functions", "modules"}
+                or any(type(_candidate_selection[k]) is not list or any(type(v) is not str for v in _candidate_selection[k]) for k in ("functions", "modules"))
+                or audit or cache):
+            result.tooling.append(diagnostic("PAL001", str(project_root), "candidate selection requires fresh strict analysis and exact physical identities", origin="migration candidate"))
+    if policy.get("required_exports") or "migration" in policy:
+        _read_root = project_root
+        if any(not Path(p).resolve().is_relative_to(project_root) for p in (paths or [project_root])):
+            result.tooling.append(diagnostic("PAL001", str(project_root), "team policy source selection resolves outside project; refused before reading", origin="migration ownership"))
     files, errors = discover_paths(paths or [], project_root)
     if _capture is not None:
         _capture["selected_paths"] = [str(path) for path in files]
@@ -343,6 +396,17 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     if errors:
         result.elapsed_seconds = time.perf_counter() - started
         return result
+    if _candidate_selection is not None:
+        candidates = {}
+        for path, source in sources.items():
+            for node in ast.parse(source, filename=path, feature_version=(3, 13)).body:
+                if isinstance(node, ast.FunctionDef) and not getattr(node, "type_params", []):
+                    identity = path + "::" + node.name
+                    candidates[identity] = candidates.get(identity, 0) + 1
+        if (any(candidates.get(identity) != 1 for identity in _candidate_selection["functions"])
+                or any(path not in sources for path in _candidate_selection["modules"])):
+            result.tooling.append(diagnostic("PAL001", str(project_root), "candidate selection does not resolve to unique supported current top-level declarations", origin="migration candidate"))
+            return result
     integrations = integration_snapshot(policy, project_root)
     if _capture is not None:
         _capture["integration_snapshot"] = integrations
@@ -352,7 +416,7 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         result.elapsed_seconds = time.perf_counter() - started
         return result
     dependencies = _source_dependencies(sources, project_root)
-    graph = SourceGraph(sources, project_root, audit, {**cache_policy, "_integration_snapshot": integrations})
+    graph = SourceGraph(sources, project_root, audit, {**cache_policy, "_integration_snapshot": integrations}, _candidate_selection)
     if _capture is not None:
         _capture["graph"] = graph
     contexts = {path: graph.binding_context(path, dependencies[path]) for path in sources}
@@ -389,6 +453,14 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
             result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"explicit_cases selection `{selection}` does not resolve to a checked top-level domain", origin="project pattern policy"))
     _guard_plan(result, policy, project_root, graph)
     _integration_freshness(result, integration_snapshot(policy, project_root), "check completed")
+    result.source_status = result.status
+    if not _migration_history or policy.get("required_exports") or "migration" in policy:
+        from .migration_views import apply_current_policy, integrate_team_policy
+        if _migration_history:
+            integrate_team_policy(result, project_root, policy, target, _overlays,
+                                  (_capture or {}).get("overlay_versions", {}))
+        else:
+            apply_current_policy(result, graph, policy, project_root)
     result.elapsed_seconds = time.perf_counter() - started
     return result
 
@@ -412,6 +484,8 @@ def _integration_freshness(result, snapshot, stage):
                 contract.trust = [entry for entry in contract.trust if not any(entry.startswith("external " + name + " ") for name in relevant)]
                 contract.trust.extend("external " + entry["identity"] + " contract=" + str(entry["contract_sha256"]) + " dependency=" + str(entry["dependency_sha256"]) + " approval=" + entry["admission"] for entry in contract.external_assumptions if entry["identity"] in relevant)
                 contract.trust.sort()
+    if refused and result.source_status is not None:
+        result.source_status = max(result.source_status, int(not result.audit))
     return refused
 
 
@@ -520,10 +594,10 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
         from .guardgen import debug_source, generate_facades, record_schemas
         for file in result.results:
             source = Path(file.path)
-            raw = source.read_bytes()
+            raw = _owned_source_bytes(source, project_root) if result.migration is not None else source.read_bytes()
             # Source changes during analysis/copy invalidate this gate rather than publish stale evidence.
             policy, _ = load_policy(project_root)
-            dependency_bytes = {d: hashlib.sha256(Path(d).read_bytes()).hexdigest() for d in file.dependencies}
+            dependency_bytes = {d: hashlib.sha256(_owned_source_bytes(d, project_root) if result.migration is not None else Path(d).read_bytes()).hexdigest() for d in file.dependencies}
             current_integrations = integration_snapshot(policy, project_root)
             current_inputs = {name: current_integrations["inputs"][name] for name in file.integration_inputs}
             if current_integrations["errors"] or current_inputs != file.integration_inputs:
@@ -564,10 +638,14 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
                 raise _IntegrationFreshnessError
             raise OSError("integration identity/manifest/expiry changed before artifact publication")
         for file in result.results:
-            raw = Path(file.path).read_bytes()
+            raw = _owned_source_bytes(file.path, project_root) if result.migration is not None else Path(file.path).read_bytes()
             encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
             if raw.decode(encoding) != source_snapshots[file.path]:
                 raise OSError("source changed during guard generation: " + file.path)
+        if result.migration is not None:
+            from .migration_views import make_prepublish
+            make_prepublish(result._migration_snapshot, result._migration_state,
+                            result._migration_reference_receipts)()
         staging.rename(destination)
         result.output = str(destination)
         for boundary in result.guarded_exports:
