@@ -14,6 +14,8 @@ from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckRe
                     FunctionContract, SCALARS, diagnostic, foundation_identities, runtime_environment)
 from .standard_contracts import (STANDARD_NAMES, STANDARD_NATIVE, STANDARD_VERSION,
                                  SCALAR_SIGNATURES, operation_contract, setup_contract)
+from .integration_contracts import (INTEGRATION_NAMES, INTEGRATION_FOUNDATIONS,
+                                    INTEGRATION_VERSION, integration_snapshot)
 
 BUILTINS = frozenset({"abs", "min", "max", "len"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
@@ -868,7 +870,7 @@ def _local_path(root: Path, name: str) -> Path | None:
 
 
 def _product_source(name: str, path: Path) -> bool:
-    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py", "pyalamode.variants": "variants.py", "pyalamode.failures": "failures.py", "pyalamode.standard": "standard.py", "pyalamode.standard_contracts": "standard_contracts.py"}
+    files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py", "pyalamode.variants": "variants.py", "pyalamode.failures": "failures.py", "pyalamode.standard": "standard.py", "pyalamode.standard_contracts": "standard_contracts.py", "pyalamode.integrations": "integrations.py", "pyalamode.integration_contracts": "integration_contracts.py"}
     return name in files and path == Path(__file__).resolve().parent / files[name]
 
 
@@ -915,6 +917,8 @@ class SourceGraph:
 
     def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None):
         self.root, self.policy = root, policy or {}
+        self.integration_snapshot = self.policy.get("_integration_snapshot") or integration_snapshot(self.policy, root)
+        self.integrations = {row["identity"].rsplit(".", 1)[-1]: row for row in self.integration_snapshot["catalog"]}
         self.types = {kind: TypeSpec(kind) for kind in SCALARS}
         self.analyzers: dict[str, FunctionalAnalyzer] = {}
         self.modules: dict[str, FunctionalAnalyzer] = {}
@@ -928,6 +932,8 @@ class SourceGraph:
             self.modules[_module_name(path, root)] = analyzer
         for analyzer in self.analyzers.values():
             analyzer.prepare()
+            for error in self.integration_snapshot["errors"]:
+                analyzer.result.diagnostics.append(diagnostic("PAL001", analyzer.path, error, origin="integration policy/manifest"))
         for analyzer in self.analyzers.values():
             analyzer.discover()
             analyzer.discover_records()
@@ -942,6 +948,7 @@ class SourceGraph:
         self.record_dependency_replacements: set[str] = set()
         self.effect_dependency_replacements: set[str] = set()
         self.standard_dependency_replacements: set[str] = set()
+        self.integration_dependency_replacements: set[str] = set()
         for analyzer in self.analyzers.values():
             if analyzer.tree is None:
                 continue
@@ -977,7 +984,7 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts"}:
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
                         self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
@@ -993,7 +1000,11 @@ class SourceGraph:
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
                 setter = self.reference(analyzer, node.func, aliases) if isinstance(node, ast.Call) else None
-                dictionary_writer = isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {"__setitem__", "__delitem__", "update", "clear", "pop", "popitem", "setdefault"}
+                # A resolved checked source function may have a collection
+                # mutator's spelling (e.g. calculations.add). Its body is
+                # inspected independently; the attribute call does not mutate
+                # the defining module merely because of that spelling.
+                dictionary_writer = isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and setter not in self.functions and node.func.attr in {"__setitem__", "__delitem__", "update", "clear", "pop", "popitem", "setdefault", "append", "extend", "insert", "remove", "reverse", "sort", "add", "discard"}
                 if isinstance(node, ast.Call) and (dictionary_writer or node.args and setter in {"foundation:builtins:setattr", "foundation:builtins:delattr"}):
                     reference = self.reference(analyzer, node.func.value if dictionary_writer else node.args[0], aliases)
                     if reference in self.functions:
@@ -1009,7 +1020,7 @@ class SourceGraph:
                         self.replaced_foundations.add(("pyalamode", "*"))
                         self.record_dependency_replacements.add("pyalamode.effects.*")
                         self.effect_dependency_replacements.add("pyalamode.effects.*")
-                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts"}:
+                    elif reference in {"module:pyalamode.records", "module:pyalamode.boundaries", "module:pyalamode.variants", "module:pyalamode.failures", "module:pyalamode.standard", "module:pyalamode.standard_contracts", "module:pyalamode.integrations", "module:pyalamode.integration_contracts"}:
                         self.replaced_foundations.update(("pyalamode", name) for name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | COLLECTIONS | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES)
                         self.effect_dependency_replacements.add(reference[len("module:"):] + ".*")
                         self.record_dependency_replacements.add(reference[len("module:"):] + ".*")
@@ -1024,6 +1035,18 @@ class SourceGraph:
                     elif reference and reference.startswith("foundation:"):
                         _, module, attribute = reference.split(":", 2)
                         self.replaced_foundations.add((module, attribute))
+                if isinstance(node, ast.Call):
+                    # Lending native namespaces/classes/functions to an unknown
+                    # ordinary call can expose their mutable behavior. Refuse the
+                    # affected integration assumption without executing the call.
+                    for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+                        reference = self.reference(analyzer, argument, aliases)
+                        if reference and (reference.startswith("foundation:integrations:") or reference.startswith(("foundation:binascii:", "foundation:_sha2:", "foundation:_imp:", "foundation:sys:", "foundation:importlib:")) or reference in {"module:binascii", "module:_sha2", "module:pyalamode.integrations"}):
+                            if reference.startswith("foundation:"):
+                                _, module, attribute = reference.split(":", 2)
+                                self.replaced_foundations.add((module, attribute))
+                            else:
+                                self.integration_dependency_replacements.add(reference[len("module:"):] + ".<unknown call escape>")
         for module, attributes in COLLECTION_FOUNDATIONS.items():
             for attribute in attributes:
                 replaced = ((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations
@@ -1077,6 +1100,16 @@ class SourceGraph:
             self.replaced_foundations.update(("pyalamode", name) for name in STANDARD_NAMES)
             self.effect_dependency_replacements.add("pyalamode.standard.data_foundations")
             self.replaced_foundations.update(("pyalamode", name) for name in EFFECT_PRIMITIVES)
+        for module, attributes in INTEGRATION_FOUNDATIONS.items():
+            for attribute in attributes:
+                if ((module, attribute) in self.replaced_foundations or (module, "*") in self.replaced_foundations
+                        or any(analyzer._attribute_changed(module, attribute) for analyzer in self.analyzers.values())):
+                    self.integration_dependency_replacements.add(module + "." + attribute)
+        for module in ("pyalamode.integrations", "pyalamode.integration_contracts"):
+            if any(identity.startswith(module + ".") for identity in self.record_dependency_replacements) or any(m == module for m, _ in self.replaced_foundations):
+                self.integration_dependency_replacements.add(module + ".*")
+        if any(module == "integrations" for module, _ in self.replaced_foundations):
+            self.integration_dependency_replacements.add("pyalamode.integrations.<adapter behavior>")
         # Schema families depend on every contained exact case, even when a
         # receiving function only returns its input without matching it.
         for family, cases in {"Option": ("Some", "Nothing"), "Result": ("Ok", "Err")}.items():
@@ -1125,6 +1158,8 @@ class SourceGraph:
                 return self.reference(analyzer, symbol.node.value, aliases, seen)
             if symbol.kind == "import":
                 module, name = symbol.name.split(":", 1)
+                if module == "pyalamode.integrations" and analyzer._foundation_available(module):
+                    return "foundation:integrations:" + name if name in INTEGRATION_NAMES else "module:" + module
                 if module == "pyalamode.effects" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + name if name in EFFECT_PRIMITIVES else "module:pyalamode.effects"
                 if module in {"pyalamode.standard", "pyalamode.standard_contracts"} and analyzer._foundation_available(module):
@@ -1136,7 +1171,7 @@ class SourceGraph:
                 if module == "pyalamode.collections" and analyzer._foundation_available(module):
                     return "foundation:pyalamode:" + (name if name in COLLECTIONS else "*")
                 target = self.modules.get(module)
-                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE} else None
+                return self.reference(target, ast.Name(id=name), None, seen) if target else "foundation:" + module + ":" + name if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *INTEGRATION_FOUNDATIONS} else None
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"get", "__getitem__"}:
                 namespace = self.reference(analyzer, node.func.value, aliases, seen)
@@ -1149,10 +1184,16 @@ class SourceGraph:
             reference = self.reference(analyzer, node.value, aliases, seen)
             if reference and reference.startswith("module:"):
                 return reference
+            if reference and reference.startswith("foundation:") and (reference.split(":", 2)[1] in {"integrations", "binascii", "_sha2", "_imp", "sys", "importlib", "importlib.util", "importlib.machinery"} or reference.split(":", 2)[1] == "builtins" and reference.rsplit(":", 1)[-1] in INTEGRATION_FOUNDATIONS["builtins"]):
+                return reference
             if reference and reference.startswith("foundation:pyalamode:") and reference.rsplit(":", 1)[-1] in COLLECTIONS:
                 return reference
         if isinstance(node, ast.Attribute):
             owner = self.reference(analyzer, node.value, aliases, seen)
+            if owner and owner.startswith("foundation:integrations:"):
+                return "module:pyalamode.integrations" if node.attr == "__globals__" else owner
+            if owner and owner.startswith("foundation:") and (owner.split(":", 2)[1] in {"binascii", "_sha2", "_imp", "sys", "importlib", "importlib.util", "importlib.machinery"} or owner.split(":", 2)[1] == "builtins" and owner.rsplit(":", 1)[-1] in INTEGRATION_FOUNDATIONS["builtins"]):
+                return owner
             if node.attr == "__dict__" and owner in self.functions:
                 return owner
             if node.attr == "__globals__":
@@ -1185,6 +1226,10 @@ class SourceGraph:
                 return owner
             if owner and owner.startswith("module:"):
                 module = owner.split(":", 1)[1]
+                if module in {"pyalamode.integrations", "pyalamode.integration_contracts"}:
+                    return "foundation:integrations:" + node.attr if module == "pyalamode.integrations" and node.attr in INTEGRATION_NAMES else "module:" + module
+                if module == "pyalamode" and node.attr == "integrations" and analyzer._foundation_available("pyalamode.integrations"):
+                    return "module:pyalamode.integrations"
                 if module in {"pyalamode.standard", "pyalamode.standard_contracts"}:
                     return "foundation:pyalamode:" + node.attr if node.attr in STANDARD_NAMES else "module:" + module
                 if module == "pyalamode" and node.attr in {"collections", "records", "boundaries", "variants", "failures", "standard", "standard_contracts"} and analyzer._foundation_available("pyalamode." + node.attr):
@@ -1200,7 +1245,7 @@ class SourceGraph:
                     return self.reference(target, ast.Name(id=node.attr), None, seen)
                 if module + "." + node.attr in self.modules:
                     return "module:" + module + "." + node.attr
-                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE}:
+                if module in {"pyalamode", "typing", "collections.abc", "types", "builtins", *RECORD_FOUNDATIONS, *EFFECT_FOUNDATIONS, *STANDARD_NATIVE, *INTEGRATION_FOUNDATIONS}:
                     return "foundation:" + module + ":" + node.attr
         return None
 
@@ -1246,6 +1291,8 @@ class SourceGraph:
             replacements.update(identity + ".<effect dependency>" for identity in self.effect_dependency_replacements)
         if any(("pyalamode", name) in relevant for name in STANDARD_NAMES) or ("pyalamode", "*") in relevant or any(module in {"pyalamode.standard", "pyalamode.standard_contracts"} for module, _ in relevant):
             replacements.update(identity + ".<standard dependency>" for identity in self.standard_dependency_replacements)
+        if any(module == "pyalamode.integrations" for module, _ in relevant):
+            replacements.update(identity + ".<integration dependency>" for identity in self.integration_dependency_replacements)
         for identity in self.replaced_variants:
             info = self.variants.get(identity) or self.cases.get(identity)
             if info.analyzer.path in {path} | set(dependencies):
@@ -1253,6 +1300,22 @@ class SourceGraph:
         if any(("pyalamode", name) in relevant for name in DOMAIN_PRIMITIVES) or ("pyalamode", "*") in relevant or any(symbol.kind == "variant" for symbol in analyzer.symbols.values()):
             replacements.update(identity + ".<domain dependency>" for identity in self.domain_dependency_replacements)
         return sorted(replacements)
+
+    def integration_context(self, path, dependencies):
+        """Conservative import closure; unrelated scalar files retain warm hits."""
+        selected = set()
+        for source in {path} | set(dependencies):
+            analyzer = self.analyzers[source]
+            for symbol in analyzer.symbols.values():
+                if symbol.kind == "import" and symbol.name.startswith("pyalamode.integrations:"):
+                    name = symbol.name.split(":", 1)[1]
+                    if name in INTEGRATION_NAMES:
+                        selected.add("pyalamode.integrations." + name)
+                elif symbol.kind == "module" and symbol.name == "pyalamode.integrations":
+                    selected.update(self.integration_snapshot["inputs"])
+            if analyzer._integration_imported():
+                selected.update(self.integration_snapshot["inputs"])
+        return {name: self.integration_snapshot["inputs"][name] for name in sorted(selected)}
 
     def analyze(self, cached: dict[str, CheckResult] | None = None) -> dict[str, CheckResult]:
         for path, result in (cached or {}).items():
@@ -1350,7 +1413,8 @@ class SourceGraph:
                 info.contract.callable_arguments = {n: sorted(targets) for n, targets in info.callable_arguments.items()}
                 info.contract.callable_operations = sorted({op for target in info.callable_dependencies for op in self.functions[target].operations})
                 info.contract.operations = sorted(info.operations)
-                info.contract.operation_contracts = [entry for op in sorted(info.operations) if (entry := operation_contract(op)) is not None]
+                info.contract.operation_contracts = [entry for op in sorted(info.operations) if (entry := self.operation_contract(op)) is not None]
+                info.contract.external_assumptions = [self.external_assumption(self.integrations[op.split(".", 1)[1]]) for op in sorted(info.operations) if op.startswith("integrations.")]
                 info.contract.required_effects = sorted(info.required_effects)
                 info.contract.effect_origins = {effect: sorted(paths) for effect, paths in info.effect_origins.items()}
                 missing = info.required_effects - info.declared_effects
@@ -1378,6 +1442,10 @@ class SourceGraph:
                     assumption = STANDARD_VERSION + ": finite exact data, manual decimal/UTF8, explicit eager callback/wrapper evidence and separately characterized ordinary setup"
                     if assumption not in info.contract.trust:
                         info.contract.trust.append(assumption)
+                for external in info.contract.external_assumptions:
+                    assumption = "external " + external["identity"] + " contract=" + external["contract_sha256"] + " dependency=" + str(external["dependency_sha256"]) + " approval=" + external["admission"]
+                    if assumption not in info.contract.trust:
+                        info.contract.trust.append(assumption)
                 info.analyzer.dependencies.update(info.dependencies)
         # Callable values retain their target assumptions even when the receiving
         # function does not invoke them. This does not add invocation effects.
@@ -1388,12 +1456,16 @@ class SourceGraph:
                 if not info.contract:
                     continue
                 trust = set(info.contract.trust)
+                external = {entry["identity"]: entry for entry in info.contract.external_assumptions}
                 for target in info.calls | info.callable_dependencies:
                     if self.functions[target].contract:
                         trust.update(self.functions[target].contract.trust)
+                        external.update({entry["identity"]: entry for entry in self.functions[target].contract.external_assumptions})
                 updated = sorted(trust)
-                changed |= updated != info.contract.trust
+                assumptions = [external[key] for key in sorted(external)]
+                changed |= updated != info.contract.trust or assumptions != info.contract.external_assumptions
                 info.contract.trust = updated
+                info.contract.external_assumptions = json.loads(json.dumps(assumptions))
         # A source dependency carries its own dependencies and initializer assumptions.
         changed = True
         while changed:
@@ -1433,6 +1505,16 @@ class SourceGraph:
                 if analyzer.module_mode:
                     analyzer.result.initialization_evidence = "unverified: dependency gate failed"
         return {path: analyzer.result for path, analyzer in self.analyzers.items()}
+
+    def operation_contract(self, operation):
+        if operation.startswith("integrations."):
+            return json.loads(json.dumps(self.integrations[operation.split(".", 1)[1]]))
+        return operation_contract(operation)
+
+    @staticmethod
+    def external_assumption(row):
+        fields = ("identity", "version", "effects", "failures", "initialization", "provenance", "approval", "contract_sha256", "dependency_sha256", "installed_identity", "admission")
+        return {**json.loads(json.dumps({key: row[key] for key in fields})), "source_evidence": "opaque external implementation; explicitly trusted operation contract"}
 
     def _initialization_cycles(self):
         """Finite conservative availability gate for checked import cycles.
@@ -1568,6 +1650,14 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                         if isinstance(target, ast.Name) and target.id not in self.module_aliases:
                             self.module_aliases[target.id] = self.module_aliases[node.value.id]
                             changed = True
+        for node in tree.body:
+            importing = (isinstance(node, ast.Import) and any(alias.name == "pyalamode.integrations" for alias in node.names)
+                or isinstance(node, ast.ImportFrom) and (node.module == "pyalamode.integrations" or node.module == "pyalamode" and any(alias.name == "integrations" for alias in node.names)))
+            if importing:
+                self.result.setup_observations.append({"identity": "pyalamode.integrations import", "version": INTEGRATION_VERSION,
+                    "line": node.lineno, "phase": "ordinary external import setup", "effects": ["IO"], "failures": ["ImportError", "OSError"],
+                    "backends": ["binascii", "_sha2"], "evidence": "native-loader setup is separate from approved adapter invocation; surrounding ordinary initialization/body unchecked",
+                    "policy": "not admitted in functional module initialization"})
 
     def discover(self):
         if self.tree is None:
@@ -1578,6 +1668,18 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     self.result.eligible_functions += 1
                     selected = strict or any(self._marker_like(d) or self._effects_like(d) for d in node.decorator_list)
                     qualified = prefix + node.name
+                    for declaration in node.decorator_list:
+                        if isinstance(declaration, ast.Call) and self.graph.reference(self, declaration.func) == "foundation:pyalamode:unsafe":
+                            values = {keyword.arg: keyword.value.value for keyword in declaration.keywords if isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is str}
+                            valid = (not declaration.args and len(declaration.keywords) == 2 and values.keys() == {"scope", "rationale"} and all(value.strip() for value in values.values()))
+                            if not valid or selected:
+                                self.boundary = qualified
+                                self.emit("PAL351", declaration, "unsafe is an ordinary adapter declaration requiring exact nonempty scope/rationale; it cannot select or decorate participating source")
+                                self.boundary = "<module>"
+                            self.result.unsafe_adapters.append({"name": qualified, "path": self.path, "line": node.lineno,
+                                "scope": values.get("scope"), "rationale": values.get("rationale"), "valid_declaration": valid and not selected,
+                                "source_evidence": "unchecked ordinary unsafe adapter", "behavior": "unknown; no certified effect bound",
+                                "output_boundary": "explicit exclusive snapshot/schema validation may start a new checked computation; preceding execution remains unchecked"})
                     info = None
                     if selected:
                         info = FunctionInfo(node, self, qualified, parent)
@@ -1600,6 +1702,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     for case in getattr(node, "cases", []):
                         visit(case.body, parent, prefix, strict)
         visit(self.tree.body, strict=self.module_mode)
+
+    def _integration_imported(self):
+        return self.tree is not None and any(isinstance(node, ast.Import) and any(alias.name == "pyalamode.integrations" for alias in node.names)
+            or isinstance(node, ast.ImportFrom) and node.module == "pyalamode" and any(alias.name == "integrations" for alias in node.names) for node in self.tree.body)
 
     def _effects_like(self, node):
         if not isinstance(node, ast.Call):
@@ -2020,6 +2126,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return self._constant(symbol.name, quiet)
         if symbol.kind == "import":
             module, name = symbol.name.split(":", 1)
+            if module == "pyalamode.integrations" and name in INTEGRATION_NAMES and self._foundation_available(module) and not self._module_changed(module, name):
+                return Value.exact("integration:" + name)
+            if module == "pyalamode" and name == "integrations" and self._foundation_available("pyalamode.integrations") and not self._module_changed(module, name):
+                return Value.exact("module:pyalamode.integrations")
             if module == "pyalamode" and name in COLLECTIONS and self._foundation_available(module) and not self._module_changed(module, name):
                 return Value.exact("collection_class:" + name)
             if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "pyalamode.standard"} and name in RECORD_PRIMITIVES | BOUNDARY_PRIMITIVES | EFFECT_PRIMITIVES | DOMAIN_PRIMITIVES | STANDARD_NAMES and self._foundation_available(module) and not self._module_changed(module, name) and not self._module_changed("pyalamode", name):
@@ -2428,6 +2538,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             if not self._symbol_stable(name, symbol):
                 self.emit("PAL101", node, f"import binding `{name}` has another initialization", first=self.global_writes[name][0].lineno)
             module = symbol.name.split(":", 1)[0]
+            if module == "pyalamode.integrations" or module == "pyalamode" and symbol.name == "pyalamode:integrations":
+                self.emit("PAL241", node, "external adapter import has ordinary native-loader IO setup; pure exports do not establish pure import initialization")
+                continue
             if module in {"pyalamode", "pyalamode.effects", "pyalamode.variants", "pyalamode.failures", "types", "builtins", "typing", "collections", "collections.abc", "__future__", "pyalamode.standard"} and self._foundation_available(module):
                 if symbol.kind == "import":
                     allowed = {"pyalamode.effects": EFFECT_PRIMITIVES, "pyalamode.standard": STANDARD_NAMES, "pyalamode": {"fun", *COLLECTIONS, *RECORD_PRIMITIVES, *BOUNDARY_PRIMITIVES, *EFFECT_PRIMITIVES, *DOMAIN_PRIMITIVES, *STANDARD_NAMES}, "types": {"NoneType"}, "pyalamode.variants": DOMAIN_PRIMITIVES - {"failure_value", "Failure"}, "pyalamode.failures": {"failure_value", "Failure"}, "builtins": BUILTINS | HANDLER_CATEGORIES | {"int", "bool", "str", "bytes", "tuple"}, "typing": {"Callable"}, "collections.abc": {"Callable"}, "__future__": {"annotations"}}
@@ -2672,6 +2785,7 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return reject(name + " requires exact " + str(parameters))
             self._collection_operation("standard." + name, node, quiet, failures)
             return self.annotation_value(returned)
+
         if self.definition_mode or self.initializing or not self.active:
             return reject("higher-order standard operations and wrapper construction are confined to checked function bodies")
         if name in {"compose", "partial_first"}:
@@ -2729,6 +2843,40 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             result = self._value_schema("Result", (self.graph.types[successes.kind], returned.arguments[1]))
         self._collection_operation("standard." + name, node, quiet, ("RecursionError",))
         return result
+
+    def _integration_call(self, node, env, quiet):
+        target = self._expr(node.func, env, quiet=True)
+        name = target.kind[len("integration:"):] if target.kind and target.kind.startswith("integration:") else None
+        if name not in INTEGRATION_NAMES:
+            return None
+        row = self.graph.integrations[name]
+        if self.definition_mode or self.initializing or not self.active:
+            if not quiet:
+                self.emit("PAL241", node, "external integration invocation is confined to checked function bodies after ordinary setup")
+            return UNKNOWN
+        if not quiet:
+            self.active.operations.add("integrations." + name)
+        if self.graph.integration_dependency_replacements:
+            if not quiet:
+                self.emit("PAL240", node, "external adapter/native/importer dependencies have analyzed replacements: " + ", ".join(sorted(self.graph.integration_dependency_replacements)))
+            return UNKNOWN
+        if row["admission"] != "approved":
+            if not quiet:
+                self.emit("PAL350", node, row["identity"] + " approval is " + row["admission"] + (": " + row["identity_error"] if row["identity_error"] else ""), origin="external operation policy")
+            return UNKNOWN
+        if node.keywords or len(node.args) != 1 or isinstance(node.args[0], ast.Starred):
+            if not quiet:
+                self.emit("PAL221", node, name + " requires exactly one positional-only exact bytes argument")
+            return UNKNOWN
+        value = self._expr(node.args[0], env, quiet=quiet)
+        if value.kind != "bytes":
+            if not quiet:
+                self.emit("PAL221", node.args[0], name + " requires established exact bytes, not a mutable buffer or foreign protocol")
+            return UNKNOWN
+        if not quiet:
+            self._require_effects(row["effects"], node, row["identity"])
+            self._collection_operation("integrations." + name, node, failures=row["failures"])
+        return Value.exact("bytes")
 
     def _collection_call(self, node, env, quiet):
         """Finite resolved direct methods; no arbitrary attribute dispatch or protocols."""
@@ -3349,6 +3497,10 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                     return reject("PAL240", f"resolved dependency `{module}.{node.attr}` has an analyzed replacement")
                 if module == "builtins" and node.attr in BUILTINS:
                     return Value.exact("builtin:" + node.attr)
+                if module == "pyalamode.integrations" and node.attr in INTEGRATION_NAMES and self._foundation_available(module):
+                    return Value.exact("integration:" + node.attr)
+                if module == "pyalamode" and node.attr == "integrations" and self._integration_imported() and self._foundation_available("pyalamode.integrations"):
+                    return Value.exact("module:pyalamode.integrations")
                 if module == "pyalamode" and node.attr == "standard" and self._foundation_available("pyalamode.standard"):
                     return Value.exact("module:pyalamode.standard")
                 if module == "pyalamode" and node.attr in COLLECTIONS and self._foundation_available(module):
@@ -3451,6 +3603,9 @@ class FunctionalAnalyzer(ScalarAnalyzer):
                 return reject("PAL210", "conditional expression requires exact bool")
             return self.merge_values(yes, no)
         if isinstance(node, ast.Call):
+            integration = self._integration_call(node, env, quiet)
+            if integration is not None:
+                return integration
             standard = self._standard_call(node, env, quiet)
             if standard is not None:
                 return standard

@@ -5,6 +5,7 @@ import json
 from .model import RULES, TARGET
 from .project import build_paths, check_paths
 from .standard_contracts import STANDARD_VERSION, operation_contract, operation_catalog
+from .integration_contracts import INTEGRATION_VERSION, operation_contract as external_contract, integration_snapshot
 
 
 def _show(result, structured: bool) -> None:
@@ -32,6 +33,12 @@ def _show(result, structured: bool) -> None:
     if result.output:
         print(f"Built ordinary Python source: {result.output}")
     for file in result.results:
+        for contract in file.contracts:
+            for assumption in contract.external_assumptions:
+                approval = assumption["approval"] or {}
+                print(f"External assumption {assumption['identity']} in {contract.name}: {assumption['admission']}; owner {approval.get('owner', 'unapproved')}; dependency {assumption['dependency_sha256']}; expiry {approval.get('expires_at', 'nonexpiring or unapproved')}.")
+        for adapter in file.unsafe_adapters:
+            print(f"Unsafe ordinary adapter {adapter['name']} at {file.path}:{adapter['line']}: scope {adapter['scope']}; {adapter['rationale']}; unchecked behavior.")
         for setup in file.setup_observations:
             print(f"Ordinary setup {setup['identity']} at {file.path}:{setup['line']}: effects {setup['effects']}; {setup['phase']}; surrounding initialization/body unchecked.")
     for boundary in result.guarded_exports:
@@ -58,8 +65,31 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--output", help="fresh output directory; default build/pyalamode")
     explanation = commands.add_parser("explain", help="describe a stable rule or scalar operation")
     explanation.add_argument("symbol")
+    explanation.add_argument("--root", help="project root for current integration policy and identities")
+    explanation.add_argument("--json", action="store_true", help="detached operation explanation")
     args = parser.parse_args(argv)
     if args.command == "explain":
+        external = external_contract(args.symbol)
+        if external is not None or args.symbol == "integrations":
+            from pathlib import Path
+            from .project import load_policy
+            root = Path(args.root or Path.cwd()).resolve()
+            policy, error = load_policy(root)
+            if error:
+                print(error)
+                return 2
+            snapshot = integration_snapshot(policy, root)
+            rows = [row for row in snapshot["catalog"] if external is None or row["identity"] == external["identity"]]
+            if args.json:
+                print(json.dumps({"version": INTEGRATION_VERSION, "catalog": rows, "approvals": snapshot["approvals"], "errors": snapshot["errors"]}, indent=2, sort_keys=True))
+            else:
+                for row in rows:
+                    print(f"{row['identity']} ({INTEGRATION_VERSION}): {row['signature']}\n{row['behavior']}\nEffects: {row['effects']}; failures: {row['failures']}.\nApproval: {row['admission']}; contract {row['contract_sha256']}; installed dependency {row['dependency_sha256']}.\nInitialization: {row['initialization']['evidence']}\n{row['aliases']}")
+                    if row["identity_error"]:
+                        print(row["identity_error"])
+                for error in snapshot["errors"]:
+                    print(error)
+            return 2 if snapshot["errors"] or any(row["identity_error"] for row in rows) else 0
         if args.symbol == "standard":
             print(STANDARD_VERSION + ": exact versioned standard operations; ordinary setup and invocation evidence are separate.")
             for row in operation_catalog():
@@ -82,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             "min": "min(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "max": "max(two or more exact int, str, or bytes of one type) -> same type; no iterable/key/default forms.",
             "fun": "Runtime identity marker. Execution adds no checked evidence and performs no input validation.",
+            "unsafe": "@unsafe(scope=nonempty_text,rationale=nonempty_text) returns an ordinary function unchanged. Its adapter remains outside certification; neither pure nor all-effects checked code can call unknown behavior. Explicit exclusive snapshot/schema validation may start a new checked computation without certifying the preceding adapter.",
             "record": "@record declares an exact fixed record with public typed data fields and stable defaults; required fields precede defaults. Constructor positional/keyword inputs and defaults undergo deep exact schema validation; fields cannot be reassigned/deleted. No bases, metaclasses, descriptors, methods, custom validators/constructors, callable fields, forward/recursive record declarations or forward/recursive record declarations. Finite exact record class patterns are supported with irrefutable fresh captures; guarded/partial captures are refused. Equality includes exact record identity and recursively equivalent field values; records are unhashable.",
             "variant": "@variant declares a closed top-level namespace of public nested @case classes with fixed admitted fields and stable defaults; case constructors are Domain.Case(...). Exact tags and payloads are immutable; no bases, methods, dynamic metadata, recursion or arbitrary matcher hooks. Adding a case invalidates incomplete explicit consumers.",
             "case": "Nested @case payload declarations follow fixed record field/signature rules. Match Domain.Case(fresh_capture) or known field keywords; nested exact record/case dispatch is characterized. Constrained partial or guarded patterns cannot have named captures. A deliberate final _ covers future cases unless explicit_cases=['module:Domain'] policy requires explicit coverage.",

@@ -254,6 +254,27 @@ Existing rooted whole-file IO, Clock and Environment interfaces have versioned e
 
 The [standard workflow](examples/standard/core.py) and [ordinary demo](examples/standard/demo.py) cover parsing to Result/Failure, running totals, grouping, adjusted values, UTF-8/hex and separately effectful providers. `pyalamode explain compose`, `integer_parse_decimal`, `utf8_decode` and `IOCapability.read_text` describe their contracts. Structured check/build reports include `standard_catalog`, used `operation_contracts`, recursive callable evidence and `setup_observations`. [The M7 contract](Docs/milestones/07-standard.md) and [runtime inventory](Docs/evidence/m07-runtime-contract.md) publish signatures, ordering, failures, aliases, initialization and costs. Target-user usefulness remains **UNMEASURED**; the representative tasks and measurement protocol do not imply completed user validation.
 
+## Reviewed external operations
+
+```python
+from pyalamode import fun
+from pyalamode.integrations import base64_encode, base64_decode, sha256_digest
+
+@fun
+def attachment(data: bytes) -> tuple[bytes, bytes]:
+    encoded = base64_encode(data)
+    restored = base64_decode(encoded)
+    return encoded, sha256_digest(restored)
+```
+
+`pyalamode.integrations-v1` has three bounded exact-bytes operations backed by the actual installed CPython 3.13.1 native `binascii` and `_sha2` artifacts. Encode and hash accept at most 1MiB. Decode accepts at most 1,398,104 encoded bytes and requires canonical padded Base64, including zero unused pad bits; malformed/noncanonical/oversized data raises `ValueError`. SHA-256 returns 32 raw bytes through private HACL state. Native backend behavior remains an explicit external assumption. Ordinary adapter import has separately reported IO/loader setup; a checked pure export does not certify that setup.
+
+External operations are denied by default. `pyalamode explain integrations --json` shows detached candidate contracts and actual path/version/byte identities without importing the adapters or backends. `python -m examples.integrations.review_policy` prints a denied local review proposal. After reviewing those identities, each explicit `[[tool.pyalamode.integration_approvals]]` table supplies `operation`, `contract_sha256`, `dependency_sha256`, nonempty `owner`, `rationale`, `provenance` and optional UTC `expires_at`; `external_trust = "approved"` selects current reviewed approvals. No command writes or silently approves policy. The [M8 contract](Docs/milestones/08-integrations.md) describes the complete closed schema and optional conservative JSON overrides. Drafts, stale identities and expired approvals cannot satisfy strict admission.
+
+Checked wrappers retain complete operation/approval identities through callers, returned/composed/captured callbacks, eager collection helpers and failure handlers. Check and build rediscover actual dependency bytes and expiry on warm runs and before artifact publication. The supported discovery layout is `sys.base_prefix/lib/python3.13/lib-dynload`, with the built-in `_imp` ABI suffix, a macOS framework `Python` core or Linux `lib/libpython3.13.so.1.0` core. Missing/custom layouts refuse. Discovery executes no sysconfig imports/getters, selected config-data source, annotations, defaults or dependency import hooks. The disk snapshot assumes ordinary unchanged importers and loaded/backend bindings at execution; analyzed native/private/global/importer writers fail closed.
+
+An ordinary `@unsafe(scope="...", rationale="...")` adapter carries visible unchecked scope/rationale and remains outside checked calls even when all effects are declared. Its isolated output may start a new checked computation after explicit `freeze(raw, exclusive=True, schema=Vector[int])`; that snapshot establishes data evidence under the exclusive-access precondition. Copying does not certify the earlier adapter behavior. The [attachment workflow](examples/integrations/core.py) and [ordinary unsafe-output demo](examples/integrations/demo.py) show both boundaries. Target-user usefulness remains **UNMEASURED**.
+
 ## Optional guards
 
 ```toml

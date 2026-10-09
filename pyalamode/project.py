@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import io
 import json
 import os
@@ -21,6 +22,7 @@ import ast
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
                     Diagnostic, FunctionContract, diagnostic, foundation_identities, runtime_environment)
 from .standard_contracts import STANDARD_VERSION, operation_catalog
+from .integration_contracts import INTEGRATION_VERSION, integration_snapshot, validate_policy
 
 _EXCLUDED = frozenset({".git", ".venv", "__pycache__", "build", "dist", ".pyalamode-cache"})
 
@@ -35,6 +37,8 @@ class ProjectResult:
     boundary_guards: str = "off"
     guarded_exports: list[dict] = field(default_factory=list)
     debug_coverage: list[dict] = field(default_factory=list)
+    integration_catalog: list[dict] = field(default_factory=list)
+    integration_approvals: list[dict] = field(default_factory=list)
 
     @property
     def status(self) -> int:
@@ -50,6 +54,8 @@ class ProjectResult:
                 "operation_contract": OPERATION_VERSION, "product_artifacts": foundation_identities(),
                 "runtime_environment": runtime_environment(),
                 "standard_operation_version": STANDARD_VERSION, "standard_catalog": operation_catalog(),
+                "integration_version": INTEGRATION_VERSION, "integration_catalog": copy.deepcopy(self.integration_catalog),
+                "integration_approvals": copy.deepcopy(self.integration_approvals),
                 "mode": "audit" if self.audit else "strict",
                 "verified": self.verified, "status": self.status,
                 "elapsed_seconds": self.elapsed_seconds, "output": self.output,
@@ -81,8 +87,9 @@ def runtime_error(target: str = TARGET) -> str | None:
 
 
 def sysconfig_free_threaded() -> bool:
-    import sysconfig
-    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    # CPython3.13's free-threaded build ABI has `t`. A sysconfig getter can
+    # import environment-selected or shadowed config-data Python source.
+    return "t" in sys.abiflags
 
 
 def load_policy(root: Path) -> tuple[dict, str | None]:
@@ -99,9 +106,14 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
             return {}, "tool.pyalamode must be a table"
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
                     "boundary_guards": "off", "external_trust": "deny", "builders": False,
-                    "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": []}
+                    "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": [],
+                    "integration_manifests": [], "integration_approvals": []}
         for key, value in policy.items():
-            if key == "require_modules":
+            if key in {"external_trust", "integration_manifests", "integration_approvals"}:
+                error = validate_policy(policy)
+                if error:
+                    return policy, error
+            elif key == "require_modules":
                 if type(value) is not list or any(type(pattern) is not str or not pattern or pattern.startswith("/") or ".." in Path(pattern).parts or "\\" in pattern for pattern in value):
                     return policy, "require_modules must be a list of nonempty project-relative glob patterns"
             elif key == "explicit_cases":
@@ -125,7 +137,7 @@ def load_policy(root: Path) -> tuple[dict, str | None]:
                 if len(set(value)) != len(value):
                     return policy, "guarded_exports contains duplicate selections"
             elif key not in expected or type(value) is not type(expected[key]) or value != expected[key]:
-                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 7 configuration"
+                return policy, f"unsupported policy field/value {key}={value!r}; use the closed milestone 8 configuration"
         if policy.get("boundary_guards", "off") == "off" and policy.get("guarded_exports"):
             return policy, "guarded_exports conflicts with boundary_guards=off"
         if policy.get("boundary_guards") == "exports" and not policy.get("guarded_exports"):
@@ -172,7 +184,8 @@ def _cache_read(cache: Path, key: str, path: str, audit: bool) -> CheckResult | 
                              initialization_evidence=payload.get("initialization_evidence", "unchecked ordinary module initialization"),
                              dependencies=payload.get("dependencies", {}), initialization_failures=payload.get("initialization_failures", []),
                              binding_context=payload.get("binding_context", []), records=payload.get("records", []), variants=payload.get("variants", []),
-                             setup_observations=payload.get("setup_observations", []))
+                             setup_observations=payload.get("setup_observations", []),
+                             unsafe_adapters=payload.get("unsafe_adapters", []), integration_inputs=payload.get("integration_inputs", {}))
         # Audit and strict are distinct cache keys; never upgrade cached audit evidence.
         if payload["mode"] != result.mode:
             return None
@@ -221,12 +234,19 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
     if errors:
         result.elapsed_seconds = time.perf_counter() - started
         return result
+    integrations = integration_snapshot(policy, project_root)
+    result.integration_catalog, result.integration_approvals = integrations["catalog"], integrations["approvals"]
+    if integrations["errors"]:
+        result.tooling.extend(diagnostic("PAL001", str(project_root), error, origin="integration manifests") for error in integrations["errors"])
+        result.elapsed_seconds = time.perf_counter() - started
+        return result
     dependencies = _source_dependencies(sources, project_root)
-    graph = SourceGraph(sources, project_root, audit, cache_policy)
+    graph = SourceGraph(sources, project_root, audit, {**cache_policy, "_integration_snapshot": integrations})
     contexts = {path: graph.binding_context(path, dependencies[path]) for path in sources}
+    external_inputs = {path: graph.integration_context(path, dependencies[path]) for path in sources}
     keys = {path: fingerprint(raw_sources[path], {**cache_policy, "path": path,
             "source_dependencies": {d: hashlib.sha256(raw_sources[d]).hexdigest() for d in sorted(dependencies[path])},
-            "binding_context": contexts[path]})
+            "binding_context": contexts[path], "integration_inputs": external_inputs[path]})
             for path in sources}
     cached = {}
     if cache:
@@ -242,6 +262,7 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         analyzed.fingerprint = keys[path]
         analyzed.dependencies = {d: hashlib.sha256(raw_sources[d]).hexdigest() for d in sorted(dependencies[path])}
         analyzed.binding_context = contexts[path]
+        analyzed.integration_inputs = external_inputs[path]
         if cache and path not in cached:
             _cache_write(cache_path, analyzed)
         result.results.append(analyzed)
@@ -254,8 +275,35 @@ def check_paths(paths: list[str | Path] | None = None, *, root: str | Path | Non
         if selection not in selected_domains:
             result.tooling.append(diagnostic("PAL001", str(project_root / "pyproject.toml"), f"explicit_cases selection `{selection}` does not resolve to a checked top-level domain", origin="project pattern policy"))
     _guard_plan(result, policy, project_root, graph)
+    _integration_freshness(result, integration_snapshot(policy, project_root), "check completed")
     result.elapsed_seconds = time.perf_counter() - started
     return result
+
+
+def _integration_freshness(result, snapshot, stage):
+    """Current external policy refusals stay status1, including crossing expiry."""
+    refused = False
+    rows = {row["identity"]: row for row in snapshot["catalog"]}
+    result.integration_catalog, result.integration_approvals = snapshot["catalog"], snapshot["approvals"]
+    for file in result.results:
+        changed = {name for name, value in file.integration_inputs.items() if snapshot["inputs"].get(name) != value}
+        for contract in file.contracts:
+            relevant = changed & {entry["identity"] for entry in contract.external_assumptions}
+            if relevant:
+                refused = True
+                file.diagnostics.append(diagnostic("PAL350", file.path, "integration identity/approval changed before " + stage + ": " + ", ".join(sorted(relevant)), line=contract.line, boundary=contract.name, origin="integration freshness"))
+                contract.source_evidence = "unverified: integration freshness changed"
+                contract.freshness = "no successful checked claim"
+                contract.behavior = "unverified behavior; no certified effect bound"
+                contract.external_assumptions = [SourceGraph.external_assumption(rows[entry["identity"]]) if entry["identity"] in relevant else entry for entry in contract.external_assumptions]
+                contract.trust = [entry for entry in contract.trust if not any(entry.startswith("external " + name + " ") for name in relevant)]
+                contract.trust.extend("external " + entry["identity"] + " contract=" + str(entry["contract_sha256"]) + " dependency=" + str(entry["dependency_sha256"]) + " approval=" + entry["admission"] for entry in contract.external_assumptions if entry["identity"] in relevant)
+                contract.trust.sort()
+    return refused
+
+
+class _IntegrationFreshnessError(Exception):
+    pass
 
 
 def _guard_plan(result, policy, root, graph):
@@ -363,7 +411,13 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
             # Source changes during analysis/copy invalidate this gate rather than publish stale evidence.
             policy, _ = load_policy(project_root)
             dependency_bytes = {d: hashlib.sha256(Path(d).read_bytes()).hexdigest() for d in file.dependencies}
-            check_key = fingerprint(raw, {**policy, "analysis_mode": "strict", "platform": sys.platform, "path": str(source), "source_dependencies": dependency_bytes, "binding_context": file.binding_context})
+            current_integrations = integration_snapshot(policy, project_root)
+            current_inputs = {name: current_integrations["inputs"][name] for name in file.integration_inputs}
+            if current_integrations["errors"] or current_inputs != file.integration_inputs:
+                if not current_integrations["errors"] and _integration_freshness(result, current_integrations, "build copy"):
+                    raise _IntegrationFreshnessError
+                raise OSError("integration identity/manifest/approval changed after checking")
+            check_key = fingerprint(raw, {**policy, "analysis_mode": "strict", "platform": sys.platform, "path": str(source), "source_dependencies": dependency_bytes, "binding_context": file.binding_context, "integration_inputs": file.integration_inputs})
             if check_key != file.fingerprint:
                 raise OSError(f"source changed after checking: {source}")
             relative = source.relative_to(base)
@@ -391,6 +445,11 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
             raise OSError("project policy changed after checking")
         if foundation_identities() != evidence["product_artifacts"]:
             raise OSError("product runtime/checker bytes changed after checking")
+        final_integrations = integration_snapshot(current_policy, project_root)
+        if final_integrations["errors"] or any(final_integrations["inputs"].get(name) != value for file in result.results for name, value in file.integration_inputs.items()):
+            if not final_integrations["errors"] and _integration_freshness(result, final_integrations, "artifact publication"):
+                raise _IntegrationFreshnessError
+            raise OSError("integration identity/manifest/expiry changed before artifact publication")
         for file in result.results:
             raw = Path(file.path).read_bytes()
             encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
@@ -402,6 +461,9 @@ def build_paths(paths: list[str | Path] | None = None, *, output: str | Path | N
             boundary["generated"] = True
         for coverage in result.debug_coverage:
             coverage["generated"] = True
+    except _IntegrationFreshnessError:
+        if staging and staging.exists():
+            shutil.rmtree(staging)
     except (OSError, ValueError, SyntaxError, TypeError, StopIteration, KeyError, RecursionError) as error:
         if staging and staging.exists():
             shutil.rmtree(staging)

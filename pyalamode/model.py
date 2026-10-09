@@ -6,10 +6,10 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "standard-operations-7.0"
+CHECKER_VERSION = "external-integrations-8.0"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-ops-7"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -22,7 +22,7 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py")}
 
 RULES = {
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
@@ -44,6 +44,8 @@ RULES = {
     "PAL320": ("capability lifetime or escape unsupported", "Use an exact capability parameter or the finite borrow scope; lend it only to checked capability slots. Capabilities cannot be data, aliases, defaults, captures or returned values."),
     "PAL330": ("pattern coverage or binding unsupported", "Use unchanged exact product cases/records with fresh irrefutable captures and explicit complete case coverage or a policy-permitted wildcard."),
     "PAL340": ("failure handler contract unsupported", "Use unchanged characterized builtin categories and opaque handler-local exception targets only through failure_value; exception state and arbitrary cleanup remain unsupported."),
+    "PAL350": ("external operation approval is not current", "Review the exact operation contract and installed dependency identity, then record explicit owner/rationale/provenance approval within its expiry; drafts and stale approvals cannot admit."),
+    "PAL351": ("unsafe ordinary adapter declaration unsupported", "Use an ordinary @unsafe(scope=nonempty_text,rationale=nonempty_text) adapter outside participating code; explicitly snapshot and validate output before a new checked computation."),
     "PAL250": ("persistent update result ignored", "Bind or return the new collection or record value; persistent updates preserve the receiver."),
 }
 
@@ -108,6 +110,7 @@ class FunctionContract:
     handlers: list[dict] = field(default_factory=list)
     operation_contracts: list[dict] = field(default_factory=list)
     callable_default_evidence: dict[str, dict] = field(default_factory=dict)
+    external_assumptions: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -129,6 +132,8 @@ class CheckResult:
     records: list[dict] = field(default_factory=list)
     variants: list[dict] = field(default_factory=list)
     setup_observations: list[dict] = field(default_factory=list)
+    unsafe_adapters: list[dict] = field(default_factory=list)
+    integration_inputs: dict[str, dict] = field(default_factory=dict)
 
     @property
     def verified(self) -> bool:
