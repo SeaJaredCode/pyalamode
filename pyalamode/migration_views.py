@@ -58,7 +58,7 @@ def _policy(policy):
             "integration_approvals": copy.deepcopy(policy.get("integration_approvals", [])),
             "required_exports": list(policy.get("required_exports", [])),
             "boundary_guards": policy.get("boundary_guards", "off"),
-            "guarded_exports": list(policy.get("guarded_exports", [])), "distribution":copy.deepcopy(policy.get("distribution")), "checked_dependencies":copy.deepcopy(policy.get("checked_dependencies",[])), "migration": migration}
+            "guarded_exports": list(policy.get("guarded_exports", [])), "distribution":copy.deepcopy(policy.get("distribution")), "checked_dependencies":copy.deepcopy(policy.get("checked_dependencies",[])), "builders":policy.get("builders",False), "migration": migration}
 
 
 def inventory(root, paths=None):
@@ -327,7 +327,7 @@ def capture_state(snapshot, policy, inventory):
             unsafe.append(row)
     modules = [row for row in boundaries if row["kind"] == "module"]
     functions = [row for row in boundaries if row["kind"] == "function"]
-    state = {"schema": 2, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
+    state = {"schema": 3, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
              "target": TARGET, "runtime_environment": runtime_environment(), "edition": EDITION, "checker": CHECKER_VERSION,
              "operation_contract": OPERATION_VERSION, "snapshot": snapshot.snapshot, "freshness": snapshot.freshness,
              "strict_status": max(snapshot.result.dependency_status,snapshot.result.source_status if snapshot.result.source_status is not None else snapshot.result.status),

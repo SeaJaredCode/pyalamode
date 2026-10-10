@@ -22,6 +22,7 @@ import ast
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
                     Diagnostic, FunctionContract, diagnostic, foundation_identities, runtime_environment)
 from .encoding_contracts import ENCODING_VERSION, operation_catalog as encoding_catalog
+from .builder_contracts import BUILDER_VERSION, operation_catalog as builder_catalog
 from .standard_contracts import STANDARD_VERSION, operation_catalog
 from .integration_contracts import INTEGRATION_VERSION, integration_snapshot, validate_policy
 
@@ -74,6 +75,7 @@ class ProjectResult:
                 "operation_contract": OPERATION_VERSION, "product_artifacts": foundation_identities(),
                 "runtime_environment": runtime_environment(),
                 "encoding_operation_version": ENCODING_VERSION, "encoding_catalog": encoding_catalog(),
+                "builder_operation_version": BUILDER_VERSION, "builder_catalog": builder_catalog(),
                 "standard_operation_version": STANDARD_VERSION, "standard_catalog": operation_catalog(),
                 "integration_version": INTEGRATION_VERSION, "integration_catalog": copy.deepcopy(self.integration_catalog),
                 "integration_approvals": copy.deepcopy(self.integration_approvals),
@@ -253,7 +255,10 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
                     "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": [],
                     "integration_manifests": [], "integration_approvals": [], "required_exports": [], "migration": {}, "distribution": {}, "checked_dependencies": []}
         for key, value in policy.items():
-            if key in {"distribution", "checked_dependencies"}:
+            if key == "builders":
+                if type(value) is not bool:
+                    return policy, "builders requires an exact boolean"
+            elif key in {"distribution", "checked_dependencies"}:
                 from .distribution import validate_distribution_policy
                 error = validate_distribution_policy(policy)
                 if error: return policy, error
@@ -756,7 +761,7 @@ def _distribution_contract_relation(payload,actual,claimed,graph,kind):
         if type(value) is list:return [normalized(v,paths) for v in value]
         if type(value) is dict:return {k:normalized(v,paths) for k,v in value.items()}
         return value
-    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","cases","case_fingerprint")
+    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","builder_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","cases","case_fingerprint")
     for key in keys:
         if normalized(actual[key],current_paths)!=normalized(claimed[key],producer_paths):raise DistributionError("producer structure disagrees with current authored declaration: "+key)
     if kind=="function":

@@ -286,10 +286,14 @@ def _callable(value,depth=0):
         if type(pair) is not list or len(pair)!=2: raise DistributionError("invalid callback pair")
         identifier(pair[0]);_callable(pair[1],depth+1)
 
-def _contract(value,kind):
+M11_FUNCTION_FIELDS = frozenset('name path line parameters returns parameter_kinds enforcement behavior source_evidence trust failures freshness boundary_protection caller_obligations defaults captures dependencies callable_targets callable_defaults return_callable_targets definition_failures operations data_assertions callable_capture_evidence return_callable_evidence invoked_targets callable_dependencies callable_arguments callable_operations effect_bound required_effects effect_origins capability_parameters borrow_scopes failure_edges direct_failures patterns handlers operation_contracts callable_default_evidence external_assumptions'.split())
+M11_PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py distribution.py encoding.py encoding_contracts.py".split())
+
+
+def _contract(value,kind, *, historical=False):
     from .migration import EFFECTS, FAILURES, _assumption, _installed, _approval, ADMISSIONS
     if kind=="function":
-        shape(value,{f.name for f in fields(FunctionContract)})
+        shape(value,M11_FUNCTION_FIELDS if historical else {f.name for f in fields(FunctionContract)})
         for key in ("parameters","defaults","captures"): schema_map(value[key])
         if not set(value["defaults"])<=set(value["parameters"]): raise DistributionError("default outside parameters")
         _schema(value["returns"]);mapping(value["parameter_kinds"])
@@ -308,6 +312,21 @@ def _contract(value,kind):
             shape(row,{"target","line","column","handled"});text(row["target"]);integer(row["line"],1);integer(row["column"],1);strings(row["handled"],FAILURES)
         for row in array(value["borrow_scopes"]):
             shape(row,{"name","interface","line","end_line","lifetime"});identifier(row["name"]);_schema(row["interface"]);integer(row["line"],1);integer(row["end_line"],row["line"]);text(row["lifetime"])
+        if not historical:
+            scopes = array(value["builder_scopes"])
+            callbacks = set()
+            for row in scopes:
+                shape(row,{"callback","parameter","element_schema","line","end_line","callback_line","callback_end_line","lifetime","operations","finalization"})
+                text(row["callback"]);identifier(row["parameter"]);_schema(row["element_schema"])
+                from .checker import _contract_type, SCALARS, COLLECTIONS, DOMAIN_TYPES, DOMAIN_CASES
+                element = _contract_type(row["element_schema"])
+                def stable(spec):
+                    return spec.name in SCALARS or spec.name.startswith(("record:","variant:","case:")) or spec.name == "Nothing" or spec.name in {"tuple",*COLLECTIONS,*DOMAIN_TYPES,*DOMAIN_CASES} and all(stable(a) for a in spec.arguments)
+                if not stable(element):raise DistributionError("builder element must be stable data")
+                if row["callback"] in callbacks or not row["callback"].startswith(value["name"]+".") or any(not part.isidentifier() for part in row["callback"].split(".")):raise DistributionError("invalid builder callback owner")
+                callbacks.add(row["callback"])
+                integer(row["line"],1);integer(row["end_line"],row["line"]);integer(row["callback_line"],1);integer(row["callback_end_line"],row["callback_line"])
+                if row["operations"] != ["append","extend"] or row["lifetime"] != "fresh callback invocation; invalidated on every exit; no alias, retention or transfer" or row["finalization"] != "automatic exact Vector result after None; construction failure publishes no result":raise DistributionError("unknown builder lifetime/finalization contract")
         for row in array(value["handlers"]):
             shape(row,{"line","categories","discharged","target","target_semantics"});integer(row["line"],1);strings(row["categories"]);strings(row["discharged"],FAILURES)
             from .checker import HANDLER_CATEGORIES
@@ -325,7 +344,8 @@ def _contract(value,kind):
         from .standard_contracts import operation_catalog
         from .encoding_contracts import operation_catalog as codecs
         from .integration_contracts import operation_catalog as integrations
-        catalogs={r["identity"]:r for r in operation_catalog()+codecs()+integrations()}
+        from .builder_contracts import operation_catalog as builders
+        catalogs={r["identity"]:r for r in operation_catalog()+codecs()+integrations()+([] if historical else builders())}
         for row in array(value["operation_contracts"]):
             mapping(row);identity=row.get("identity")
             if type(identity) is not str or identity not in catalogs: raise DistributionError("unknown operation contract")
@@ -399,7 +419,7 @@ def _diagnostic(row):
     if row["column_encoding"] not in {"utf-8-bytes","unicode-codepoints","syntax-offset","utf-16"}:raise DistributionError("unknown diagnostic coordinate")
     if row["dependency_context"] is not None:dependency_context(row["dependency_context"])
 
-def validate_installed_receipt(row):
+def validate_installed_receipt(row, *, historical=False):
     shape(row,{"schema","kind","declaration","admission","input_status","source_status","verified","complete","observed","candidate","exports","diagnostics","fingerprint"})
     if type(row["schema"]) is not int or row["schema"]!=1 or row["kind"]!="pyalamode-installed-dependency-input":raise DistributionError("unknown dependency receipt")
     _declaration(row["declaration"]);integer(row["input_status"],0,2);boolean(row["verified"]);boolean(row["complete"]);sha(row["fingerprint"])
@@ -420,7 +440,7 @@ def validate_installed_receipt(row):
         for s in c["export_selectors"]:selection(s)
         if c["identity"]["name"]!=row["declaration"]["name"] or c["identity"]["packages"]!=row["declaration"]["packages"]:raise DistributionError("candidate receipt ownership mismatch")
     if row["admission"]=="current" and (row["candidate"] is None or len(obs["owners"])!=1 or row["candidate"]["identity"]["version"]!=row["declaration"]["version"]):raise DistributionError("current receipt lacks exact current candidate owner")
-    for e in array(row["exports"]):_export(e)
+    for e in array(row["exports"]):_export(e,historical=historical)
     if row["exports"] and not row["verified"]:raise DistributionError("unverified receipt has claims")
     for d in array(row["diagnostics"]):_diagnostic(d)
 
@@ -428,12 +448,17 @@ def _identity(row):
     shape(row,{"name","version","packages","wheel_tag"});_declaration({"schema":1,**{k:row[k] for k in ("name","version","packages")}})
     if row["wheel_tag"]!="py3-none-any":raise DistributionError("unsupported wheel tag")
 
-def _export(row):
+def _export(row, *, historical=False):
     shape(row,{"selector","kind","declaration","contract","source_location","guard"});selection(row["selector"]);selection(row["declaration"])
     if row["selector"]!=row["declaration"]:raise DistributionError("export identity is not actual declaration")
     loc=row["source_location"];shape(loc,{"path","line","column","column_encoding"});relative(loc["path"]);integer(loc["line"],1);integer(loc["column"],1)
     if loc["column_encoding"]!="utf-8-bytes":raise DistributionError("unknown source coordinate")
-    _contract(row["contract"],row["kind"])
+    if historical is None and row["kind"]=="function":
+        keys=set(mapping(row["contract"]))
+        if keys==M11_FUNCTION_FIELDS:historical=True
+        elif keys=={f.name for f in fields(FunctionContract)}:historical=False
+        else:raise DistributionError("unknown function contract profile")
+    _contract(row["contract"],row["kind"],historical=historical)
     if row["contract"]["name"]!=row["selector"].split(":")[1] or row["contract"]["line"]!=loc["line"]:raise DistributionError("declaration location mismatch")
     if row["guard"] is not None:raise DistributionError("guard coverage belongs to separate inventory")
 
@@ -477,17 +502,20 @@ def _setup(row):
 
 def validate_evidence(value):
     bounded(value);shape(value,{"schema","kind","payload","sha256"})
-    if type(value["schema"]) is not int or value["schema"]!=1 or value["kind"]!="pyalamode-checked-distribution":raise DistributionError("unknown evidence schema")
+    if type(value["schema"]) is not int or value["schema"] not in {1,2} or value["kind"]!="pyalamode-checked-distribution":raise DistributionError("unknown evidence schema")
+    historical=value["schema"]==1
     sha(value["sha256"])
     if value["sha256"]!=digest(value["payload"]):raise DistributionError("evidence checksum mismatch")
     p=value["payload"];shape(p,{"identity","target","producer","inputs","modules","exports","guards","artifacts","claim_scope"});_identity(p["identity"])
     shape(p["target"],{"python","implementation","gil","platforms","filesystem_encoding","filesystem_errors"})
     for key in ("python","implementation","gil","filesystem_encoding","filesystem_errors"):text(p["target"][key],128)
     strings(p["target"]["platforms"])
-    producer=p["producer"];shape(producer,{"checker","edition","operation_contract","standard_version","integration_version","encoding_version","product_artifacts","runtime_environment"})
+    producer=p["producer"];shape(producer,{"checker","edition","operation_contract","standard_version","integration_version","encoding_version","product_artifacts","runtime_environment"} | (set() if historical else {"builder_version"}))
+    if not historical:
+        text(producer["builder_version"],128)
     for key in ("checker","edition","operation_contract","standard_version","integration_version","encoding_version"):text(producer[key])
     products=mapping(producer["product_artifacts"])
-    if set(products)!=set(foundation_identities()):raise DistributionError("unknown/incomplete product inventory")
+    if set(products)!=(M11_PRODUCTS if historical else set(foundation_identities())):raise DistributionError("unknown/incomplete product inventory")
     for d in products.values():sha(d)
     env=producer["runtime_environment"];shape(env,{"filesystem_encoding","filesystem_errors","utf8_mode"});text(env["filesystem_encoding"],128);text(env["filesystem_errors"],128);integer(env["utf8_mode"],0,1)
     inp=p["inputs"];shape(inp,{"policy_sha256","sources","checked_dependencies","integration_inputs","resolution","selection"});sha(inp["policy_sha256"])
@@ -495,7 +523,7 @@ def validate_evidence(value):
         relative(path);shape(row,{"sha256","module","ownership","shipped","participating"});sha(row["sha256"]);boolean(row["shipped"]);boolean(row["participating"])
         if row["ownership"]!="project":raise DistributionError("unknown producer source ownership")
         if row["module"] is not None:module(row["module"])
-    for name,r in mapping(inp["checked_dependencies"]).items():text(name,64);validate_installed_receipt(r)
+    for name,r in mapping(inp["checked_dependencies"]).items():text(name,64);validate_installed_receipt(r,historical=historical)
     from .migration import _integration_input,OPERATIONS,FAILURES
     for op,r in mapping(inp["integration_inputs"]).items():
         if op not in OPERATIONS:raise DistributionError("unknown integration input")
@@ -519,7 +547,7 @@ def validate_evidence(value):
     if not modules or set(inp["resolution"])!=set(modules):raise DistributionError("incomplete module inventory")
     selectors=set()
     for row in array(p["exports"],4096):
-        _export(row)
+        _export(row,historical=historical)
         mod=row["selector"].split(":")[0]
         if row["selector"] in selectors or mod not in modules or row["source_location"]["path"]!=modules[mod]["authored_path"]:raise DistributionError("duplicate/unowned export")
         selectors.add(row["selector"])
@@ -692,7 +720,7 @@ def distribution_snapshot(policy,root):
                     claimed_runtime={k for k,r in payload["artifacts"].items() if r["role"] in {"source","generated"}}
                     if not set(installed).issubset(claimed_runtime):raise DistributionError("source/artifact ownership inventory mismatch")
                     if any(name.endswith("/__init__.py") and name not in installed for name in claimed_runtime):raise DistributionError("initialized owned package required")
-                    compatible = identity == {"name":declared["name"],"version":declared["version"],"packages":declared["packages"],"wheel_tag":"py3-none-any"} and payload["producer"]["checker"]==CHECKER_VERSION and payload["producer"]["operation_contract"]==OPERATION_VERSION and payload["producer"]["product_artifacts"]==foundation_identities() and payload["producer"]["edition"]==EDITION and payload["producer"]["standard_version"]=="pyalamode.standard-v1" and payload["producer"]["integration_version"]=="pyalamode.integrations-v1" and payload["producer"]["encoding_version"]=="pyalamode.encoding-v1" and payload["target"]=={"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"}
+                    compatible = identity == {"name":declared["name"],"version":declared["version"],"packages":declared["packages"],"wheel_tag":"py3-none-any"} and payload["producer"]["checker"]==CHECKER_VERSION and payload["producer"]["operation_contract"]==OPERATION_VERSION and payload["producer"]["product_artifacts"]==foundation_identities() and payload["producer"]["edition"]==EDITION and payload["producer"]["standard_version"]=="pyalamode.standard-v1" and payload["producer"]["integration_version"]=="pyalamode.integrations-v1" and payload["producer"]["encoding_version"]=="pyalamode.encoding-v1" and payload["producer"].get("builder_version")=="pyalamode.builders-v1" and payload["target"]=={"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"}
                     receipt["admission"]="incompatible" if not compatible else "current"
                     stale=record_stale;causes=set()
                     for name,row in payload["artifacts"].items():
@@ -805,9 +833,9 @@ def build_wheel(result,capture,root,destination):
     members[info+"/WHEEL"]=("Wheel-Version: 1.0\nGenerator: "+CHECKER_VERSION+"\nRoot-Is-Purelib: true\nTag: py3-none-any\n").encode()
     from .encoding_contracts import ENCODING_VERSION
     artifacts={k:{"sha256":hashlib.sha256(v).hexdigest(),"size":len(v),"role":"generated" if k in generated else "authored" if "/sources/" in k else "metadata" if k.startswith(info) else "source"} for k,v in members.items()}
-    payload={"identity":{"name":declaration["name"],"version":declaration["version"],"packages":declaration["packages"],"wheel_tag":"py3-none-any"},"target":{"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"},"producer":{"checker":CHECKER_VERSION,"edition":EDITION,"operation_contract":OPERATION_VERSION,"standard_version":"pyalamode.standard-v1","integration_version":"pyalamode.integrations-v1","encoding_version":ENCODING_VERSION,"product_artifacts":foundation_identities(),"runtime_environment":runtime_environment()},"inputs":{"policy_sha256":hashlib.sha256(policyraw).hexdigest(),"sources":{str(Path(p).relative_to(root)):{"sha256":hashlib.sha256(v).hexdigest(),"module":graph.module_name(p) if str(Path(p).relative_to(root)) in files else None,"ownership":"project","shipped":str(Path(p).relative_to(root)) in files,"participating":bool(owned[p].module_mode or owned[p].contracts or owned[p].records or owned[p].variants)} for p,v in capture["raw_sources"].items() if Path(p).is_relative_to(root)},"checked_dependencies":public_receipts(capture["distribution_snapshot"]),"integration_inputs":capture["integration_snapshot"]["inputs"],"resolution":{m["module"]:m["authored_path"] for m in modules},"selection":{graph.module_name(r.path):r.module_mode for r in result.results}},"modules":modules,"exports":exports,"guards":{"mode":result.boundary_guards,"exports":guards,"debug":debug,"generated_files":{k:hashlib.sha256(v).hexdigest() for k,v in generated.items()}},"artifacts":artifacts,"claim_scope":"Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."}
+    payload={"identity":{"name":declaration["name"],"version":declaration["version"],"packages":declaration["packages"],"wheel_tag":"py3-none-any"},"target":{"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"},"producer":{"checker":CHECKER_VERSION,"edition":EDITION,"operation_contract":OPERATION_VERSION,"standard_version":"pyalamode.standard-v1","integration_version":"pyalamode.integrations-v1","encoding_version":ENCODING_VERSION,"builder_version":"pyalamode.builders-v1","product_artifacts":foundation_identities(),"runtime_environment":runtime_environment()},"inputs":{"policy_sha256":hashlib.sha256(policyraw).hexdigest(),"sources":{str(Path(p).relative_to(root)):{"sha256":hashlib.sha256(v).hexdigest(),"module":graph.module_name(p) if str(Path(p).relative_to(root)) in files else None,"ownership":"project","shipped":str(Path(p).relative_to(root)) in files,"participating":bool(owned[p].module_mode or owned[p].contracts or owned[p].records or owned[p].variants)} for p,v in capture["raw_sources"].items() if Path(p).is_relative_to(root)},"checked_dependencies":public_receipts(capture["distribution_snapshot"]),"integration_inputs":capture["integration_snapshot"]["inputs"],"resolution":{m["module"]:m["authored_path"] for m in modules},"selection":{graph.module_name(r.path):r.module_mode for r in result.results}},"modules":modules,"exports":exports,"guards":{"mode":result.boundary_guards,"exports":guards,"debug":debug,"generated_files":{k:hashlib.sha256(v).hexdigest() for k,v in generated.items()}},"artifacts":artifacts,"claim_scope":"Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."}
     payload["claim_scope"]=CLAIM_SCOPE
-    envelope={"schema":1,"kind":"pyalamode-checked-distribution","payload":payload,"sha256":digest(payload)}
+    envelope={"schema":2,"kind":"pyalamode-checked-distribution","payload":payload,"sha256":digest(payload)}
     bounded(envelope);validate_evidence(envelope)
     members[info+"/pyalamode/evidence.json"]=canonical(envelope)+b"\n"
     stream=io.StringIO(newline="");writer=csv.writer(stream,lineterminator="\n")

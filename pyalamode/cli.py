@@ -5,6 +5,7 @@ import json
 from .model import RULES, TARGET
 from .project import build_paths, check_paths
 from .encoding_contracts import ENCODING_VERSION, operation_catalog as codec_catalog, operation_contract as codec_contract
+from .builder_contracts import BUILDER_VERSION, operation_catalog as builder_catalog, operation_contract as builder_contract
 from .standard_contracts import STANDARD_VERSION, operation_contract, operation_catalog
 from .integration_contracts import INTEGRATION_VERSION, operation_contract as external_contract, integration_snapshot
 
@@ -91,6 +92,10 @@ def explain_symbol(symbol: str, *, root=None, snapshot=None) -> dict:
         lines.extend(external_snapshot["errors"])
         return {"symbol": symbol, "status": max(source_status, 2 if external_snapshot["errors"] or any(row["identity_error"] for row in rows) else 0),
                 "title": symbol, "text": "\n".join(lines), "contract": {"version": INTEGRATION_VERSION, "catalog": rows, "approvals": external_snapshot["approvals"], "errors": external_snapshot["errors"]}}
+    builder = builder_contract(symbol)
+    if symbol == "builders" or builder is not None:
+        rows = builder_catalog() if builder is None else [builder]
+        return {"symbol": symbol, "status": 0, "title": symbol, "text": "\n".join(r["identity"] + ": " + r["signature"] + "\n" + r["behavior"] for r in rows), "contract": {"version": BUILDER_VERSION, "catalog": rows}}
     codec=codec_contract(symbol)
     if symbol=="encoding" or codec is not None:
         rows=codec_catalog() if codec is None else [codec]

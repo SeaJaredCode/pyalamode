@@ -2,6 +2,7 @@
 
 from typing import Callable, TypeVar
 from .collections import Map, OrderedMap, Set, Vector
+from .builders import VectorBuilder, vector_build
 from .records import record, replace
 from .variants import variant, case, Option, Some, Nothing, Result, Ok, Err, accumulate
 from .encoding import value_encode, value_decode
@@ -35,7 +36,7 @@ def unsafe(*, scope: str, rationale: str):
     return declaration
 
 
-__all__ = ["value_encode", "value_decode", "variant", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate", "Failure", "failure_value", "fun", "unsafe", "Vector", "OrderedMap", "Map", "Set", "record", "replace", "freeze", "thaw", "dataclass_adapter", "namedtuple_adapter", "effects", "Effectful", "IO", "State", "Clock", "Random", "Environment",
+__all__ = ["VectorBuilder", "vector_build", "value_encode", "value_decode", "variant", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate", "Failure", "failure_value", "fun", "unsafe", "Vector", "OrderedMap", "Map", "Set", "record", "replace", "freeze", "thaw", "dataclass_adapter", "namedtuple_adapter", "effects", "Effectful", "IO", "State", "Clock", "Random", "Environment",
            "text_split", "text_join", "text_replace", "text_startswith", "text_slice",
            "integer_clamp", "integer_parse_decimal", "integer_format_decimal", "utf8_encode", "utf8_decode", "hex_encode", "hex_decode", "vector_scan", "vector_group_by", "compose", "partial_first", "result_traverse",
            "IOCapability", "StateCapability", "ClockCapability", "RandomCapability", "EnvironmentCapability",
