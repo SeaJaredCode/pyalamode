@@ -57,7 +57,7 @@ def capture(specs=(("core", "f", 1),)):
                              "context": {"kind": "ast-statement", "ast": C101},
                              "origin": "static source", "count": count, "locations": locations, "review_required": False})
     paths = sorted({row["path"] for row in rows})
-    value = {"schema": 3, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
+    value = {"schema": 4, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
              "target": "cpython-3.13.1", "runtime_environment": {"filesystem_encoding": "utf-8", "filesystem_errors": "surrogateescape", "utf8_mode": 0},
              "edition": "python-v1", "checker": CHECKER_VERSION, "operation_contract": OPERATION_VERSION,
              "snapshot": "b" * 64, "freshness": "current disk snapshot", "strict_status": int(bool(findings)),

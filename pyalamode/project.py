@@ -23,6 +23,7 @@ from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckRe
                     Diagnostic, FunctionContract, diagnostic, foundation_identities, runtime_environment)
 from .encoding_contracts import ENCODING_VERSION, operation_catalog as encoding_catalog
 from .builder_contracts import BUILDER_VERSION, operation_catalog as builder_catalog
+from .task_contracts import TASK_VERSION, operation_catalog as task_catalog
 from .standard_contracts import STANDARD_VERSION, operation_catalog
 from .integration_contracts import INTEGRATION_VERSION, integration_snapshot, validate_policy
 
@@ -76,6 +77,7 @@ class ProjectResult:
                 "runtime_environment": runtime_environment(),
                 "encoding_operation_version": ENCODING_VERSION, "encoding_catalog": encoding_catalog(),
                 "builder_operation_version": BUILDER_VERSION, "builder_catalog": builder_catalog(),
+                "task_operation_version": TASK_VERSION, "task_catalog": task_catalog(),
                 "standard_operation_version": STANDARD_VERSION, "standard_catalog": operation_catalog(),
                 "integration_version": INTEGRATION_VERSION, "integration_catalog": copy.deepcopy(self.integration_catalog),
                 "integration_approvals": copy.deepcopy(self.integration_approvals),
@@ -251,13 +253,13 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
         if not isinstance(policy, dict):
             return {}, "tool.pyalamode must be a table"
         expected = {"schema": 1, "edition": EDITION, "runtime": "cpython-3.13",
-                    "boundary_guards": "off", "external_trust": "deny", "builders": False,
+                    "boundary_guards": "off", "external_trust": "deny", "builders": False, "tasks": False,
                     "require_modules": [], "guarded_exports": [], "effect_bounds": {}, "explicit_cases": [],
                     "integration_manifests": [], "integration_approvals": [], "required_exports": [], "migration": {}, "distribution": {}, "checked_dependencies": []}
         for key, value in policy.items():
-            if key == "builders":
+            if key in {"builders", "tasks"}:
                 if type(value) is not bool:
-                    return policy, "builders requires an exact boolean"
+                    return policy, key + " requires an exact boolean"
             elif key in {"distribution", "checked_dependencies"}:
                 from .distribution import validate_distribution_policy
                 error = validate_distribution_policy(policy)
@@ -280,7 +282,7 @@ def load_policy(root: Path, read_root: Path | None = None) -> tuple[dict, str | 
                     if type(selection) is not str or selection.count(":") != 1 or any(not part.isidentifier() for part in selection.split(":", 1)[0].split(".")) or any(not part.isidentifier() for part in selection.split(":", 1)[1].split(".")):
                         return policy, "effect_bounds selectors must be exact module:function identities"
                     if type(bound) is not list or any(type(effect) is not str or effect not in EFFECT_FAMILIES for effect in bound) or len(set(bound)) != len(bound):
-                        return policy, "effect_bounds requires unique IO/State/Clock/Random/Environment family lists; Task is reserved"
+                        return policy, "effect_bounds requires unique IO/State/Clock/Random/Environment/Task family lists"
             elif key == "boundary_guards":
                 if type(value) is not str or value not in {"off", "exports", "debug"}:
                     return policy, "boundary_guards must be off, exports or debug"
@@ -761,7 +763,7 @@ def _distribution_contract_relation(payload,actual,claimed,graph,kind):
         if type(value) is list:return [normalized(v,paths) for v in value]
         if type(value) is dict:return {k:normalized(v,paths) for k,v in value.items()}
         return value
-    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","builder_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","cases","case_fingerprint")
+    keys=("name","line","parameters","parameter_kinds","returns","defaults","captures","callable_targets","callable_defaults","return_callable_targets","callable_capture_evidence","callable_default_evidence","return_callable_evidence","invoked_targets","callable_dependencies","callable_arguments","callable_operations","operations","data_assertions","borrow_scopes","builder_scopes","task_scopes","effect_bound","capability_parameters") if kind=="function" else ("name","line","schema","fields","defaults") if kind=="record" else ("name","line","schema","cases","case_fingerprint")
     for key in keys:
         if normalized(actual[key],current_paths)!=normalized(claimed[key],producer_paths):raise DistributionError("producer structure disagrees with current authored declaration: "+key)
     if kind=="function":

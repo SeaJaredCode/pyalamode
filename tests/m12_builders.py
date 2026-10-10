@@ -706,7 +706,7 @@ def assemble(clock: ClockCapability, value: int) -> Vector[int]:
     def test_parent_product_module_reference_inventory_and_parent_precedence(self):
         from pyalamode.checker import SourceGraph
         children = ('collections', 'records', 'boundaries', 'variants', 'failures', 'standard', 'standard_contracts',
-                    'encoding', 'encoding_contracts', 'builders', 'builder_contracts', 'integrations', 'integration_contracts')
+                    'encoding', 'encoding_contracts', 'builders', 'builder_contracts', 'tasks', 'task_contracts', 'integrations', 'integration_contracts')
         reference_root = self.root/'references'
         reference_root.mkdir()
         reader = reference_root/'reader.py'
@@ -761,11 +761,11 @@ def assemble(clock: ClockCapability, value: int) -> Vector[int]:
         published = next(node.value for node in root_module.body if isinstance(node, ast.Assign)
                          and any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets))
         self.assertEqual(_FACADE_PUBLIC_BINDINGS, frozenset(ast.literal_eval(published)))
-        self.assertEqual(len(_FACADE_PUBLIC_BINDINGS), 66)
+        self.assertEqual(len(_FACADE_PUBLIC_BINDINGS), 72)
         product_directory = Path(__file__).resolve().parents[1]/'pyalamode'
         product_names = {'pyalamode': '__init__.py', 'pyalamode.effects': 'effects.py',
                          **{'pyalamode.'+name:name+'.py' for name in _PRODUCT_CHILD_MODULES}}
-        self.assertEqual(len(product_names), 15)
+        self.assertEqual(len(product_names), 17)
         for module, filename in product_names.items():
             canonical = product_directory/filename
             self.assertTrue(_product_source(module, canonical))
@@ -1522,8 +1522,8 @@ class BuilderEvidenceTests(unittest.TestCase):
             self.assertEqual(len(reference['state']['inputs']['product_artifacts']), 22)
             self.assertEqual(reference['record']['id'], 'f47887db0984005546d16cb8734a2a8e08e15625ec065aded5a96f9de88be3e3')
             _, state, report, _ = observe(root)
-            self.assertEqual(state['schema'], 3)
-            self.assertEqual(len(state['inputs']['product_artifacts']), 24)
+            self.assertEqual(state['schema'], 4)
+            self.assertEqual(len(state['inputs']['product_artifacts']), 26)
             self.assertEqual(state['strict_status'], 1)
             self.assertEqual(len(report['comparison']['retained_findings']), 2)
             self.assertEqual(report['comparison']['new_findings'], [])
@@ -1558,9 +1558,9 @@ class BuilderEvidenceTests(unittest.TestCase):
             result=build_paths([root],root=root,artifact='wheel',output=output)
             self.assertEqual(result.status,0,result.to_dict())
             with zipfile.ZipFile(output) as wheel:data=json.loads(wheel.read('bulk-1.0.0.dist-info/pyalamode/evidence.json'))
-            self.assertEqual(data['schema'],2)
+            self.assertEqual(data['schema'],3)
             self.assertEqual(data['payload']['producer']['builder_version'],'pyalamode.builders-v1')
-            self.assertEqual(len(data['payload']['producer']['product_artifacts']),24)
+            self.assertEqual(len(data['payload']['producer']['product_artifacts']),26)
             d.validate_evidence(data)
             for mutate in ('row','scope','missing','hybrid','builder-type','builder-size'):
                 bad=copy.deepcopy(data)
@@ -1577,9 +1577,9 @@ class BuilderEvidenceTests(unittest.TestCase):
             plain=build_paths([root],root=root,artifact='wheel',output=root/'other/bulk-1.0.0-py3-none-any.whl')
             self.assertEqual(plain.status,0,plain.to_dict())
             with zipfile.ZipFile(plain.output) as wheel:old=json.loads(wheel.read('bulk-1.0.0.dist-info/pyalamode/evidence.json'))
-            old['schema']=1;producer=old['payload']['producer'];producer.pop('builder_version')
+            old['schema']=1;producer=old['payload']['producer'];producer.pop('builder_version');producer.pop('task_version')
             producer['product_artifacts']={k:v for k,v in producer['product_artifacts'].items() if k in d.M11_PRODUCTS}
-            for row in old['payload']['exports']:row['contract'].pop('builder_scopes')
+            for row in old['payload']['exports']:row['contract'].pop('builder_scopes');row['contract'].pop('task_scopes')
             old['sha256']=d.digest(old['payload'])
             d.validate_evidence(old)
             d._export(old['payload']['exports'][0],historical=None)

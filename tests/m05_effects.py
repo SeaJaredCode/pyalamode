@@ -175,7 +175,7 @@ class EffectsBuild(unittest.TestCase):
         self.assertEqual(check_paths([self.source],root=self.root,cache=False).status,0)
         self.policy('[tool.pyalamode.effect_bounds]\n"core:outer"=[]\n')
         self.assertEqual(check_paths([self.source],root=self.root,cache=False).status,1)
-        for text in ['effect_bounds=[]','[tool.pyalamode.effect_bounds]\n"core:missing"=["Clock"]','[tool.pyalamode.effect_bounds]\n"core:outer"=["Task"]','[tool.pyalamode.effect_bounds]\n"core:outer"=["Clock","Clock"]']:
+        for text in ['effect_bounds=[]','[tool.pyalamode.effect_bounds]\n"core:missing"=["Clock"]','[tool.pyalamode.effect_bounds]\n"core:outer"=["Unknown"]','[tool.pyalamode.effect_bounds]\n"core:outer"=["Clock","Clock"]']:
             self.policy(text+'\n');output=self.root/'bad'
             self.assertEqual(build_paths([self.source],root=self.root,output=output).status,2)
             self.assertFalse(output.exists())

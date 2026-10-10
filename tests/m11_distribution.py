@@ -39,7 +39,7 @@ class DistributionTests(unittest.TestCase):
     def test_wheel_separate_consumer_build_and_owned_capture(self):
         self.wheel();r=self.check();self.assertEqual(r.status,0,r.to_dict());self.assertTrue(r.checked_dependencies[0]['verified']);self.assertEqual(len(r.results),1)
         built=build_paths([self.consumer],root=self.consumer,output=self.base/'built');self.assertEqual(built.status,0,built.to_dict())
-        snap,state,report,_=observe(self.consumer);self.assertEqual(state['schema'],3);self.assertEqual(state['coverage']['eligible_modules'],1);self.assertEqual(state['coverage']['eligible_functions'],1);self.assertEqual(report['status'],0)
+        snap,state,report,_=observe(self.consumer);self.assertEqual(state['schema'],4);self.assertEqual(state['coverage']['eligible_modules'],1);self.assertEqual(state['coverage']['eligible_functions'],1);self.assertEqual(report['status'],0)
     def test_missing_used_complete_semantic_and_recordable(self):
         r=self.check();self.assertEqual(r.status,1);self.assertIn('PAL370',[x.rule for f in r.results for x in f.diagnostics]);self.assertTrue(r.checked_dependencies[0]['complete'])
         self.assertEqual(next(x for f in r.results for x in f.diagnostics if x.rule=='PAL370').dependency_context['reason_code'],'missing-distribution')
@@ -341,7 +341,7 @@ def quote(zulu:int,alpha:int)->int:
             row=corrupted['required_operations'][0] if sites=='required' else corrupted['current_policy_events']['approval_failures'][0]['before' if sites=='event-before' else 'after']
             row['required_by'][0]['source_owner']='project'
             with self.subTest(sites=sites),self.assertRaises(m.MigrationError):m._state(corrupted,retained=True)
-        _,state,report,_=observe(root);self.assertEqual(state['schema'],3);self.assertEqual(len(state['inputs']['product_artifacts']),24);self.assertEqual(state['strict_status'],1);self.assertEqual(len(report['comparison']['retained_findings']),2);self.assertEqual(report['comparison']['new_findings'],[])
+        _,state,report,_=observe(root);self.assertEqual(state['schema'],4);self.assertEqual(len(state['inputs']['product_artifacts']),26);self.assertEqual(state['strict_status'],1);self.assertEqual(len(report['comparison']['retained_findings']),2);self.assertEqual(report['comparison']['new_findings'],[])
         with self.assertRaises(m.MigrationError):m.write_baseline(root,reference['state'],owner='team',rationale='cannot recertify historical inputs',replace=True,prepublish=lambda:None)
         for name,text in archive['files'].items():self.assertEqual((root/name).read_bytes(),text.encode())
 
