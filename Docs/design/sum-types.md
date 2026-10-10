@@ -91,7 +91,7 @@ Stage order follows the original design note. Closed unions stand alone, unlock 
 - Runtime: `types.UnionType` and string union annotations, member validation and order canonicalization in `pyalamode/records.py`; `validate_data` canonicalizes checker schemas in `pyalamode/boundaries.py`; guard schema code in `pyalamode/guardgen.py`.
 - Explain topics `oneof` and `union` in `pyalamode/cli.py`. Example in `examples/unions/shapes.py`.
 - Tests: `tests/m06_unions.py` adds 18 tests covering the alias, positive flows, refused members, refused operations, coverage, policy, literals, shadowed builtins, payload narrowing, warm-cache freshness after a member domain gains a case, real off/exports/debug builds with rejected guarded inputs, and runtime validation. Two earlier whitelist tests now use still-refused unions (`int | float`, `bool | int`, `tuple[int | list[int]]`) instead of `int | None`.
-- The full suite (419 tests) passes natively on CPython 3.13.1 macOS. One Linux `python:3.13.1-slim` run reported 1 failure in 419 tests before its details could be captured; the rerun was blocked by a Docker Desktop file-sharing hang. Linux verification is outstanding, and that failure is unidentified.
+- Verification at `268d916`: the full suite (505 tests) passes natively on CPython 3.13.1 macOS arm64, and in Docker `python:3.13.1-slim` (CPython 3.13.1, Linux aarch64) with networking disabled. The Linux run uses `git archive HEAD` copied into the container and a `.pth` file so subprocess tests import the package, since the M9 editor test starts `python -m pyalamode.editor` in a fresh process.
 
 ## Stage 2: rename
 
