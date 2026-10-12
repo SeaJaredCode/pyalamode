@@ -12,6 +12,7 @@ import time
 import typing
 import collections.abc
 import sys
+import _thread
 from types import GenericAlias
 from . import records as _records
 from . import standard as _standard
@@ -21,10 +22,11 @@ State = "State"
 Clock = "Clock"
 Random = "Random"
 Environment = "Environment"
-_FAMILIES = (IO, State, Clock, Random, Environment)
+Task = "Task"
+_FAMILIES = (IO, State, Clock, Random, Environment, Task)
 
-__all__ = ["effects", "Effectful", "IO", "State", "Clock", "Random", "Environment",
-           "IOCapability", "StateCapability", "ClockCapability", "RandomCapability", "EnvironmentCapability",
+__all__ = ["effects", "Effectful", "IO", "State", "Clock", "Random", "Environment", "Task",
+           "IOCapability", "StateCapability", "ClockCapability", "RandomCapability", "EnvironmentCapability", "TaskCapability",
            "borrow", "live_io", "recorded_io", "state", "live_clock", "recorded_clock",
            "live_random", "recorded_random", "live_environment", "recorded_environment"]
 
@@ -217,8 +219,16 @@ class EnvironmentCapability(_Capability):
         return os.environ.get(name, default)
 
 
+class TaskCapability(_Capability):
+    """Opaque owner-thread provider for the finite top-level task operations."""
+    __slots__ = ()
+
+    def __init_subclass__(cls, **kwargs):
+        _invalid("TaskCapability", "exact capability subclasses are unsupported")
+
+
 _CAPABILITIES = ((IO, IOCapability), (State, StateCapability), (Clock, ClockCapability),
-                 (Random, RandomCapability), (Environment, EnvironmentCapability))
+                 (Random, RandomCapability), (Environment, EnvironmentCapability), (Task, TaskCapability))
 
 
 def _capability_family(kind):
@@ -243,6 +253,37 @@ def _view(kind, provider, lease):
     return capability
 
 
+def _task_metadata(provider):
+    """Check only exact private Task configuration, including revoked status."""
+    data, mode, index = provider.data, provider.mode, provider.index
+    if type(data) is not tuple or len(data) != 5:
+        _invalid("capability", "malformed task configuration")
+    workers, maximum, order, cutoff, owner = data
+    if type(workers) is not int or type(maximum) is not int or type(owner) is not int:
+        _invalid("capability", "malformed task configuration")
+    if owner <= 0 or index not in (0, 1, 2):
+        _invalid("capability", "invalid task metadata")
+    if mode == "live":
+        if not 1 <= workers <= 4 or not 1 <= maximum <= 256 or order is not None or cutoff is not None:
+            _invalid("capability", "invalid live task configuration")
+    elif mode == "controlled":
+        if workers != 1 or type(order) is not tuple or len(order) > 256 or maximum != len(order):
+            _invalid("capability", "invalid controlled task configuration")
+        for position, value in enumerate(order):
+            if type(value) is not int or not 0 <= value < len(order) or value in order[:position]:
+                _invalid("capability", "invalid controlled task order")
+        if cutoff is not None and (type(cutoff) is not int or not 0 <= cutoff <= len(order)):
+            _invalid("capability", "invalid controlled task cutoff")
+    else:
+        _invalid("capability", "invalid task provider mode")
+    return owner
+
+
+def _task_owner(provider):
+    if _task_metadata(provider) != _thread.get_ident():
+        raise RuntimeError("tasks: provider belongs to a different thread")
+
+
 def _live(capability, family=None):
     actual = _capability_family(type(capability))
     if actual is None or family is not None and actual != family:
@@ -262,9 +303,11 @@ def _live(capability, family=None):
     _exact(stored_family, str, "provider family")
     _exact(mode, str, "provider mode")
     _exact(index, int, "provider index")
-    if stored_family != actual or index < 0 or mode not in (("cell",) if actual == State else ("live", "recorded")):
+    if stored_family != actual or index < 0 or mode not in (("cell",) if actual == State else ("live", "controlled") if actual == Task else ("live", "recorded")):
         _invalid("capability", "invalid provider metadata")
-    if actual == State:
+    if actual == Task:
+        _task_metadata(provider)
+    elif actual == State:
         _exact(data, int, "state value")
     elif mode == "recorded":
         _exact(data, tuple, "recorded provider data")
@@ -290,6 +333,12 @@ def _live(capability, family=None):
         if active is not True:
             raise RuntimeError("borrowed capability view is closed")
         lease = parent
+    if actual == Task:
+        _task_owner(provider)
+        if index == 1:
+            raise RuntimeError("tasks: provider already has an active call")
+        if index == 2:
+            raise RuntimeError("tasks: provider is permanently revoked")
     return provider
 
 
@@ -321,6 +370,10 @@ class _Borrow:
             raise RuntimeError("borrow context has no active entry")
         if type(self._lease) is not _Lease:
             _invalid("borrow", "malformed context lease")
+        if type(self._capability) is TaskCapability:
+            # Body/coordinator failure may revoke the provider. Exit checks
+            # ownership without requiring idle/nonrevoked status, preserving it.
+            _task_owner(object.__getattribute__(self._capability, "_provider"))
         object.__setattr__(self._lease, "active", False)
         object.__setattr__(self, "_status", "closed")
         return False

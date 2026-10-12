@@ -6,10 +6,10 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "sums-unions-11.1"
+CHECKER_VERSION = "characterized-tasks-sums-13.1"
 EDITION = "python-v1"
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-union-ops-11.1"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-builder-task-union-ops-13.1"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -22,9 +22,12 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "sums.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "sums.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py", "builders.py", "builder_contracts.py", "tasks.py", "task_contracts.py")}
 
 RULES = {
+    "PAL382": ("characterized tasks disabled", "Explicitly opt into tasks=true after reviewing the finite synchronous task, callback, capture and scheduling contract."),
+    "PAL380": ("confined construction disabled", "Use immutable construction or explicitly opt into builders=true after reviewing the finite confinement contract."),
+    "PAL381": ("confined construction lifetime or escape unsupported", "Keep one fresh lexical callback parameter, direct append/extend statements and automatic finalization; builders and construction callbacks cannot be aliased, retained or transferred."),
     "PAL001": ("tooling failure", "Repair the source path, encoding, syntax, policy, or output destination and retry."),
     "PAL002": ("unsupported target", "Use the published CPython 3.13.1 standard-build macOS/Linux target."),
     "PAL101": ("binding already initialized", "Derive a new local name; exclusive branches can initialize one name once."),
@@ -127,6 +130,8 @@ class FunctionContract:
     operation_contracts: list[dict] = field(default_factory=list)
     callable_default_evidence: dict[str, dict] = field(default_factory=dict)
     external_assumptions: list[dict] = field(default_factory=list)
+    builder_scopes: list[dict] = field(default_factory=list)
+    task_scopes: list[dict] = field(default_factory=list)
     tail_recursive: bool = False
 
 

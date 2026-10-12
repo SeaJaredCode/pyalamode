@@ -1,0 +1,3 @@
+[tool.pyalamode]
+schema = 1
+builders = true

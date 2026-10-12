@@ -4,6 +4,8 @@ from sys import _getframe
 from types import FunctionType
 from typing import Callable, TypeVar
 from .collections import Map, OrderedMap, Set, Vector
+from .builders import VectorBuilder, vector_build
+from .tasks import live_tasks, controlled_tasks, task_map, task_map_with
 from .records import record, replace
 from .sums import oneof, case, Option, Some, Nothing, Result, Ok, Err, accumulate
 from .encoding import value_encode, value_decode
@@ -13,7 +15,7 @@ from .standard import (text_split, text_join, text_replace, text_startswith, tex
                        integer_clamp, integer_parse_decimal, integer_format_decimal,
                        utf8_encode, utf8_decode, hex_encode, hex_decode, vector_scan,
                        vector_group_by, compose, partial_first, result_traverse)
-from .effects import (effects, Effectful, IO, State, Clock, Random, Environment,
+from .effects import (effects, Effectful, IO, State, Clock, Random, Environment, Task, TaskCapability,
                       IOCapability, StateCapability, ClockCapability, RandomCapability,
                       EnvironmentCapability, borrow, live_io, recorded_io, state,
                       live_clock, recorded_clock, live_random, recorded_random,
@@ -75,7 +77,7 @@ def unsafe(*, scope: str, rationale: str):
     return declaration
 
 
-__all__ = ["value_encode", "value_decode", "oneof", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate", "Failure", "failure_value", "fun", "tailrec", "unsafe", "Vector", "OrderedMap", "Map", "Set", "record", "replace", "freeze", "thaw", "dataclass_adapter", "namedtuple_adapter", "effects", "Effectful", "IO", "State", "Clock", "Random", "Environment",
+__all__ = ["Task", "TaskCapability", "live_tasks", "controlled_tasks", "task_map", "task_map_with", "VectorBuilder", "vector_build", "value_encode", "value_decode", "oneof", "case", "Option", "Some", "Nothing", "Result", "Ok", "Err", "accumulate", "Failure", "failure_value", "fun", "tailrec", "unsafe", "Vector", "OrderedMap", "Map", "Set", "record", "replace", "freeze", "thaw", "dataclass_adapter", "namedtuple_adapter", "effects", "Effectful", "IO", "State", "Clock", "Random", "Environment",
            "text_split", "text_join", "text_replace", "text_startswith", "text_slice",
            "integer_clamp", "integer_parse_decimal", "integer_format_decimal", "utf8_encode", "utf8_decode", "hex_encode", "hex_decode", "vector_scan", "vector_group_by", "compose", "partial_first", "result_traverse",
            "IOCapability", "StateCapability", "ClockCapability", "RandomCapability", "EnvironmentCapability",

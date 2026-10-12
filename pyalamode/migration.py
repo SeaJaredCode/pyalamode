@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import copy
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -31,8 +32,32 @@ MAX_LOCATIONS = 262_144
 MAX_APPROVALS = 4_096
 MAX_CHAIN = 128
 IDENTITY_VERSION = "migration-identity-v1"
-SOURCE_RULES = frozenset("PAL101 PAL102 PAL110 PAL120 PAL121 PAL130 PAL201 PAL210 PAL211 PAL221 PAL230 PAL240 PAL241 PAL250 PAL310 PAL320 PAL330 PAL340 PAL350 PAL351 PAL370 PAL371 PAL372".split())
-EFFECTS = frozenset({"IO", "State", "Clock", "Random", "Environment"})
+M12_SOURCE_RULES = frozenset("PAL101 PAL102 PAL110 PAL120 PAL121 PAL130 PAL201 PAL210 PAL211 PAL221 PAL230 PAL240 PAL241 PAL250 PAL310 PAL320 PAL330 PAL340 PAL350 PAL351 PAL370 PAL371 PAL372 PAL380 PAL381".split())
+SOURCE_RULES = M12_SOURCE_RULES | {"PAL382"}
+M12_EFFECTS = frozenset({"IO", "State", "Clock", "Random", "Environment"})
+EFFECTS = M12_EFFECTS | {"Task"}
+_VALIDATION_PROFILE = ContextVar("pyalamode_exact_metadata_profile", default=4)
+
+
+@contextmanager
+def validation_profile(profile):
+    """Carry one explicitly selected exact schema through nested validators."""
+    if type(profile) is not int or profile not in {1, 2, 3, 4}:
+        _fail("unknown exact metadata profile")
+    token = _VALIDATION_PROFILE.set(profile)
+    try:
+        yield
+    finally:
+        _VALIDATION_PROFILE.reset(token)
+
+
+def _families():
+    return EFFECTS if _VALIDATION_PROFILE.get() == 4 else M12_EFFECTS
+
+
+def _source_rules():
+    profile = _VALIDATION_PROFILE.get()
+    return SOURCE_RULES if profile == 4 else M12_SOURCE_RULES if profile == 3 else M12_SOURCE_RULES - {"PAL380", "PAL381"}
 FAILURES = frozenset({"IndexError", "KeyError", "ValueError", "ZeroDivisionError", "RecursionError", "RuntimeError", "OSError", "UnicodeError"})
 OPERATIONS = frozenset("pyalamode.integrations." + name for name in ("base64_encode", "base64_decode", "sha256_digest"))
 ADMISSIONS = frozenset({"approved", "missing", "stale", "draft", "denied", "expired", "unresolved"})
@@ -48,13 +73,21 @@ STATE_KEYS = set("schema kind identity_version target runtime_environment editio
 BOUNDARY_KEYS = set("id kind selector path qualified_name signature definition_sha256 selected selection_reasons strict_checked public_export required_export mode source_evidence effect_bound required_effects effect_origins external_assumptions failures guard_coverage location".split())
 FINDING_KEYS = set("id identity_key birth_identity rule boundary_id logical_boundary signature context_sha256 context origin count locations review_required".split())
 LEGACY_POLICY_KEYS = set("require_modules effect_bounds explicit_cases external_trust integration_manifests integration_approvals required_exports boundary_guards guarded_exports migration".split())
-POLICY_KEYS = LEGACY_POLICY_KEYS | {"distribution", "checked_dependencies"}
+M11_POLICY_KEYS = LEGACY_POLICY_KEYS | {"distribution", "checked_dependencies"}
+M12_POLICY_KEYS = M11_POLICY_KEYS | {"builders"}
+POLICY_KEYS = M12_POLICY_KEYS | {"tasks"}
 IDENTITY_KEYS = set("identity_version rule logical_boundary signature context_sha256 origin".split())
 APPROVAL_KEYS = set("operation contract_sha256 dependency_sha256 owner rationale provenance".split())
 ASSUMPTION_KEYS = set("identity version effects failures initialization provenance approval contract_sha256 dependency_sha256 installed_identity admission source_evidence".split())
 INSTALLED_KEYS = set("distribution version build cache_tag platform base_prefix abiflags extension_suffixes native_artifacts adapter_artifact interpreter_executable interpreter_core resolution native_setup_trust operation invocation_backend native_operations".split())
 LEGACY_PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py".split())
-PRODUCTS = (LEGACY_PRODUCTS - {"variants.py"}) | {"sums.py", "distribution.py", "encoding.py", "encoding_contracts.py"}
+M11_PRODUCTS = LEGACY_PRODUCTS | {"distribution.py", "encoding.py", "encoding_contracts.py"}
+M12_PRODUCTS = M11_PRODUCTS | {"builders.py", "builder_contracts.py"}
+PRODUCTS = (M12_PRODUCTS - {"variants.py"}) | {"sums.py", "tasks.py", "task_contracts.py"}
+M12_CHECKER = "confined-builders-12.0"
+M12_OPERATION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-builder-ops-12"
+M11_CHECKER = "checked-distribution-11.0"
+M11_OPERATION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-ops-11"
 LEGACY_CHECKER = "migration-team-policy-10.0"
 LEGACY_OPERATION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-ops-8"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -153,6 +186,10 @@ def _array(value, maximum=MAX_ROWS):
 
 
 def _strings(value, allowed=None, *, unique=True):
+    if allowed is EFFECTS:
+        allowed = _families()
+    elif allowed is SOURCE_RULES:
+        allowed = _source_rules()
     _array(value)
     for item in value:
         _text(item)
@@ -235,7 +272,7 @@ def _location(value, *, diagnostic=False):
 
 def _logical(value, legacy=False):
     _shape(value, {"kind", "selector", "qualified_name"})
-    # Genuine M10 history spells closed sums "variant"; current files use "oneof".
+    # Genuine M10-M12 history spells closed sums "variant"; current files use "oneof".
     if value["kind"] not in {"module", "function", "record", "variant" if legacy else "oneof"}:
         _fail("unsupported migration boundary kind")
     _selector(value["selector"], module=value["kind"] == "module")
@@ -335,11 +372,24 @@ def _assumption(value, inputs=None):
             _fail("external assumption disagrees with captured integration inputs")
 
 
+def _profile_schema(value, *, nullable=False):
+    _text(value, nullable=nullable)
+    if value is None or _VALIDATION_PROFILE.get() == 4:
+        return
+    try:
+        parsed = ast.parse(value, mode="eval")
+    except SyntaxError:
+        return  # Record/alternative identities are separately scoped text.
+    if any(isinstance(node, ast.Name) and node.id in {"Task", "TaskCapability"}
+           for node in ast.walk(parsed)):
+        _fail("historical schema cannot admit Task interfaces or callable bounds")
+
+
 def _assertion(value):
     _shape(value, {"line", "name", "schema"})
     _integer(value["line"], 1)
     _text(value["name"])
-    _text(value["schema"])
+    _profile_schema(value["schema"])
 
 
 def _guard(value):
@@ -352,7 +402,7 @@ def _guard(value):
         for key in ("selection", "public_boundary", "original_boundary", "original_protection", "coverage"):
             _text(row[key])
         _parameters(row["parameters"])
-        _text(row["returns"], nullable=True)
+        _profile_schema(row["returns"], nullable=True)
         _boolean(row["generated"])
     row = value["debug"]
     if row is not None:
@@ -362,7 +412,7 @@ def _guard(value):
         for key in ("name", "callable_validation", "capability_validation"):
             _text(row[key])
         _parameters(row["parameters"])
-        _text(row["returns"], nullable=True)
+        _profile_schema(row["returns"], nullable=True)
         _boolean(row["generated"])
         _array(row["locals"])
         for assertion in row["locals"]:
@@ -377,7 +427,7 @@ def _parameters(value):
         _fail("schema parameters require object")
     for name, schema in value.items():
         _text(name)
-        _text(schema)
+        _profile_schema(schema)
 
 
 def _migration_policy(value):
@@ -388,8 +438,12 @@ def _migration_policy(value):
         _boolean(value[gate])
 
 
-def _policy(value, legacy=False):
-    _shape(value, LEGACY_POLICY_KEYS if legacy else POLICY_KEYS)
+def _policy(value, legacy=False, historical=False, m12=False):
+    _shape(value, LEGACY_POLICY_KEYS if legacy else M12_POLICY_KEYS if m12 else M11_POLICY_KEYS if historical else POLICY_KEYS)
+    if m12 or not legacy and not historical:
+        _boolean(value["builders"])
+    if not legacy and not historical:
+        _boolean(value["tasks"])
     if not legacy:
         from .distribution import validate_distribution_policy
         error = validate_distribution_policy({k:v for k,v in value.items() if k in {"distribution","checked_dependencies"} and v is not None})
@@ -514,14 +568,22 @@ def _sort_rows(rows):
 
 
 def _state(state, *, retained=False):
+    if type(state) is not dict or type(state.get("schema")) is not int or state["schema"] not in {1, 2, 3, 4}:
+        _fail("unknown migration state schema")
+    with validation_profile(state["schema"]):
+        return _state_fields(state, retained=retained)
+
+
+def _state_fields(state, *, retained=False):
     value = _json_value(state)
     schema=value.get("schema")
-    if type(schema) is not int or schema not in {1,2}: _fail("unknown migration state schema")
+    if type(schema) is not int or schema not in {1,2,3,4}: _fail("unknown migration state schema")
     legacy=schema==1
-    if legacy and not retained:_fail("recognized legacy state is historical provenance only")
+    historical=schema!=4
+    if historical and not retained:_fail("recognized legacy state is historical provenance only")
     _shape(value, STATE_KEYS if legacy else STATE_KEYS | {"current_dependency_status","current_dependency_events"})
     from .model import CHECKER_VERSION,OPERATION_VERSION
-    if (value["checker"],value["operation_contract"]) != ((LEGACY_CHECKER,LEGACY_OPERATION) if legacy else (CHECKER_VERSION,OPERATION_VERSION)): _fail("unrecognized checker/inventory provenance")
+    if (value["checker"],value["operation_contract"]) != ((LEGACY_CHECKER,LEGACY_OPERATION) if legacy else (M11_CHECKER,M11_OPERATION) if schema==2 else (M12_CHECKER,M12_OPERATION) if schema==3 else (CHECKER_VERSION,OPERATION_VERSION)): _fail("unrecognized checker/inventory provenance")
     if not legacy:
         _integer(value["current_dependency_status"],0,2)
         from .distribution import _declaration,dependency_context,validate_installed_receipt
@@ -554,7 +616,7 @@ def _state(state, *, retained=False):
     if not legacy:
         if type(inputs["checked_dependencies"]) is not dict: _fail("dependency inventory requires map")
         for name,row in inputs["checked_dependencies"].items():
-            validate_installed_receipt(row)
+            validate_installed_receipt(row,historical=historical)
             if row["declaration"]["name"]!=name: _fail("dependency identity mismatch")
         expected_status=max((max(r["input_status"],r["source_status"] or 0) for r in inputs["checked_dependencies"].values()),default=0)
         if value["current_dependency_status"]!=expected_status or value["strict_status"]<expected_status: _fail("dependency source status laundered")
@@ -603,16 +665,16 @@ def _state(state, *, retained=False):
         _path(exclusion["path"])
         _text(exclusion["reason"], nonempty=True)
     scope["exclusions"] = _sort_rows(scope["exclusions"])
-    _shape(value["coverage"], set("eligible_modules selected_modules checked_modules eligible_functions selected_functions checked_functions checked_exports selected_records".split()) | {"selected_variants" if legacy else "selected_oneofs"})
+    _shape(value["coverage"], set("eligible_modules selected_modules checked_modules eligible_functions selected_functions checked_functions checked_exports selected_records".split()) | {"selected_variants" if historical else "selected_oneofs"})
     for count in value["coverage"].values():
         _integer(count)
-    _policy(value["policy"],legacy=legacy)
+    _policy(value["policy"],legacy=legacy,historical=historical,m12=schema==3)
     _array(value["boundaries"])
     logical_buckets = {}
     for row in value["boundaries"]:
         _shape(row, BOUNDARY_KEYS)
         logical = {key: row[key] for key in ("kind", "selector", "qualified_name")}
-        _logical(logical, legacy=legacy)
+        _logical(logical, legacy=historical)
         _path(row["path"])
         _text(row["signature"], nullable=True)
         _digest(row["definition_sha256"])
@@ -632,7 +694,7 @@ def _state(state, *, retained=False):
         if type(row["effect_origins"]) is not dict:
             _fail("effect origin requires map")
         for family, origins in row["effect_origins"].items():
-            if family not in EFFECTS:
+            if family not in _families():
                 _fail("unsupported effect origin family")
             _strings(origins)
             origins.sort()
@@ -653,9 +715,9 @@ def _state(state, *, retained=False):
     grouped = {}
     for row in value["findings"]:
         _shape(row, FINDING_KEYS)
-        if row["rule"] not in SOURCE_RULES:
+        if row["rule"] not in _source_rules():
             _fail("tooling/policy/unknown rule cannot become audit debt")
-        _logical(row["logical_boundary"], legacy=legacy)
+        _logical(row["logical_boundary"], legacy=historical)
         _text(row["signature"], nullable=True)
         _text(row["origin"])
         context = row["context"]
@@ -686,7 +748,7 @@ def _state(state, *, retained=False):
         if birth is None:
             birth = identity
         _shape(birth, IDENTITY_KEYS)
-        _logical(birth["logical_boundary"], legacy=legacy)
+        _logical(birth["logical_boundary"], legacy=historical)
         if birth["identity_version"] != IDENTITY_VERSION or any(birth[k] != identity[k] for k in ("rule", "signature", "context_sha256", "origin")):
             _fail("finding birth cannot change rule/context/signature/origin")
         if birth["logical_boundary"]["kind"] != row["logical_boundary"]["kind"] or not retained and birth != identity:
@@ -768,11 +830,11 @@ def _state(state, *, retained=False):
         for event in value["current_policy_events"]["approval_failures"]:
             for site in event["after"]["required_by"]:
                 if "source_owner" not in site:_fail("current approval event site needs explicit ownership")
+    if set(inputs["product_artifacts"]) != (LEGACY_PRODUCTS if legacy else M11_PRODUCTS if schema==2 else M12_PRODUCTS if schema==3 else PRODUCTS):
+        _fail("migration product inventory must match its exact recognized provenance")
     if value["strict_status"] != 2 and value["current_policy_status"] != 2:
         if set(scope["selected_paths"]) != set(inputs["sources"]) or not set(scope["displayed_paths"]) <= set(scope["selected_paths"]):
             _fail("migration scope must expose complete captured sources and a display subset")
-        if set(inputs["product_artifacts"]) != (LEGACY_PRODUCTS if legacy else PRODUCTS):
-            _fail("migration product inventory must include every current approved product byte identity")
         for boundary in value["boundaries"]:
             if boundary["path"] not in inputs["sources"]:
                 _fail("boundary source is absent from actual input capture")
@@ -789,7 +851,7 @@ def _state(state, *, retained=False):
                     "checked_functions": sum(b["kind"] == "function" and b["strict_checked"] for b in rows),
                     "checked_exports": sum(b["kind"] != "module" and b["public_export"] and b["strict_checked"] for b in rows),
                     "selected_records": sum(b["kind"] == "record" and b["selected"] for b in rows),
-                    ("selected_variants" if legacy else "selected_oneofs"): sum(b["kind"] == ("variant" if legacy else "oneof") and b["selected"] for b in rows)}
+                    ("selected_variants" if historical else "selected_oneofs"): sum(b["kind"] == ("variant" if historical else "oneof") and b["selected"] for b in rows)}
         if value["coverage"] != expected or expected["eligible_modules"] != len(inputs["sources"]):
             _fail("migration denominator does not match actual boundary/source inventory")
     _canonical(value)
@@ -809,7 +871,7 @@ def finding_context(source: str, diagnostic: dict, boundary: dict) -> dict:
     """Position-free smallest authored statement, with no application execution."""
     if type(source) is not str or len(source.encode("utf-8", "surrogatepass")) > MAX_BYTES:
         _fail("finding context requires bounded captured source")
-    if type(diagnostic) is not dict or diagnostic.get("rule") not in SOURCE_RULES:
+    if type(diagnostic) is not dict or diagnostic.get("rule") not in _source_rules():
         _fail("tooling/policy diagnostic cannot become finding context")
     try:
         tree = ast.parse(source)
@@ -917,11 +979,19 @@ def _match_boundaries(old, new):
 
 def compare_states(reference: dict | None, current: dict) -> dict:
     """Compare independent dimensions; reference state must come from safe loading."""
-    new = _state(current,retained=type(current) is dict and current.get("schema")==1)
+    new = _state(current,retained=type(current) is dict and current.get("schema") in {1,2,3})
     old = _state(reference, retained=True) if reference is not None else None
     if old is not None and old["schema"]==1:
         old["policy"]={**old["policy"],"distribution":None,"checked_dependencies":[]}
         old["inputs"]={**old["inputs"],"checked_dependencies":{}}
+    if old is not None and old["schema"] in {1,2}:
+        old["policy"]={**old["policy"],"builders":False}
+    if new["schema"] in {1,2}:
+        new["policy"]={**new["policy"],"builders":False}
+    if old is not None and old["schema"] in {1,2,3}:
+        old["policy"]={**old["policy"],"tasks":False}
+    if new["schema"] in {1,2,3}:
+        new["policy"]={**new["policy"],"tasks":False}
     out = {"schema": 1, "kind": "pyalamode-migration-comparison", "reference_observed": old is not None,
            **{name: [] for name in CATEGORIES}}
     out["lost_strict_coverage"] += copy.deepcopy(new["current_policy_events"]["required_exports"])
@@ -1068,6 +1138,10 @@ def _compare_policy(out, before, after, before_inputs, after_inputs):
     def weaken(field, reason):
         out["policy_weakening"].append(_event_row(None, {"field": field, "value": before[field]},
                                                  {"field": field, "value": after[field]}, reason))
+    if not before["builders"] and after["builders"]:
+        weaken("builders", "builders-enabled")
+    if not before["tasks"] and after["tasks"]:
+        weaken("tasks", "tasks-enabled")
     for field in ("required_exports", "require_modules", "explicit_cases"):
         if set(before[field]) - set(after[field]):
             weaken(field, "required-policy-coverage-removed-or-changed")
@@ -1136,7 +1210,7 @@ def evaluate_gates(comparison: dict, policy: dict) -> dict:
 
 def _finding_fragment(row):
     _shape(row, FINDING_KEYS)
-    if row["rule"] not in SOURCE_RULES:
+    if row["rule"] not in _source_rules():
         _fail("comparison finding contains policy/tooling debt")
     _logical(row["logical_boundary"])
     _text(row["signature"], nullable=True)
@@ -1204,7 +1278,7 @@ def _effect_dimensions(row):
     if type(row["effect_origins"]) is not dict:
         _fail("effect origins require map")
     for key, origins in row["effect_origins"].items():
-        if key not in EFFECTS:
+        if key not in _families():
             _fail("unknown effect family")
         _strings(origins)
 
@@ -1289,7 +1363,7 @@ def _comparison(value):
                         from .distribution import validate_installed_receipt
                         if type(row["value"]) is not dict: _fail("dependency input comparison map required")
                         for name,item in row["value"].items():
-                            validate_installed_receipt(item)
+                            validate_installed_receipt(item,historical=None)
                             if item["declaration"]["name"]!=name: _fail("dependency identity mismatch")
                     elif row["input"] == "integration_inputs":
                         for operation, item in row["value"].items():
@@ -1319,16 +1393,23 @@ def _comparison(value):
 def _default_policy():
     return {"require_modules": [], "effect_bounds": {}, "explicit_cases": [],
             "external_trust": "deny", "integration_manifests": [], "integration_approvals": [],
-            "required_exports": [], "boundary_guards": "off", "guarded_exports": [], "distribution": None, "checked_dependencies": [],
+            "required_exports": [], "boundary_guards": "off", "guarded_exports": [], "distribution": None, "checked_dependencies": [], "builders": False, "tasks": False,
             "migration": {"schema": 1, "baseline": ".pyalamode/baseline.json", **{gate: False for gate in GATES}}}
 
 
-def _report(value):
+def _report(value, *, retained=False):
+    state = value.get("state") if type(value) is dict else None
+    profile = state.get("schema") if type(state) is dict else 4
+    with validation_profile(profile):
+        return _report_fields(value, retained=retained)
+
+
+def _report_fields(value, *, retained=False):
     _shape(value, set("schema kind state reference_id comparison gates status verified claim_scope human_measurement".split()))
     _integer(value["schema"], 1, 1)
     if value["kind"] != "pyalamode-migration-report":
         _fail("incompatible report schema")
-    state = _state(value["state"])
+    state = _state(value["state"], retained=retained)
     _digest(value["reference_id"], nullable=True)
     _comparison(value["comparison"])
     if value["comparison"]["reference_observed"] != (value["reference_id"] is not None):
@@ -1659,7 +1740,7 @@ def _load(local, relative, seen=None, depth=0):
         _shape(record, {"schema", "kind", "id", "created_at", "report"})
         _integer(record["schema"], 1, 1)
         _utc(record["created_at"])
-        state = _report(record["report"])
+        state = _report(record["report"], retained=True)
         _recordable_state(state)
         if record["report"]["status"] == 2:
             _fail("tooling report cannot be loaded as durable history")

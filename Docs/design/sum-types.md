@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stages 0 to 3 implemented on branch `sum-types`, merged with M11 (`c668439`).
+Status: stages 0 to 3 implemented on branch `sum-types`, which has merged main through M13 (`0016394`).
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -157,6 +157,16 @@ Exhaustiveness inside the distribution is only sound if the checker sees every c
 - Census for single-source APIs (`analyze_source`, `analyze_sources`). Their census is exactly the sources passed in.
 
 ## Merge notes for the orchestrator
+
+### Merge of M12 and M13 (`0016394`)
+
+Done on `sum-types` with the procedure below. `--resolve` settled 19 of 26 regions. The rest, and the follow-ups, were:
+
+- `__all__` keeps M13's names with `oneof` and `tailrec`; `FunctionContract` and `FunctionInfo` keep M12/M13 fields and `tail_recursive`/`tailrec`; M13's module-mode import allowance gains `tailrec`; the extension-case exclusion moved into M12's `_attribute_value`; the contract-relation key line keeps the `case` export kind.
+- `migration.py`: `PRODUCTS = (M12_PRODUCTS - {"variants.py"}) | {"sums.py", "tasks.py", "task_contracts.py"}`. M13 marks all M10-M12 states with one `historical` flag, and all of them spell `variant`, so the legacy spelling conditions key off `historical`.
+- `_FACADE_PUBLIC_BINDINGS` adds `MARKERS`; M12's count assertion goes from 72 to 73. M12's simulated M11 wheel test renames `sums.py` to `variants.py` and drops `tail_recursive`. M12's product child-module list names `sums`.
+- Versions: `CHECKER_VERSION = "characterized-tasks-sums-13.1"`, `OPERATION_VERSION` ends `-builder-task-union-ops-13.1`; M13's version test follows. The rename tool no longer rewrites versions, and its legacy-line protection covers `historical`.
+- Result: 596 tests pass on macOS.
 
 The `sum-types` branch started at `9108a81`, merged M11 (`c668439`), and then added the rename, open sums and `@tailrec`. M12 is in progress in the main working tree. It was rehearsed against a snapshot of that tree in a scratch clone: after the steps below, the combined tree passed all 550 tests on macOS, and the snapshot alone passed its 506.
 

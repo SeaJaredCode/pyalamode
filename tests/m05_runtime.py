@@ -103,7 +103,7 @@ class M05Runtime(unittest.TestCase):
         self.assertIs(effects(Clock)(captured), captured)
 
     def test_declaration_family_exact_first(self):
-        for families in ((), ("Task",), ("Unknown",), (Clock, Clock), (Hooks(),), (StringHooks(Clock),)):
+        for families in ((), ("Future",), ("Unknown",), (Clock, Clock), (Hooks(),), (StringHooks(Clock),)):
             with self.subTest(families=tuple(type(value).__name__ for value in families)):
                 with self.assertRaises(TypeError):
                     effects(*families)
@@ -130,7 +130,7 @@ class M05Runtime(unittest.TestCase):
                lambda: Effectful[[Hooks()], int, Clock],
                lambda: Effectful[[Foreign], int, Clock],
                lambda: Effectful[[int], int, StringHooks(Clock)],
-               lambda: Effectful[[int], int, "Task"],
+               lambda: Effectful[[int], int, "Future"],
                lambda: Effectful[(int,), int, Clock],
                lambda: Effectful[[int], int],
                lambda: Effectful())

@@ -75,12 +75,9 @@ PAIRS = [(r"pyalamode\.variants\b", "pyalamode.sums"), (r"from \. import variant
          (r"\bdiscover_variants\b", "discover_oneofs"), (r"\bVariant\b", "OneOf"), (r"\bvariants\b", "oneofs"), (r"\bvariant\b", "oneof"),
          (r"_variant_", "_oneof_"), (r"_variant\b", "_oneof"), (r"\bvariant_", "oneof_")]
 # Lines that must keep historical spelling after the generic mapping.
-PROTECTED = {"pyalamode/migration.py": [r"^LEGACY_PRODUCTS = ", r'"variants\.py"', r"Genuine M10 history spells", r"selected_variants\" if legacy", r"\"variant\" if legacy"]}
+PROTECTED = {"pyalamode/migration.py": [r"^LEGACY_PRODUCTS = ", r'"variants\.py"', r"Genuine M10", r"selected_variants\" if ", r"\"variant\" if "]}
 # Branch-native files mention `variant` only to prove it is gone.
 SKIP = {"tests/m06_unions.py", "tests/m06_open.py", "tests/m02_tailrec.py"}
-VERSIONS = [(r'CHECKER_VERSION = "[^"]*"', 'CHECKER_VERSION = "sums-unions-11.1"'),
-            (r'(OPERATION_VERSION = "[^"]*)-ops-11"', r'\1-union-ops-11.1"')]
-
 
 def rewrite(path, text):
     relative = path.relative_to(ROOT).as_posix()
@@ -102,11 +99,8 @@ def rewrite(path, text):
                 line = re.sub(pattern, replacement, line)
             line = line.replace("\0historical\0", "variants.py")
         lines.append(line)
-    text = "\n".join(lines)
-    if relative == "pyalamode/model.py":
-        for pattern, replacement in VERSIONS:
-            text = re.sub(pattern, replacement, text)
-    return text
+    # Version strings are a merge decision, not a mechanical rename.
+    return "\n".join(lines)
 
 
 def main(check=False):
