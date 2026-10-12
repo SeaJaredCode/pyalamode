@@ -166,7 +166,7 @@ Done on `sum-types` with the procedure below. `--resolve` settled 19 of 26 regio
 - `migration.py`: `PRODUCTS = (M12_PRODUCTS - {"variants.py"}) | {"sums.py", "tasks.py", "task_contracts.py"}`. M13 marks all M10-M12 states with one `historical` flag, and all of them spell `variant`, so the legacy spelling conditions key off `historical`.
 - `_FACADE_PUBLIC_BINDINGS` adds `MARKERS`; M12's count assertion goes from 72 to 73. M12's simulated M11 wheel test renames `sums.py` to `variants.py` and drops `tail_recursive`. M12's product child-module list names `sums`.
 - Versions: `CHECKER_VERSION = "characterized-tasks-sums-13.1"`, `OPERATION_VERSION` ends `-builder-task-union-ops-13.1`; M13's version test follows. The rename tool no longer rewrites versions, and its legacy-line protection covers `historical`.
-- Result: 596 tests pass on macOS.
+- Result: 596 tests pass on macOS arm64 and in Docker `python:3.13.1-slim` (Linux aarch64) at `e3e70f4`.
 
 The `sum-types` branch started at `9108a81`, merged M11 (`c668439`), and then added the rename, open sums and `@tailrec`. M12 is in progress in the main working tree. It was rehearsed against a snapshot of that tree in a scratch clone: after the steps below, the combined tree passed all 550 tests on macOS, and the snapshot alone passed its 506.
 
