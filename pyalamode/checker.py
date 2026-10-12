@@ -7,7 +7,10 @@ import hashlib
 import io
 import json
 import tokenize
-from dataclasses import dataclass, field
+import copy
+import keyword
+import unicodedata
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace
 from pathlib import Path
 
 from .model import (CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, CheckResult,
@@ -20,6 +23,9 @@ from .task_contracts import (TASK_NAMES, TASK_OPERATIONS, TASK_FOUNDATIONS, TASK
                              operation_contract as task_contract, setup_contract as task_setup)
 from .integration_contracts import (INTEGRATION_NAMES, INTEGRATION_FOUNDATIONS,
                                     INTEGRATION_VERSION, integration_snapshot)
+from . import source_maps as sm
+from . import syntax
+from .model import EXPERIMENTAL_EDITION, SYNTAX_VERSION
 
 BUILTINS = frozenset({"abs", "min", "max", "len"})
 COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
@@ -27,7 +33,7 @@ COLLECTIONS = frozenset({"Vector", "OrderedMap", "Map", "Set"})
 # The root's effects binding is a decorator callable, not its child module.
 _PRODUCT_CHILD_MODULES = frozenset({"collections", "records", "boundaries", "variants", "failures", "standard",
                                    "standard_contracts", "encoding", "encoding_contracts", "builders", "builder_contracts",
-                                   "integrations", "integration_contracts", "tasks", "task_contracts"})
+                                   "integrations", "integration_contracts", "tasks", "task_contracts", "syntax", "source_maps"})
 DOMAIN_TYPES = frozenset({"Option", "Result"})
 DOMAIN_CASES = frozenset({"Some", "Nothing", "Ok", "Err"})
 DOMAIN_PRIMITIVES = frozenset({"variant", "case", "accumulate", "failure_value", "Failure", *DOMAIN_TYPES, *DOMAIN_CASES})
@@ -110,6 +116,252 @@ def fingerprint(source: bytes, policy: dict | None = None) -> str:
                            "product_artifacts": foundation_identities(), "runtime_environment": runtime_environment()},
                           sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(metadata + b"\0" + source).hexdigest()
+
+
+@dataclass
+class SourceUnit:
+    """Private actual bytes and ownership; a map never grants semantic evidence."""
+    path: str
+    owner: object
+    edition: str
+    selected_edition: str
+    encoding: str
+    authored_bytes: bytes
+    authored_text: str
+    preparation: object = None
+    translation: object = None
+    normalized_bytes: bytes | None = None
+    normalized_text: str | None = None
+    source_map: object = None
+    frontend_status: int = 0
+    dependency_owner: str | None = None
+
+
+def translator_identity():
+    directory = Path(__file__).resolve().parent
+    return sm.TranslatorIdentity(SYNTAX_VERSION, tuple((name, hashlib.sha256((directory / name).read_bytes()).hexdigest())
+        for name in ("source_maps.py", "syntax.py")))
+
+
+def map_bytes(value):
+    raw = (json.dumps(sm.map_to_dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    if len(raw) > sm.MAX_MAP_BYTES:
+        raise sm.SourceMapError("canonical map file exceeds 32 MiB")
+    return raw
+
+
+def source_owner(path, root, module=None, authored_path=None):
+    physical = Path(path)
+    if physical.suffix == ".pya" and (physical.is_symlink() or any(parent.is_symlink() for parent in physical.absolute().parents)):
+        raise sm.SourceMapError("dialect ownership requires a regular physical source path")
+    relative = authored_path or physical.resolve().relative_to(root).as_posix()
+    identity = module if module is not None else _module_name(str(path), root)
+    if physical.suffix == ".pya":
+        components = list(Path(relative).with_suffix("").parts)
+        if components and components[-1] == "__init__":
+            components.pop()
+        if not components or any(not p.isidentifier() or keyword.iskeyword(p) or unicodedata.normalize("NFKC", p) != p for p in components):
+            raise sm.SourceMapError("dialect filename/package must already be a canonical ordinary Python import destination")
+        if identity != ".".join(components):
+            raise sm.SourceMapError("dialect module identity disagrees with actual ordinary runtime destination")
+        return sm.SourceOwner(relative, relative[:-4] + ".py", identity)
+    return {"authored_path": relative, "runtime_path": relative, "module": identity or None}
+
+
+def _unit_issue(unit, issue):
+    return diagnostic(issue.rule, unit.path, issue.reason, line=issue.line, column=issue.column,
+        end_line=issue.end_line, end_column=issue.end_column, origin="experimental source frontend")
+
+
+def source_provenance(unit):
+    if unit.path == "<source>":
+        return None
+    owner = asdict(unit.owner) if type(unit.owner) is sm.SourceOwner else unit.owner
+    raw_identity = {"path": owner["authored_path"], "edition": unit.edition, "role": "authored",
+        "sha256": hashlib.sha256(unit.authored_bytes).hexdigest(), "byte_count": len(unit.authored_bytes)}
+    normalized = None
+    reference = None
+    if unit.normalized_bytes is not None:
+        role = "lowered" if unit.translation is not None or unit.edition == EDITION else "scaffold"
+        normalized = {"path": owner["runtime_path"], "edition": EDITION, "role": role,
+            "sha256": hashlib.sha256(unit.normalized_bytes).hexdigest(), "byte_count": len(unit.normalized_bytes)}
+    if unit.source_map is not None:
+        raw = map_bytes(unit.source_map)
+        reference = {"schema": 1, "sha256": hashlib.sha256(raw).hexdigest(), "byte_count": len(raw),
+            "source_sha256": raw_identity["sha256"], "generated_sha256": normalized["sha256"]}
+    return {"schema": 1, "owner": owner, "selected_edition": unit.selected_edition, "authored": raw_identity,
+        "normalized": normalized, "translator": {"version": SYNTAX_VERSION, "files": dict(translator_identity().files)} if unit.edition != EDITION else None,
+        "map": reference, "coordinate_space": "decoded-python" if unit.edition == EDITION else "raw-bytes" if unit.encoding == "utf-8-invalid" else "authored-utf8",
+        "status": unit.frontend_status}
+
+
+def _raw_units(sources, root, policy, raw_sources=None):
+    units = {}
+    distributions = policy.get("_distribution_snapshot", {})
+    for path, text in sources.items():
+        raw = (raw_sources or {}).get(path, text.encode("utf-8"))
+        dialect = Path(path).suffix == ".pya"
+        selected = policy.get("edition", EDITION)
+        dependency = distributions.get("source_owners", {}).get(path)
+        if dependency:
+            receipt = distributions["receipts"][dependency]
+            module_row = next(row for row in receipt["_payload"]["modules"] if distributions["module_names"][path] == row["module"])
+            owner = source_owner(path, root, module_row["module"], module_row["authored_path"])
+            selected = receipt["_payload"]["producer"]["edition"] if dialect else selected
+        elif path == "<source>":
+            owner = None
+        else:
+            try:
+                owner = source_owner(path, root)
+            except ValueError:
+                if dialect:
+                    raise
+                owner = {"authored_path": Path(path).name, "runtime_path": Path(path).name, "module": _module_name(path, root) or None}
+        encoding = "utf-8" if dialect else tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
+        unit = SourceUnit(path, owner, EXPERIMENTAL_EDITION if dialect else EDITION, selected, encoding, raw, text, dependency_owner=dependency)
+        if dialect:
+            prepared = syntax.prepare_source(raw, owner, edition=selected, translator=translator_identity())
+            unit.preparation, unit.frontend_status = prepared, prepared.status
+            if prepared.prepared is not None:
+                unit.authored_text = prepared.prepared.authored_text
+                unit.normalized_bytes = prepared.prepared.scaffold_bytes
+                unit.normalized_text = unit.normalized_bytes.decode("utf-8-sig")
+                unit.source_map = prepared.prepared.scaffold_map
+            else:
+                try:
+                    raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    unit.encoding = "utf-8-invalid"
+                unit.authored_text = "" if unit.encoding == "utf-8-invalid" else text
+                unit.normalized_text = ""
+        else:
+            unit.normalized_text = text
+            unit.normalized_bytes = text.encode("utf-8")
+        units[path] = unit
+    return units
+
+
+def _empty_contexts(graph, unit):
+    """Resolve only actual annotation bindings in the scaffold; no body analyze."""
+    analyzer = graph.analyzers[unit.path]
+    if analyzer.tree is None:
+        return (), []
+    rows = []
+    before = len(analyzer.result.diagnostics)
+    for node in ast.walk(analyzer.tree):
+        if not isinstance(node, ast.AnnAssign) or not isinstance(node.target, ast.Name) or not isinstance(node.value, (ast.List, ast.Dict)):
+            continue
+        if (node.value.elts if isinstance(node.value, ast.List) else node.value.keys):
+            continue
+        parent = analyzer.parents.get(id(node))
+        while parent is not None and not isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            parent = analyzer.parents.get(id(parent))
+        previous = analyzer.active, analyzer.definition_mode, analyzer.constant_limit
+        info = analyzer.infos.get(id(parent))
+        analyzer.active = info
+        analyzer.definition_mode = info is None
+        analyzer.constant_limit = node.lineno if info is None else None
+        try:
+            extra = set(_written_names(parent.body)) if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) else set()
+            schema = analyzer._annotation(node.annotation, extra_names=extra)
+        finally:
+            analyzer.active, analyzer.definition_mode, analyzer.constant_limit = previous
+        if schema is None:
+            continue
+        spec = graph.types[schema]
+        family = "Vector" if isinstance(node.value, ast.List) else "Map"
+        if spec.name != family or not analyzer._data_schema(spec):
+            continue
+        start = sm.offset_at(unit.normalized_bytes, node.value.lineno, node.value.col_offset + 1)
+        end = sm.offset_at(unit.normalized_bytes, node.value.end_lineno, node.value.end_col_offset + 1)
+        mapped = sm.map_range(unit.source_map, sm.ByteSpan(start, end), source=unit.authored_bytes, generated=unit.normalized_bytes)
+        if not mapped.exact:
+            raise sm.SourceMapError("empty initializer must have one exact authored copy occurrence")
+        rows.append(syntax.EmptyDisplayType(mapped.source_span, family, schema))
+    return tuple(rows), analyzer.result.diagnostics[before:]
+
+
+def prepare_units(sources, root, audit, policy, raw_sources=None, _graph_type=None):
+    units = _raw_units(sources, root, policy, raw_sources)
+    dialect = [unit for unit in units.values() if unit.edition != EDITION and unit.preparation.prepared is not None]
+    errors = {}
+    if dialect:
+        scaffold = (_graph_type or SourceGraph)({path: unit.normalized_text or "" for path, unit in units.items()}, root, audit, policy, _source_units=units, _scaffold=True)
+        for unit in dialect:
+            contexts, annotation_errors = _empty_contexts(scaffold, unit)
+            # These diagnostics belong to the scaffold that resolved the actual
+            # annotation. Map before replacing it with the lowered input.
+            errors[unit.path] = [dataclass_replace(row, origin="experimental source frontend")
+                for row in public_result(CheckResult(unit.path, "", diagnostics=annotation_errors), unit).diagnostics]
+            lowered = syntax.lower_source(unit.preparation.prepared, empty_types=contexts)
+            unit.frontend_status = max(unit.frontend_status, lowered.status)
+            if lowered.translation is not None:
+                unit.translation = lowered.translation
+                unit.normalized_bytes = lowered.translation.lowered_bytes
+                unit.normalized_text = unit.normalized_bytes.decode("utf-8-sig")
+                unit.source_map = lowered.translation.lowered_map
+            unit._issues = lowered.issues
+    for unit in units.values():
+        if unit.edition != EDITION and not hasattr(unit, "_issues"):
+            unit._issues = unit.preparation.issues
+        unit._annotation_errors = errors.get(unit.path, [])
+    return units
+
+
+def public_result(result, unit):
+    """Detached one-time typed coordinate remap; normalized cache stays private."""
+    value = copy.deepcopy(result)
+    value.source_provenance = source_provenance(unit)
+    if unit.edition == EDITION or unit.source_map is None:
+        return value
+    def location(line, column=1, end_line=None, end_column=None):
+        start = sm.offset_at(unit.normalized_bytes, line, column)
+        end = sm.offset_at(unit.normalized_bytes, end_line or line, end_column or column)
+        mapped = sm.map_range(unit.source_map, sm.ByteSpan(start, end), source=unit.authored_bytes, generated=unit.normalized_bytes)
+        first = sm.position_at(unit.authored_bytes, mapped.source_span.start)
+        last = sm.position_at(unit.authored_bytes, mapped.source_span.end)
+        return first, last
+    rows = []
+    for row in value.diagnostics:
+        if row.origin == "experimental source frontend":
+            rows.append(row)
+            continue
+        first, last = location(row.line, row.column, row.end_line, row.end_column)
+        binding = row.first_binding
+        if binding and binding.startswith(unit.path + ":"):
+            parts = binding[len(unit.path) + 1:].split(":")
+            if len(parts) in {1, 2} and all(p.isdecimal() for p in parts):
+                point, _ = location(int(parts[0]), int(parts[1]) if len(parts) == 2 else 1)
+                binding = unit.path + ":" + str(point.line) + (":" + str(point.column) if len(parts) == 2 else "")
+        rows.append(dataclass_replace(row, line=first.line, column=first.column, end_line=last.line if row.end_line is not None else None,
+            end_column=last.column if row.end_column is not None else None, first_binding=binding))
+    value.diagnostics = rows
+    # Closed row types, including their recursively nested lexical sites.
+    def sites(row):
+        if type(row) is list:
+            return [sites(v) for v in row]
+        if type(row) is not dict:
+            return row
+        out = copy.deepcopy(row)
+        if type(out.get("line")) is int and ("path" not in out or out["path"] == unit.path):
+            first, last = location(out["line"], out.get("column", 1), out.get("end_line"), out.get("end_column"))
+            out["line"] = first.line
+            if "column" in out: out["column"] = first.column
+            if out.get("end_line") is not None: out["end_line"] = last.line
+            if out.get("end_column") is not None: out["end_column"] = last.column
+        for key in ("callback_line", "callback_end_line"):
+            if type(out.get(key)) is int:
+                out[key] = location(out[key])[0].line
+        for key in ("locals", "patterns", "handlers", "failure_edges", "borrow_scopes", "builder_scopes", "task_scopes"):
+            if key in out: out[key] = sites(out[key])
+        return out
+    for contract in value.contracts:
+        contract.line = location(contract.line)[0].line
+        for name in ("data_assertions", "borrow_scopes", "builder_scopes", "task_scopes", "patterns", "handlers", "failure_edges"):
+            setattr(contract, name, sites(getattr(contract, name)))
+    for name in ("records", "variants", "setup_observations", "unsafe_adapters"):
+        setattr(value, name, sites(getattr(value, name)))
+    return value
 
 
 @dataclass(frozen=True)
@@ -935,19 +1187,25 @@ def _local_path(root: Path, name: str) -> Path | None:
         return None
     for count in range(1, len(parts)):
         parent = root.joinpath(*parts[:count])
-        if parent.with_suffix(".py").is_file() and not (parent / "__init__.py").is_file():
+        if any(parent.with_suffix(suffix).is_file() for suffix in (".py", ".pya")) and not any((parent / ("__init__" + suffix)).is_file() for suffix in (".py", ".pya")):
             return None
     base = root.joinpath(*parts)
     # CPython's filesystem finder tries an initialized package before a module file.
-    for candidate in (base / "__init__.py", base.with_suffix(".py")):
+    candidates = (base / "__init__.py", base.with_suffix(".py"), base / "__init__.pya", base.with_suffix(".pya"))
+    present = [candidate for candidate in candidates if candidate.is_file()]
+    if any(candidate.suffix == ".pya" for candidate in present) and len(present) != 1:
+        raise ValueError("ambiguous dialect/runtime import ownership: " + name)
+    for candidate in candidates:
         if candidate.is_file():
+            if candidate.suffix == ".pya":
+                source_owner(str(candidate), root)
             return candidate.resolve()
     return None
 
 
 def _product_source(name: str, path: Path) -> bool:
     files = {"pyalamode": "__init__.py", "pyalamode.collections": "collections.py", "pyalamode.effects": "effects.py", "pyalamode.variants": "variants.py", "pyalamode.failures": "failures.py", "pyalamode.standard": "standard.py", "pyalamode.standard_contracts": "standard_contracts.py", "pyalamode.integrations": "integrations.py", "pyalamode.integration_contracts": "integration_contracts.py",
-             "pyalamode.records": "records.py", "pyalamode.boundaries": "boundaries.py", "pyalamode.encoding": "encoding.py", "pyalamode.encoding_contracts": "encoding_contracts.py", "pyalamode.builders": "builders.py", "pyalamode.builder_contracts": "builder_contracts.py", "pyalamode.tasks": "tasks.py", "pyalamode.task_contracts": "task_contracts.py"}
+             "pyalamode.records": "records.py", "pyalamode.boundaries": "boundaries.py", "pyalamode.encoding": "encoding.py", "pyalamode.encoding_contracts": "encoding_contracts.py", "pyalamode.builders": "builders.py", "pyalamode.builder_contracts": "builder_contracts.py", "pyalamode.tasks": "tasks.py", "pyalamode.task_contracts": "task_contracts.py", "pyalamode.syntax": "syntax.py", "pyalamode.source_maps": "source_maps.py"}
     return name in files and path == Path(__file__).resolve().parent / files[name]
 
 
@@ -958,7 +1216,11 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
     errors = []
     queue = list(paths)
     while queue:
-        path = queue.pop(0).resolve()
+        physical = queue.pop(0)
+        if physical.suffix == ".pya" and (physical.is_symlink() or not physical.is_file() or any(parent.is_symlink() for parent in physical.absolute().parents)):
+            errors.append(diagnostic("PAL001", str(physical), "dialect ownership requires a regular physical source path", origin="experimental source ownership"))
+            continue
+        path = physical.resolve()
         if read_root is not None and not path.is_relative_to(read_root):
             errors.append(diagnostic("PAL001", str(read_root), "editor source resolves outside workspace; refused before reading", origin="editor source ownership"))
             continue
@@ -967,16 +1229,28 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
         try:
             if overlays and str(path) in overlays:
                 text = overlays[str(path)]
-                encoding, _ = tokenize.detect_encoding(io.BytesIO(text.encode("utf-8")).readline)
+                encoding = "utf-8" if path.suffix == ".pya" else tokenize.detect_encoding(io.BytesIO(text.encode("utf-8")).readline)[0]
                 raw = text.encode(encoding)
             else:
                 raw = path.read_bytes()
-            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
-            source = raw.decode(encoding)
+            if path.suffix == ".pya":
+                # The frontend owns decoder/token/parser errors with exact raw
+                # intervals. Keep the bytes even when decoded source is absent.
+                try:
+                    source = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    source = ""
+            else:
+                encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+                source = raw.decode(encoding)
             if raw_sources is not None:
                 raw_sources[str(path)] = raw
             sources[str(path)] = source
-            tree = ast.parse(source, filename=str(path), feature_version=(3, 13))
+            if path.suffix == ".pya":
+                prepared = syntax.prepare_source(raw, source_owner(str(path), root), edition=EXPERIMENTAL_EDITION, translator=translator_identity())
+                tree = ast.parse(prepared.prepared.scaffold_bytes.decode("utf-8-sig"), filename=str(path), feature_version=(3, 13)) if prepared.prepared is not None else ast.Module(body=[], type_ignores=[])
+            else:
+                tree = ast.parse(source, filename=str(path), feature_version=(3, 13))
         except (OSError, UnicodeError, SyntaxError, ValueError) as error:
             errors.append(diagnostic("PAL001", str(path), f"cannot read/parse source: {error}",
                                      line=getattr(error, "lineno", 1) or 1, column_encoding="unicode-codepoints"))
@@ -987,12 +1261,16 @@ def load_sources(paths: list[Path], root: Path, raw_sources: dict[str, bytes] | 
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom):
-                base = _import_name(node, module, path.name == "__init__.py")
+                base = _import_name(node, module, path.name in {"__init__.py", "__init__.pya"})
                 names = [base] + [base + "." + alias.name for alias in node.names if alias.name != "*"]
             for name in names:
                 parts = name.split(".")
                 for count in range(1, len(parts) + 1):
-                    dependency = _local_path(root, ".".join(parts[:count]))
+                    try:
+                        dependency = _local_path(root, ".".join(parts[:count]))
+                    except (ValueError, OSError) as error:
+                        errors.append(diagnostic("PAL001", str(path), str(error), origin="experimental source ownership"))
+                        continue
                     if dependency and not _product_source(".".join(parts[:count]), dependency) and str(dependency) not in sources:
                         queue.append(dependency)
     return sources, errors
@@ -1004,8 +1282,11 @@ class SourceGraph:
     _intrinsic_schema_outputs = False
 
     def __init__(self, sources: dict[str, str], root: Path, audit: bool, policy: dict | None,
-                 candidate_selection: dict | None = None):
+                 candidate_selection: dict | None = None, *, _source_units=None, _scaffold=False):
         self.root, self.policy = root, policy or {}
+        self.source_units = _source_units if _source_units is not None else prepare_units(sources, root, audit, self.policy, self.policy.get("_raw_sources"), type(self))
+        self.scaffold = _scaffold
+        sources = {path: unit.normalized_text or "" for path, unit in self.source_units.items()}
         self.distributions = self.policy.get("_distribution_snapshot", {})
         self.module_names = self.distributions.get("module_names", {})
         self.resolved_modules = self.distributions.get("resolved_modules", {})
@@ -1040,6 +1321,14 @@ class SourceGraph:
             analyzer.prepare()
             for error in self.integration_snapshot["errors"]:
                 analyzer.result.diagnostics.append(diagnostic("PAL001", analyzer.path, error, origin="integration policy/manifest"))
+            if not _scaffold:
+                unit = self.source_units[analyzer.path]
+                analyzer.result.source_provenance = source_provenance(unit)
+                if unit.edition != EDITION:
+                    analyzer.result.diagnostics.extend(_unit_issue(unit, issue) for issue in unit._issues)
+                    analyzer.result.diagnostics.extend(unit._annotation_errors)
+                    if unit.preparation.prepared is not None and not analyzer.module_mode:
+                        analyzer.result.diagnostics.append(diagnostic("PAL390", analyzer.path, "authored .pya requires actual whole-module # mode: fun participation", end_line=1, end_column=1, origin="experimental source frontend"))
         for analyzer in self.analyzers.values():
             analyzer.discover()
             analyzer.discover_records()
@@ -1272,6 +1561,12 @@ class SourceGraph:
         for info in self.functions.values():
             info.analyzer.declare_effects(info)
             info.analyzer.classify_builder(info)
+        if not _scaffold:
+            replacements = sorted(module + "." + name for module, name in self.replaced_foundations if module in {"pyalamode.syntax", "pyalamode.source_maps"})
+            if replacements:
+                for path, unit in self.source_units.items():
+                    if unit.edition != EDITION:
+                        self.analyzers[path].result.diagnostics.append(diagnostic("PAL240", path, "compiler dependency binding replaced in the analyzed graph: " + ", ".join(replacements), origin="experimental compiler dependency"))
         for info in self.functions.values():
             info.analyzer.signature(info)
 
@@ -1550,6 +1845,8 @@ class SourceGraph:
         """Relevant analyzed replacements are cache inputs, even in ordinary writers."""
         analyzer = self.analyzers[path]
         relevant = {(self.module_name(p), "*") for p in {path} | set(dependencies)}
+        if any(self.source_units[p].source_map is not None for p in {path} | set(dependencies) if p in self.source_units):
+            relevant.update({("pyalamode.syntax", "*"), ("pyalamode.source_maps", "*")})
         for name, symbol in analyzer.symbols.items():
             if symbol.kind == "import":
                 module, attribute = symbol.name.split(":", 1)
@@ -3512,8 +3809,17 @@ class FunctionalAnalyzer(ScalarAnalyzer):
             return None
         method, expression = node.func.attr, node.func.value
         typed = None
-        if isinstance(expression, ast.Subscript) and self._type_identity(expression.value, self.locals) in COLLECTIONS:
-            kind = self._annotation(expression, extra_names=self.locals)
+        type_names = self.locals
+        if self.initializing:
+            # Established exact module/class bindings are not lexical shadows.
+            # Future, indefinite and rebound names still pass the identity gates.
+            type_names = set(self.locals) - {
+                name for name, binding in env.items()
+                if binding.definite and binding.value.kind
+                and binding.value.kind.startswith(("module:", "collection_class:", "record_class:", "variant_class:", "case_class:"))
+            }
+        if isinstance(expression, ast.Subscript) and self._type_identity(expression.value, type_names) in COLLECTIONS:
+            kind = self._annotation(expression, extra_names=type_names)
             typed = self.graph.types.get(kind)
             owner = Value.exact("collection_class:" + typed.name) if typed else UNKNOWN
         else:
@@ -4581,7 +4887,12 @@ class FunctionalAnalyzer(ScalarAnalyzer):
 def analyze_sources(sources: dict[str, str], *, root: str | Path, audit: bool = False,
                     policy: dict | None = None) -> dict[str, CheckResult]:
     """Analyze a captured source graph without application imports or user evaluation."""
-    return SourceGraph(sources, Path(root).resolve(), audit, policy).analyze()
+    graph = SourceGraph(sources, Path(root).resolve(), audit, policy)
+    results = graph.analyze()
+    for result in results.values():
+        result.dependencies = {path: hashlib.sha256(graph.source_units[path].authored_bytes).hexdigest()
+            for path in result.dependencies if path in graph.source_units}
+    return {path: public_result(result, graph.source_units[path]) for path, result in results.items()}
 
 
 def analyze_source(source: str, path: str = "<source>", *, audit: bool = False,
@@ -4591,12 +4902,19 @@ def analyze_source(source: str, path: str = "<source>", *, audit: bool = False,
 
 
 def analyze_file(path: str | Path, *, audit: bool = False, policy: dict | None = None) -> CheckResult:
-    resolved = Path(path).resolve()
-    sources, errors = load_sources([resolved], resolved.parent)
+    physical = Path(path).absolute()
+    resolved = physical.resolve()
+    if resolved.suffix == ".pya" and physical.suffix != ".pya":
+        item = diagnostic("PAL001", str(physical), "requested filename must identify the actual authored .pya format", origin="experimental source ownership")
+        return CheckResult(str(physical), "", diagnostics=[item], mode="audit" if audit else "strict")
+    raw = {}
+    # Keep the physical input until load_sources rejects dialect symlinks and
+    # symlinked parents, before reading any resolved authored bytes.
+    sources, errors = load_sources([physical], resolved.parent, raw)
     if errors:
         result = CheckResult(str(resolved), "", diagnostics=errors, mode="audit" if audit else "strict")
         return result
-    results = analyze_sources(sources, root=resolved.parent, audit=audit, policy=policy)
+    results = analyze_sources(sources, root=resolved.parent, audit=audit, policy={**(policy or {}), "_raw_sources": raw})
     result = results[str(resolved)]
     # Dependency failures cannot be hidden by requesting only one entry file.
     for other in results.values():

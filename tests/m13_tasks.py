@@ -319,10 +319,10 @@ class TaskMetadataTests(unittest.TestCase):
         self.assertEqual(explain_symbol('live_tasks')['contract']['catalog'][0]['identity'], 'pyalamode.tasks.live_tasks')
 
     def test_current_identity_and_exact_foundation_inventory(self):
-        self.assertEqual(CHECKER_VERSION, 'characterized-tasks-13.0')
-        self.assertTrue(OPERATION_VERSION.endswith('builder-task-ops-13'))
+        self.assertEqual(CHECKER_VERSION, 'experimental-syntax-14.0')
+        self.assertTrue(OPERATION_VERSION.endswith('builder-task-syntax-ops-14'))
         identities = foundation_identities()
-        self.assertEqual(len(identities), 26)
+        self.assertEqual(len(identities), 28)
         self.assertIn('tasks.py', identities)
         self.assertIn('task_contracts.py', identities)
 
@@ -336,7 +336,7 @@ class TaskMetadataTests(unittest.TestCase):
             m.write_baseline(root, state, owner='development', rationale='explicit task permission', prepublish=lambda: None)
             policy.write_text('[tool.pyalamode]\ntasks=true\n[tool.pyalamode.migration]\nschema=1\nreject_policy_weakening=true\n')
             _, current, report, _ = observe(root)
-            self.assertEqual(current['schema'], 4)
+            self.assertEqual(current['schema'], 5)
             self.assertEqual(current['strict_status'], 0)
             self.assertEqual(report['status'], 1)
             self.assertEqual(report['comparison']['policy_weakening'][0]['reason'], 'tasks-enabled')
@@ -353,9 +353,9 @@ class TaskMetadataTests(unittest.TestCase):
             self.assertEqual(result.status, 0, result.to_dict())
             with zipfile.ZipFile(result.output) as wheel:
                 envelope = json.loads(wheel.read('qtask-1.0.0.dist-info/pyalamode/evidence.json'))
-            self.assertEqual(envelope['schema'], 3)
+            self.assertEqual(envelope['schema'], 4)
             self.assertEqual(envelope['payload']['producer']['task_version'], TASK_VERSION)
-            self.assertEqual(len(envelope['payload']['producer']['product_artifacts']), 26)
+            self.assertEqual(len(envelope['payload']['producer']['product_artifacts']), 28)
             d.validate_evidence(envelope)
             for change in ('scope', 'missing', 'extra', 'effect'):
                 bad = copy.deepcopy(envelope)
@@ -493,7 +493,7 @@ class TaskMetadataTests(unittest.TestCase):
             self.assertEqual(reference['state']['checker'], 'confined-builders-12.0')
             self.assertNotIn('tasks', reference['state']['policy'])
             _, state, report, _ = observe(root)
-            self.assertEqual(state['schema'], 4)
+            self.assertEqual(state['schema'], 5)
             self.assertEqual(state['strict_status'], 1)
             self.assertEqual(len(report['comparison']['retained_findings']), 4)
             with self.assertRaises(m.MigrationError):

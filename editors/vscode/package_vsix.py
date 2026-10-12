@@ -5,7 +5,8 @@ from pathlib import Path
 import zipfile
 from xml.sax.saxutils import escape
 
-PAYLOAD = ("package.json", "extension.js", "transport.js", "README.md")
+PAYLOAD = ("package.json", "extension.js", "transport.js", "README.md",
+           "language-configuration.json", "syntaxes/pyalamode.tmLanguage.json")
 
 
 def package(output):

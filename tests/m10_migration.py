@@ -284,6 +284,25 @@ def unknown(value: int) -> int:
         self.assertTrue(any(row.get("rule") == "PAL221" for row in preview["blockers"] if type(row) is dict))
         self.assertIn("@fun\ndef leaf", preview["edits"][0]["after"])
         self.assertEqual(self.path.read_bytes(), source)
+        self.assertFalse(preview["verified"])
+        self.assertEqual(preview["candidate"]["source_status"], 1)
+        demotions = [row for row in preview["blockers"] if type(row) is dict and row.get("reason") == "candidate source refusal demotes existing local evidence"]
+        self.assertTrue(demotions)
+        self.assertEqual(demotions[0]["demotion_fields"], ["behavior", "freshness", "source_evidence"])
+        self.assertEqual(len(demotions[0]["contract_comparison"]["fields"]), 43)
+        self.assertEqual({row["field"] for row in demotions[0]["contract_comparison"]["fields"] if not row["matched"]}, {"behavior", "freshness", "source_evidence"})
+        actual_snapshot = check_snapshot
+        def altered_existing(*args, **kwargs):
+            candidate = actual_snapshot(*args, **kwargs)
+            if kwargs.get("overlays") and kwargs.get("_candidate_selection") is None:
+                contract = next(contract for file in candidate.result.results for contract in file.contracts if contract.name == "checked")
+                contract.effect_bound.append("Clock")
+            return candidate
+        with patch("pyalamode.project.check_snapshot", side_effect=altered_existing):
+            changed_contract = convert_preview(snapshot, state, "function:core:leaf")
+        self.assertEqual(changed_contract["status"], 2)
+        self.assertTrue(any("existing participating dimensions changed" in row for row in changed_contract["blockers"] if type(row) is str))
+        self.assertEqual(self.path.read_bytes(), source)
         self.assertNotEqual(ready["candidate_snapshot"], snapshot.snapshot)
         self.assertTrue(ready["candidate_analysis"]["candidate_selection"]["functions"])
         self.path.write_text("from pyalamode import fun\ndef leaf(value: int) -> int:\n    return value + 1\n")

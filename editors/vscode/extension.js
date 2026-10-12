@@ -2,7 +2,7 @@
 const vscode = require('vscode');
 const fs = require('node:fs');
 const path = require('node:path');
-const {Client} = require('./transport');
+const {Client, HEX64, exactKeys, validateTextEdits, validateSourceLocation} = require('./transport');
 let active;
 
 function activate(context) {
@@ -30,7 +30,9 @@ function activate(context) {
     const canonical = localUri(uri), known = editorUris.get(canonical.toString());
     return known || vscode.Uri.file(path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, path.relative(rootFolder(), canonical.fsPath)));
   };
-  const supported = document => document.languageId === 'python' && document.uri.scheme === 'file' && !document.isUntitled;
+  const supported = document => document.uri.scheme === 'file' && !document.isUntitled &&
+    ((document.languageId === 'python' && document.uri.path.endsWith('.py')) ||
+     (document.languageId === 'pyalamode' && document.uri.path.endsWith('.pya')));
   const fail = error => { diagnostics.clear(); output.appendLine('Unverified: ' + error.message); vscode.window.showErrorMessage('Pyalamode: ' + error.message); };
   const virtual = (text, label) => {
     const uri = vscode.Uri.from({scheme: 'pyalamode-view', path: '/' + (++serial) + '/' + label});
@@ -42,10 +44,10 @@ function activate(context) {
     let uri;
     try { uri = localUri(document.uri).toString(); } catch (_) { return; }
     const previous = editorUris.get(uri);
-    if (previous && previous.toString() !== document.uri.toString()) throw new Error('Multiple open editor aliases for one canonical Python file are unsupported');
+    if (previous && previous.toString() !== document.uri.toString()) throw new Error('Multiple open editor aliases for one canonical source file are unsupported');
     if (versions.has(uri)) return;
     editorUris.set(uri, document.uri);
-    client.notify('textDocument/didOpen', {textDocument: {uri, languageId: 'python', version: document.version, text: document.getText()}});
+    client.notify('textDocument/didOpen', {textDocument: {uri, languageId: document.languageId, version: document.version, text: document.getText()}});
     versions.set(uri, document.version);
   };
   async function start() {
@@ -101,7 +103,7 @@ function activate(context) {
   };
   const safe = fn => async (...args) => { try { return await fn(...args); } catch (error) { if (!/cancelled/.test(error.message)) fail(error); return undefined; } };
   subscriptions.push(output, diagnostics, vscode.workspace.registerTextDocumentContentProvider('pyalamode-view', {provideTextDocumentContent: uri => content.get(uri.toString()) || ''}));
-  const selector = {language: 'python', scheme: 'file'};
+  const selector = [{language: 'python', scheme: 'file'}, {language: 'pyalamode', scheme: 'file'}];
   subscriptions.push(vscode.languages.registerHoverProvider(selector, {provideHover: safe(async (document, position, token) => {
     const value = await query('textDocument/hover', document, {position}, token); if (!value) return null;
     const text = typeof value.contents === 'string' ? value.contents : value.contents.value;
@@ -119,6 +121,27 @@ function activate(context) {
     const values = await query('textDocument/codeAction', document, {range: {start: requestedRange.start, end: requestedRange.end}, context: {diagnostics: []}}, token);
     return (values || []).filter(item => item.command === 'pyalamode.preview' && Array.isArray(item.arguments) && item.arguments.length === 1);
   })}));
+  subscriptions.push(vscode.languages.registerDocumentFormattingEditProvider({language: 'pyalamode', scheme: 'file'}, {
+    provideDocumentFormattingEdits: safe(async (document, options, token) => {
+      if (!supported(document) || document.languageId !== 'pyalamode') return [];
+      const version = document.version, before = document.getText(), transport = await ensure();
+      const uri = localUri(document.uri).toString();
+      const unchanged = () => client === transport && !document.isClosed && document.version === version &&
+        versions.get(uri) === version && document.getText() === before && !token?.isCancellationRequested;
+      if (!unchanged()) return [];
+      const project = await transport.request('pyalamode/project', {}, token);
+      if (!unchanged()) return [];
+      if (typeof project?.snapshot !== 'string' || !HEX64.test(project.snapshot)) throw new Error('Invalid Pyalamode project snapshot');
+      if (!Number.isSafeInteger(options.tabSize) || options.tabSize < 1 || options.tabSize > 8 || typeof options.insertSpaces !== 'boolean')
+        throw new Error('Unsupported Pyalamode formatting options');
+      const edits = await transport.request('textDocument/formatting', {
+        textDocument: {uri}, options: {tabSize: options.tabSize, insertSpaces: options.insertSpaces},
+        pyalamode: {version, snapshot: project.snapshot}
+      }, token);
+      if (!unchanged()) return [];
+      return validateTextEdits(edits, before).map(item => new vscode.TextEdit(range(item.range), item.newText));
+    })
+  }));
   subscriptions.push(vscode.workspace.onDidOpenTextDocument(document => { if (client?.initialized && !client.dead) { try { opened(document); } catch (error) { client.fail(error); } } }));
   subscriptions.push(vscode.workspace.onDidChangeTextDocument(event => {
     if (!client || client.dead || !supported(event.document) || !event.contentChanges.length) return;
@@ -153,7 +176,8 @@ function activate(context) {
     if (document.version !== params.version) throw new Error('Preview is stale; refresh diagnostics');
     const result = await (await ensure()).request('pyalamode/preview', params);
     if (result.uri !== params.uri || result.version !== document.version || result.snapshot !== params.snapshot || result.before !== document.getText()) throw new Error('Preview source changed; refresh diagnostics');
-    const before = virtual(result.before, 'before.py'), after = virtual(result.after, 'proposed.py');
+    const suffix = uri.path.endsWith('.pya') ? '.pya' : '.py';
+    const before = virtual(result.before, 'before' + suffix), after = virtual(result.after, 'proposed' + suffix);
     await vscode.commands.executeCommand('vscode.diff', before, after, result.title + ' — ' + uri.fsPath, {preview: true});
     output.appendLine('Preview only: ' + JSON.stringify({source: params.uri, status: result.status, remainingDiagnostics: result.remainingDiagnostics, limits: result.limits}));
     return result;
@@ -172,6 +196,39 @@ function activate(context) {
     const destination = displayUri(vscode.Uri.parse(result.location.uri));
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(destination), {selection: range(result.location.range)});
     output.appendLine('Authored guard coverage: ' + JSON.stringify(result)); return result;
+  });
+  command('pyalamode.sourceLocation', async params => {
+    const transport = await ensure();
+    if (!params) {
+      const artifact = await vscode.window.showOpenDialog({canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: 'Select local mapped artifact'});
+      if (!artifact) return;
+      const generatedPath = await vscode.window.showInputBox({prompt: 'Exact artifact-relative generated .py path'}); if (!generatedPath) return;
+      const line = Number(await vscode.window.showInputBox({prompt: 'Generated line (zero-based)'}));
+      const character = Number(await vscode.window.showInputBox({prompt: 'Generated UTF16 character (zero-based)'}));
+      const project = await transport.request('pyalamode/project', {});
+      params = {artifactUri: artifact[0].toString(), path: generatedPath, position: {line, character}, snapshot: project.snapshot};
+    }
+    if (!exactKeys(params, ['artifactUri', 'path', 'position', 'snapshot']) || typeof params.artifactUri !== 'string' ||
+        typeof params.path !== 'string' || params.path.length > 4096 || !params.path.endsWith('.py') ||
+        /[\\:\x00-\x1f\x7f-\x9f]/.test(params.path) || params.path.split('/').some(part => !part || part === '.' || part === '..') ||
+        !exactKeys(params.position, ['line', 'character']) || !Number.isSafeInteger(params.position.line) || params.position.line < 0 ||
+        !Number.isSafeInteger(params.position.character) || params.position.character < 0 || typeof params.snapshot !== 'string' || !HEX64.test(params.snapshot))
+      throw new Error('Select an exact current mapped source location');
+    const artifact = localUri(vscode.Uri.parse(params.artifactUri));
+    if (!fs.statSync(artifact.fsPath).isDirectory()) throw new Error('Select an existing artifact directory');
+    let owned = artifact.fsPath;
+    for (const part of params.path.split('/')) {
+      owned = path.join(owned, part);
+      if (fs.lstatSync(owned).isSymbolicLink()) throw new Error('Mapped artifact paths cannot contain symlinks');
+    }
+    if (!fs.statSync(owned).isFile()) throw new Error('Select an existing generated .py file');
+    const result = validateSourceLocation(await transport.request('pyalamode/sourceLocation', {...params, artifactUri: artifact.toString()}), params.snapshot);
+    if (client !== transport) throw new Error('Source location session changed; refresh diagnostics');
+    output.appendLine('Authored source provenance: ' + JSON.stringify(result));
+    if (result.location === null) { await openView(JSON.stringify(result.provenance, null, 2), 'source-location.json'); return result; }
+    const destination = displayUri(vscode.Uri.parse(result.location.uri));
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(destination), {selection: range(result.location.range)});
+    return result;
   });
   subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration('pyalamode.pythonPath')) { diagnostics.clear(); restart().catch(fail); } }));
   subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => { diagnostics.clear(); restart().catch(fail); }));

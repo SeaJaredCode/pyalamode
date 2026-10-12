@@ -57,14 +57,15 @@ def capture(specs=(("core", "f", 1),)):
                              "context": {"kind": "ast-statement", "ast": C101},
                              "origin": "static source", "count": count, "locations": locations, "review_required": False})
     paths = sorted({row["path"] for row in rows})
-    value = {"schema": 4, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
+    value = {"schema": 5, "kind": "pyalamode-migration-state", "identity_version": m.IDENTITY_VERSION,
+             "syntax_version": "pyalamode.syntax-v1", "source_map_schema": 1,
              "target": "cpython-3.13.1", "runtime_environment": {"filesystem_encoding": "utf-8", "filesystem_errors": "surrogateescape", "utf8_mode": 0},
              "edition": "python-v1", "checker": CHECKER_VERSION, "operation_contract": OPERATION_VERSION,
              "snapshot": "b" * 64, "freshness": "current disk snapshot", "strict_status": int(bool(findings)),
              "current_dependency_status":0,"current_dependency_events":[],
              "current_policy_status": 0, "current_policy_events": {"required_exports": [], "expired_approvals": [], "approval_failures": []},
              "required_operations": [],
-             "inputs": {"sources": {path: {"sha256": "c" * 64, "origin": "disk", "version": None, "disk_sha256": "c" * 64} for path in paths},
+             "inputs": {"sources": {path: {"sha256": "c" * 64, "origin": "disk", "version": None, "disk_sha256": "c" * 64, "source_provenance": None} for path in paths},
                         "policy_sha256": None, "product_artifacts": {name: "d" * 64 for name in m.PRODUCTS}, "integration_inputs": {},"checked_dependencies":{}},
              "scope": {"project_root": "/synthetic/project", "selected_paths": paths, "displayed_paths": paths, "exclusions": []},
              "coverage": {}, "boundaries": rows, "findings": findings, "policy": m._default_policy(), "approvals": [], "unsafe_adapters": []}

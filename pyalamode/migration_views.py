@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ast
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import datetime, timezone
 import difflib
 import fnmatch
@@ -14,7 +14,8 @@ import os
 from pathlib import Path, PurePosixPath
 import tokenize
 
-from .model import CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, diagnostic, runtime_environment
+from .model import CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, diagnostic, runtime_environment, SYNTAX_VERSION, SOURCE_MAP_SCHEMA, FunctionContract
+from . import source_maps as sm
 from .migration import (MigrationError, IDENTITY_VERSION, SOURCE_RULES, GATES,
                         finding_context, normalize_state, compare_states,
                         evaluate_gates, load_reference)
@@ -43,6 +44,26 @@ def _location(path, node=None):
             "column_encoding": "utf-8-bytes"}
 
 
+def _authored_location(snapshot, path, relative, node=None):
+    value = _location(relative, node)
+    unit = snapshot.source_units.get(path)
+    if node is None or unit is None or unit.source_map is None: return value
+    span = sm.ByteSpan(sm.offset_at(unit.normalized_bytes,node.lineno,node.col_offset+1),
+        sm.offset_at(unit.normalized_bytes,node.end_lineno,node.end_col_offset+1))
+    mapped = sm.map_range(unit.source_map,span,source=unit.authored_bytes,generated=unit.normalized_bytes)
+    first,last=sm.position_at(unit.authored_bytes,mapped.source_span.start),sm.position_at(unit.authored_bytes,mapped.source_span.end)
+    value.update(line=first.line,column=first.column,end_line=last.line,end_column=last.column)
+    return value
+
+
+def _authored_line(snapshot, path, line):
+    unit = snapshot.source_units.get(path) or (snapshot.graph.source_units.get(path) if snapshot.graph else None)
+    if unit is None or unit.source_map is None: return line
+    offset=sm.offset_at(unit.normalized_bytes,line,1)
+    mapped=sm.map_range(unit.source_map,sm.ByteSpan(offset,offset),source=unit.authored_bytes,generated=unit.normalized_bytes)
+    return sm.position_at(unit.authored_bytes,mapped.source_span.start).line
+
+
 def _logical(row):
     return {key: row[key] for key in ("kind", "selector", "qualified_name")}
 
@@ -58,7 +79,7 @@ def _policy(policy):
             "integration_approvals": copy.deepcopy(policy.get("integration_approvals", [])),
             "required_exports": list(policy.get("required_exports", [])),
             "boundary_guards": policy.get("boundary_guards", "off"),
-            "guarded_exports": list(policy.get("guarded_exports", [])), "distribution":copy.deepcopy(policy.get("distribution")), "checked_dependencies":copy.deepcopy(policy.get("checked_dependencies",[])), "builders":policy.get("builders",False), "tasks":policy.get("tasks",False), "migration": migration}
+            "guarded_exports": list(policy.get("guarded_exports", [])), "distribution":copy.deepcopy(policy.get("distribution")), "checked_dependencies":copy.deepcopy(policy.get("checked_dependencies",[])), "builders":policy.get("builders",False), "tasks":policy.get("tasks",False), "edition": policy.get("edition", EDITION), "migration": migration}
 
 
 def inventory(root, paths=None):
@@ -77,7 +98,7 @@ def inventory(root, paths=None):
         relative = _relative(path, root)
         if any(part in _EXCLUDED or part.endswith(".egg-info") or part.startswith(".pyalamode-build-") for part in Path(relative).parts):
             raise MigrationError("display selection is excluded source: " + relative)
-        if not path.exists() or (path.is_file() and path.suffix != ".py"):
+        if not path.exists() or (path.is_file() and path.suffix not in {".py", ".pya"}):
             raise MigrationError("display selection must be existing project-local Python source or directory")
         requested.append(path)
     return {"requested": requested, "exclusions": sorted(exclusions, key=lambda row: (row["path"], row["reason"]))}
@@ -117,6 +138,33 @@ def _signature(node):
     if isinstance(node, ast.ClassDef):
         return json.dumps([ast.dump(n, include_attributes=False, show_empty=False) for n in node.body], separators=(",", ":"))
     return None
+
+
+def _constructor_aliases(analyzer):
+    """Exact generated Name occurrences with their actual stable import owner."""
+    unit = analyzer.graph.source_units.get(analyzer.path)
+    if unit is None or unit.translation is None: return {}
+    admitted = {}
+    for family in unit.translation.used_collections:
+        alias = "_pyalamode_syntax_"+family
+        symbol = analyzer.symbols.get(alias)
+        if (symbol and symbol.kind == "import" and symbol.name == "pyalamode:"+family
+                and analyzer._symbol_stable(alias,symbol) and not analyzer._module_changed("pyalamode",family)):
+            admitted[alias] = family
+    return {str(node.lineno)+":"+str(node.col_offset+1)+":"+node.id: admitted[node.id]
+        for node in ast.walk(analyzer.tree) if isinstance(node,ast.Name) and isinstance(node.ctx,ast.Load) and node.id in admitted}
+
+
+def _canonical_node(analyzer, node):
+    """Normalize only actual compiler-owned constructor binding occurrences."""
+    aliases = _constructor_aliases(analyzer)
+    cloned = copy.deepcopy(node)
+    class ConstructorNames(ast.NodeTransformer):
+        def visit_Name(self, value):
+            key = str(value.lineno)+":"+str(value.col_offset+1)+":"+value.id
+            if isinstance(value.ctx,ast.Load) and key in aliases: value.id=aliases[key]
+            return value
+    return ConstructorNames().visit(cloned) if aliases else cloned
 
 
 def _project_policy_diagnostic(result, item):
@@ -185,7 +233,7 @@ def _operation_rows(snapshot):
                 canonical = "pyalamode." + operation
                 for line in lines:
                     row = {"boundary": graph.module_name(owner.analyzer.path) + ":" + owner.qualified,
-                           "path": _relative(info.analyzer.path, root) if info.analyzer.path in snapshot.sources else next(m["authored_path"] for r in graph.distributions["receipts"].values() if r.get("_payload") for m in r["_payload"]["modules"] if m["module"]==graph.module_name(info.analyzer.path)), "line": line, "via": via,
+                           "path": _relative(info.analyzer.path, root) if info.analyzer.path in snapshot.sources else next(m["authored_path"] for r in graph.distributions["receipts"].values() if r.get("_payload") for m in r["_payload"]["modules"] if m["module"]==graph.module_name(info.analyzer.path)), "line": _authored_line(snapshot, info.analyzer.path, line), "via": via,
                            "source_owner": "project" if info.analyzer.path in snapshot.sources else next({"name":r["declaration"]["name"],"version":r["declaration"]["version"],"package":graph.module_name(info.analyzer.path).split(".")[0]} for r in graph.distributions["receipts"].values() if r["declaration"]["name"]==graph.source_owners[info.analyzer.path])}
                     sites.setdefault(canonical, {})[_canonical(row)] = row
             pending.extend((target_, "retained" if via == "retained" else "invoked") for target_ in info.calls)
@@ -224,7 +272,7 @@ def capture_state(snapshot, policy, inventory):
             module_reasons = (["module_marker"] if marker else []) + (["required_module"] if required else [])
             def append(kind, node, qualified, selected, evidence=None, info=None):
                 selector = "module:" + module if kind == "module" else module + ":" + qualified
-                contract = info.contract if info and kind == "function" else None
+                contract = next((c for c in file.contracts if c.name == qualified), None) if kind == "function" else None
                 data = asdict(contract) if contract else evidence or {}
                 reasons = list(module_reasons) if selected else []
                 if kind == "function" and info:
@@ -244,7 +292,8 @@ def capture_state(snapshot, policy, inventory):
                 if debug:
                     debug["path"] = relative
                 row = {"id": None, "kind": kind, "selector": selector, "path": relative, "qualified_name": module if kind == "module" else qualified,
-                       "signature": _signature(node), "definition_sha256": _hash(ast.dump(node or analyzer.tree, include_attributes=False, show_empty=False)),
+                       "signature": _signature(_canonical_node(analyzer,node)) if node is not None else None,
+                       "definition_sha256": _hash(ast.dump(_canonical_node(analyzer,node or analyzer.tree), include_attributes=False, show_empty=False)),
                        "selected": bool(selected), "selection_reasons": sorted(set(reasons)), "strict_checked": checked,
                        "public_export": public, "required_export": kind == "function" and public and selector in policy.get("required_exports", []),
                        "mode": "strict" if selected else "off", "source_evidence": source_evidence,
@@ -252,7 +301,7 @@ def capture_state(snapshot, policy, inventory):
                        "external_assumptions": copy.deepcopy(data.get("external_assumptions", [])),
                        "failures": {"invocation": data.get("failures", []), "definition": data.get("definition_failures", []), "initialization": file.initialization_failures if kind == "module" else []},
                        "guard_coverage": {"mode": snapshot.result.boundary_guards, "selected_export": guard, "debug": debug, "data_assertions": data.get("data_assertions", [])},
-                       "location": _location(relative, node)}
+                       "location": _authored_location(snapshot, path, relative, node)}
                 boundaries.append(row)
                 boundary_nodes.setdefault((relative, "<module>" if kind == "module" else qualified), []).append(row)
             if analyzer.tree is None:
@@ -269,7 +318,7 @@ def capture_state(snapshot, policy, inventory):
                         for kind, declarations, evidence_rows in (("record", graph.record_declarations, file.records), ("variant", graph.variant_declarations, file.variants)):
                             declaration = next((info for info in declarations if info.analyzer is analyzer and info.node is node), None)
                             if declaration:
-                                data = next((data for data in evidence_rows if data["name"] == node.name and data["line"] == node.lineno), {})
+                                data = next((data for data in evidence_rows if data["name"] == node.name), {})
                                 append(kind, node, prefix + node.name, True, data)
                         visit(node.body, prefix + node.name + ".")
                     else:
@@ -295,14 +344,31 @@ def capture_state(snapshot, policy, inventory):
                 context = {"kind": "unavailable", "reason": "diagnostic boundary ownership is unavailable or ambiguous"}
             else:
                 boundary = possible[0]
-                context = finding_context(snapshot.sources[file.path], asdict(item), boundary)
+                from .checker import public_result
+                analyzer = graph.analyzers[file.path]
+                unit = graph.source_units[file.path]
+                private_rows = []
+                for d in analyzer.result.diagnostics:
+                    if (d.rule,d.boundary,d.reason) != (item.rule,item.boundary,item.reason): continue
+                    probe = copy.deepcopy(analyzer.result)
+                    probe.diagnostics = [d]
+                    mapped = public_result(probe,unit).diagnostics[0]
+                    if asdict(mapped) == asdict(item): private_rows.append(d)
+                private_boundary = copy.deepcopy(boundary)
+                private_node = next((i.node for i in analyzer.infos.values() if i.qualified == item.boundary), None)
+                private_boundary["location"] = _location(relative, private_node)
+                if len(private_rows) != 1 or private_rows[0].origin == "experimental source frontend":
+                    context = {"kind":"unavailable","reason":"diagnostic has no unique normalized authored occurrence"}
+                else:
+                    context = finding_context(analyzer.source, asdict(private_rows[0]), private_boundary, constructor_aliases=_constructor_aliases(analyzer))
             if boundary is None:
                 raise MigrationError("diagnostic has no captured module boundary")
             location = {key: asdict(item)[key] for key in ("line", "column", "end_line", "end_column", "column_encoding", "first_binding", "reason", "remediation")}
             location["path"] = _relative(item.path, root)
             if location["first_binding"]:
-                first_path, first_line = location["first_binding"].rsplit(":", 1)
-                location["first_binding"] = _relative(first_path, root) + ":" + first_line
+                parts = location["first_binding"].rsplit(":", 2)
+                first_path, tail = (parts[0], ":".join(parts[1:])) if len(parts) == 3 and parts[1].isdecimal() else (parts[-2], parts[-1])
+                location["first_binding"] = _relative(first_path, root) + ":" + tail
             key = _hash({"rule": item.rule, "boundary": _logical(boundary), "signature": boundary["signature"], "context": context, "origin": item.origin})
             if key not in grouped:
                 grouped[key] = {"id": None, "identity_key": None, "birth_identity": None, "rule": item.rule,
@@ -327,8 +393,9 @@ def capture_state(snapshot, policy, inventory):
             unsafe.append(row)
     modules = [row for row in boundaries if row["kind"] == "module"]
     functions = [row for row in boundaries if row["kind"] == "function"]
-    state = {"schema": 4, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
-             "target": TARGET, "runtime_environment": runtime_environment(), "edition": EDITION, "checker": CHECKER_VERSION,
+    state = {"schema": 5, "kind": "pyalamode-migration-state", "identity_version": IDENTITY_VERSION,
+             "syntax_version": SYNTAX_VERSION, "source_map_schema": SOURCE_MAP_SCHEMA,
+             "target": TARGET, "runtime_environment": runtime_environment(), "edition": policy.get("edition", EDITION), "checker": CHECKER_VERSION,
              "operation_contract": OPERATION_VERSION, "snapshot": snapshot.snapshot, "freshness": snapshot.freshness,
              "strict_status": max(snapshot.result.dependency_status,snapshot.result.source_status if snapshot.result.source_status is not None else snapshot.result.status),
              "current_policy_status": snapshot.result.current_policy_status, "current_policy_events": current_events,
@@ -694,7 +761,7 @@ def _preview_result(snapshot, state, target, *, status, blockers, edits=None, ca
             "candidate_snapshot": candidate.snapshot if candidate else None,
             "candidate_inputs": copy.deepcopy(candidate.inputs) if candidate else None,
             "candidate_freshness": candidate.freshness if candidate else None,
-            "retained_dimensions": ["effects", "external trust", "failures", "operations", "untargeted input identities"],
+            "retained_dimensions": [field.name for field in fields(FunctionContract)] + ["records", "variants", "initialization", "setup_observations", "untargeted input identities"],
             "limits": limits, "applied": False}
 
 
@@ -723,6 +790,7 @@ def convert_preview(snapshot, state, target):
     root = Path(snapshot.inputs["root"])
     path = str(root / boundary["path"])
     analyzer = snapshot.graph.analyzers[path]
+    repair_relation = None
     if boundary["selected"] and kind == "function":
         findings = [row for row in state["findings"] if row["logical_boundary"] == _logical(boundary)]
         repair = next((row for row in findings if row["rule"] in {"PAL101", "PAL250"}), None)
@@ -737,6 +805,7 @@ def convert_preview(snapshot, state, target):
                     proposal = session.preview({"uri": Path(path).as_uri(), "version": session.documents[path]["version"],
                                                "snapshot": session.current.snapshot, "diagnosticIndex": item["data"]["diagnosticIndex"]})
                     after = proposal["after"]
+                    repair_relation = session._last_repair_relation
                 except ProtocolError as error:
                     return _preview_result(snapshot, state, target, status=max(1, state["current_policy_status"]), blockers=[str(error)], limits="Inherited conservative M9 repair refusal.")
             else:
@@ -773,7 +842,8 @@ def convert_preview(snapshot, state, target):
             marker = _available_marker(snapshot.graph.analyzers[item["path"]], node)
             if marker is None:
                 return _preview_result(snapshot, state, target, status=1, blockers=["actual marker availability is not established"])
-            insertions.setdefault(item["path"], []).append((node.lineno - 1, "@" + marker + _newline(snapshot.sources[item["path"]])))
+            authored_line = _authored_location(snapshot,item["path"],item["path"],node)["line"]
+            insertions.setdefault(item["path"], []).append((authored_line - 1, "@" + marker + _newline(snapshot.sources[item["path"]])))
         changed = {}
         for source, rows in insertions.items():
             lines = _physical_lines(snapshot.sources[source])
@@ -806,14 +876,39 @@ def convert_preview(snapshot, state, target):
         after = candidate.inputs["sources"].get(source)
         if after is None or (source not in changed and row != after) or (source in changed and row["disk_sha256"] != after["disk_sha256"]):
             blockers.append("untargeted source/disk identity changed: " + source)
-    retained = ("external_assumptions", "effect_bound", "required_effects", "failures", "definition_failures", "operations", "operation_contracts")
+    from .project import _contract_comparison, _occurrence_relation, _file_dimensions_equal
     for file in snapshot.result.results:
         other = next((file_ for file_ in candidate.result.results if file_.path == file.path), None)
+        relation = _occurrence_relation(snapshot,candidate,file.path) if file.path in changed else None
+        # Adoption changes the reviewed target's participation. Repair and all
+        # untargeted files retain their complete declaration/init/setup facts.
+        if (repair_relation is not None or file.path not in changed) and (other is None or not _file_dimensions_equal(file,other,relation=relation,repair=repair_relation if file.path == path else None)):
+            blockers.append("existing declaration/initialization/setup dimensions changed: " + file.path)
         for old in file.contracts:
             new = next((contract for contract in other.contracts if contract.name == old.name), None) if other else None
-            if new is None or any(getattr(old, key) != getattr(new, key) for key in retained):
+            repair_ = repair_relation if file.path == path and old.name == name else None
+            comparison = _contract_comparison(old,new,relation=relation,repair=repair_) if new is not None else None
+            demotion = {"source_evidence": "unverified: audit or failed selected gate",
+                "freshness": "no successful checked claim", "behavior": "unverified behavior; no certified effect bound"}
+            if (comparison is not None and not comparison["matched"] and kind == "function" and repair_relation is None
+                    and file.path in changed and candidate.result.status == 1 and candidate.result.source_status == 1
+                    and not snapshot.result.audit and not candidate.result.audit and other.diagnostics
+                    and old.source_evidence == "checked participating source" and old.freshness == "current for recorded inputs"
+                    and old.behavior == ("pure" if not old.effect_bound else "effects <= {" + ", ".join(old.effect_bound) + "}")
+                    and all(getattr(new,key) == value for key,value in demotion.items())):
+                expected = asdict(old)
+                expected.update(demotion)
+                if _contract_comparison(expected,new,relation=relation)["matched"]:
+                    blockers.append({"reason": "candidate source refusal demotes existing local evidence",
+                        "boundary": _module_name(file.path, root) + ":" + old.name,
+                        "demotion_fields": sorted(demotion), "contract_comparison": comparison})
+                    continue
+            if comparison is None or not comparison["matched"]:
                 blockers.append("existing participating dimensions changed: " + _module_name(file.path, root) + ":" + old.name)
-    status = max(candidate.result.status, 2 if any("changed" in str(row) or "stale" in str(row) for row in blockers) else 0)
+    dimension_blockers = [row for row in blockers if not (type(row) is dict
+        and set(row) == {"reason", "boundary", "demotion_fields", "contract_comparison"}
+        and row["reason"] == "candidate source refusal demotes existing local evidence")]
+    status = max(candidate.result.status, 2 if any("changed" in str(row) or "stale" in str(row) for row in dimension_blockers) else 0)
     if candidate.result.status:
         blockers += [asdict(item) for item in candidate.result.tooling] + [asdict(item) for file in candidate.result.results for item in file.diagnostics]
     return _preview_result(snapshot, state, target, status=status, blockers=blockers, edits=edits, candidate=candidate,

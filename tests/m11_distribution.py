@@ -39,7 +39,7 @@ class DistributionTests(unittest.TestCase):
     def test_wheel_separate_consumer_build_and_owned_capture(self):
         self.wheel();r=self.check();self.assertEqual(r.status,0,r.to_dict());self.assertTrue(r.checked_dependencies[0]['verified']);self.assertEqual(len(r.results),1)
         built=build_paths([self.consumer],root=self.consumer,output=self.base/'built');self.assertEqual(built.status,0,built.to_dict())
-        snap,state,report,_=observe(self.consumer);self.assertEqual(state['schema'],4);self.assertEqual(state['coverage']['eligible_modules'],1);self.assertEqual(state['coverage']['eligible_functions'],1);self.assertEqual(report['status'],0)
+        snap,state,report,_=observe(self.consumer);self.assertEqual(state['schema'],5);self.assertEqual(state['coverage']['eligible_modules'],1);self.assertEqual(state['coverage']['eligible_functions'],1);self.assertEqual(report['status'],0)
     def test_missing_used_complete_semantic_and_recordable(self):
         r=self.check();self.assertEqual(r.status,1);self.assertIn('PAL370',[x.rule for f in r.results for x in f.diagnostics]);self.assertTrue(r.checked_dependencies[0]['complete'])
         self.assertEqual(next(x for f in r.results for x in f.diagnostics if x.rule=='PAL370').dependency_context['reason_code'],'missing-distribution')
@@ -341,7 +341,7 @@ def quote(zulu:int,alpha:int)->int:
             row=corrupted['required_operations'][0] if sites=='required' else corrupted['current_policy_events']['approval_failures'][0]['before' if sites=='event-before' else 'after']
             row['required_by'][0]['source_owner']='project'
             with self.subTest(sites=sites),self.assertRaises(m.MigrationError):m._state(corrupted,retained=True)
-        _,state,report,_=observe(root);self.assertEqual(state['schema'],4);self.assertEqual(len(state['inputs']['product_artifacts']),26);self.assertEqual(state['strict_status'],1);self.assertEqual(len(report['comparison']['retained_findings']),2);self.assertEqual(report['comparison']['new_findings'],[])
+        _,state,report,_=observe(root);self.assertEqual(state['schema'],5);self.assertEqual(len(state['inputs']['product_artifacts']),28);self.assertEqual(state['strict_status'],1);self.assertEqual(len(report['comparison']['retained_findings']),2);self.assertEqual(report['comparison']['new_findings'],[])
         with self.assertRaises(m.MigrationError):m.write_baseline(root,reference['state'],owner='team',rationale='cannot recertify historical inputs',replace=True,prepublish=lambda:None)
         for name,text in archive['files'].items():self.assertEqual((root/name).read_bytes(),text.encode())
 
@@ -404,6 +404,16 @@ def quote(zulu:int,alpha:int)->int:
         (self.consumer/'pyproject.toml').write_text(approval(self.consumer,'consumer team')+CONSUMER+bridge_dependency)
         accepted=self.check();self.assertEqual(accepted.status,0,accepted.to_dict());contract=accepted.results[0].contracts[0]
         self.assertTrue(any('checked_pricing-1.0.0.dist-info/pyalamode/sources/checked_pricing/core.py::quote' in target for target in contract.invoked_targets));self.assertEqual(contract.external_assumptions[0]['approval']['owner'],'consumer team')
+        origin_capture={};origin_checked=self.check(_capture=origin_capture)
+        self.assertEqual(origin_checked.status,0,origin_checked.to_dict())
+        birth=origin_capture['distribution_snapshot']['receipts']['checked-pricing']
+        comparison=birth['_contract_comparisons']['checked_pricing.core:quote']
+        self.assertTrue(comparison['matched']);self.assertEqual(len(comparison['fields']),43)
+        external=next(row for row in comparison['fields']if row['field']=='external_assumptions')
+        self.assertEqual(external['before'][0]['approval']['owner'],'base producer')
+        self.assertEqual(external['after'][0]['approval']['owner'],'consumer team')
+        self.assertEqual(external['rule'],'verified-producer-origin-context')
+        self.assertEqual(next(row for row in origin_checked.checked_dependencies if row['declaration']['name']=='checked-pricing')['exports'][0]['contract']['external_assumptions'][0]['approval']['owner'],'consumer team')
         for imported,called in (('from checked_bridge import hidden','hidden(value)'),('import checked_bridge as bridge','bridge.hidden(value)')):
             (self.consumer/'use.py').write_text('from pyalamode import fun\n'+imported+'\n@fun\ndef total(value:bytes)->bytes:\n    return '+called+'\n')
             refused=self.check();self.assertEqual(refused.status,1,refused.to_dict());diagnostics=[x for f in refused.results for x in f.diagnostics];self.assertEqual([x.rule for x in diagnostics],['PAL371']);context=diagnostics[0].dependency_context
@@ -549,6 +559,67 @@ def quote(zulu:int,alpha:int)->int:
                 derived,_=original(altered,policy,integrations,self.consumer);result=derived.modules['checked_pricing.core'].result;contract=result.contracts[0]
                 self.assertEqual(result.status,1);self.assertEqual(contract.data_assertions,[]);self.assertFalse(contract.source_evidence.startswith('checked'));self.assertTrue(any(x.rule==('PAL240'if label=='writer'else 'PAL221')for x in result.diagnostics));self.assertEqual(derived.integrations['sha256_digest']['admission'],'denied')
         (self.consumer/'pyproject.toml').write_text(approval(self.consumer,'independent consumer team')+CONSUMER);accepted=self.check();self.assertEqual(accepted.status,0,accepted.to_dict());self.assertEqual(accepted.checked_dependencies[0]['source_status'],0);self.assertTrue(accepted.checked_dependencies[0]['exports'])
+
+        from pyalamode.project import _distribution_contract_relation
+        from pyalamode.model import FunctionContract
+        from dataclasses import fields
+        origin_capture={};origin_checked=self.check(_capture=origin_capture)
+        self.assertEqual(origin_checked.status,0,origin_checked.to_dict())
+        birth=origin_capture['distribution_snapshot']['receipts']['checked-pricing']
+        comparison=birth['_contract_comparisons']['checked_pricing.core:quote']
+        self.assertTrue(comparison['matched']);self.assertEqual(len(comparison['fields']),43)
+        self.assertEqual({row['field']for row in comparison['fields']},{field.name for field in fields(FunctionContract)})
+        external=next(row for row in comparison['fields']if row['field']=='external_assumptions')
+        self.assertEqual(external['before'][0]['approval']['owner'],'producer team')
+        self.assertEqual(external['after'][0]['approval']['owner'],'independent consumer team')
+        self.assertEqual(external['rule'],'verified-producer-origin-context')
+        actual={row['field']:copy.deepcopy(row['after'])for row in comparison['fields']}
+        payload=birth['_payload'];claim=next(row['contract']for row in payload['exports']if row['selector']=='checked_pricing.core:quote')
+        producer_policy=birth['_producer_policy'];current=origin_capture['graph']
+        self.assertTrue(_distribution_contract_relation(payload,actual,claim,current,'function',producer_policy)['matched'])
+        for field,value in (('trust',['fabricated trust']),('failures',[]),('required_effects',['Clock']),('captures',{'invented':'int'}),('source_evidence','checked fabricated source')):
+            with self.subTest(fraud=field):
+                forged=copy.deepcopy(claim);forged[field]=value
+                with self.assertRaises(d.DistributionError):_distribution_contract_relation(payload,actual,forged,current,'function',producer_policy)
+        for field,value in (('behavior','fabricated native behavior'),('effects',['Clock']),('failures',[]),('native_operations',['_sha2.invented']),('invocation_backend','binascii'),('contract_sha256','0'*64)):
+            with self.subTest(fraud='operation-'+field):
+                forged=copy.deepcopy(claim);next(row for row in forged['operation_contracts']if row['identity']==operation)[field]=value
+                with self.assertRaises(d.DistributionError):_distribution_contract_relation(payload,actual,forged,current,'function',producer_policy)
+        forged=copy.deepcopy(claim);forged['external_assumptions'][0]['approval']['owner']='counterfeit origin owner'
+        with self.assertRaises(d.DistributionError):_distribution_contract_relation(payload,actual,forged,current,'function',producer_policy)
+        forged_payload=copy.deepcopy(payload);forged_payload['inputs']['integration_inputs'][operation]['approval']['owner']='counterfeit captured owner'
+        with self.assertRaises(d.DistributionError):_distribution_contract_relation(forged_payload,actual,claim,current,'function',producer_policy)
+        forged=copy.deepcopy(claim);forged['external_assumptions'][0]['installed_identity']['adapter_artifact']['sha256']='0'*64
+        with self.assertRaises(d.DistributionError):_distribution_contract_relation(payload,actual,forged,current,'function',producer_policy)
+        forged=copy.deepcopy(claim);forged_payload=copy.deepcopy(payload);forged_policy=copy.deepcopy(producer_policy)
+        changed_identity=forged['external_assumptions'][0]['installed_identity'];changed_identity['abiflags']='t'
+        changed_digest=d.digest(changed_identity)
+        original_token='external '+operation+' contract='+claim['external_assumptions'][0]['contract_sha256']+' dependency='+claim['external_assumptions'][0]['dependency_sha256']+' approval='+claim['external_assumptions'][0]['admission']
+        changed_token='external '+operation+' contract='+claim['external_assumptions'][0]['contract_sha256']+' dependency='+changed_digest+' approval='+claim['external_assumptions'][0]['admission']
+        self.assertEqual(forged['trust'].count(original_token),1)
+        forged['trust']=sorted(changed_token if token==original_token else token for token in forged['trust'])
+        for row in (forged['external_assumptions'][0],next(row for row in forged['operation_contracts']if row['identity']==operation)):
+            row['installed_identity']=copy.deepcopy(changed_identity);row['dependency_sha256']=changed_digest;row['approval']['dependency_sha256']=changed_digest
+        forged_payload['inputs']['integration_inputs'][operation]['dependency_sha256']=changed_digest
+        forged_payload['inputs']['integration_inputs'][operation]['approval']['dependency_sha256']=changed_digest
+        next(row for row in forged_policy['integration_approvals']if row['operation']==operation)['dependency_sha256']=changed_digest
+        with self.assertRaises(d.DistributionError):_distribution_contract_relation(forged_payload,actual,forged,current,'function',forged_policy)
+        evidence_bytes=ep.read_bytes();record_bytes=record.read_bytes();policy_bytes=(info/'pyalamode/policy.toml').read_bytes()
+        try:
+            for label in ('origin-approval-owner','catalog-behavior','native-operations'):
+                with self.subTest(repaired_envelope_fraud=label):
+                    forged_envelope=json.loads(evidence_bytes);forged_payload=forged_envelope['payload'];forged_claim=next(row['contract']for row in forged_payload['exports']if row['selector']=='checked_pricing.core:quote')
+                    if label=='origin-approval-owner':
+                        forged_payload['inputs']['integration_inputs'][operation]['approval']['owner']='counterfeit birth owner'
+                        forged_claim['external_assumptions'][0]['approval']['owner']='counterfeit birth owner'
+                        next(row for row in forged_claim['operation_contracts']if row['identity']==operation)['approval']['owner']='counterfeit birth owner'
+                    else:next(row for row in forged_claim['operation_contracts']if row['identity']==operation)['behavior'if label=='catalog-behavior'else 'native_operations']='fabricated behavior'if label=='catalog-behavior'else ['_sha2.invented']
+                    forged_envelope['sha256']=d.digest(forged_payload);ep.write_bytes(d.canonical(forged_envelope));self.rewrite_record()
+                    rejected=self.check();self.assertEqual(rejected.status,2,rejected.to_dict());self.assertEqual([row.rule for row in rejected.tooling],['PAL001']);self.assertFalse(rejected.verified)
+                    self.assertEqual(rejected.checked_dependencies[0]['input_status'],2);self.assertEqual(rejected.checked_dependencies[0]['exports'],[])
+        finally:ep.write_bytes(evidence_bytes);record.write_bytes(record_bytes)
+        self.assertEqual((info/'pyalamode/policy.toml').read_bytes(),policy_bytes);self.assertEqual(self.check().status,0)
+        self.assertEqual(payload,birth['_payload']);self.assertEqual(actual,{row['field']:row['after']for row in comparison['fields']})
 
     def nominal_writer_install(self,mode):
         if (self.base/'out').exists():(self.base/'out').rename(self.base/('retained-out-'+mode))

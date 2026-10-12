@@ -6,10 +6,13 @@ import hashlib
 from pathlib import Path
 import sys
 
-CHECKER_VERSION = "characterized-tasks-13.0"
+CHECKER_VERSION = "experimental-syntax-14.0"
 EDITION = "python-v1"
+EXPERIMENTAL_EDITION = "pyalamode-v1-experimental"
+SYNTAX_VERSION = "pyalamode.syntax-v1"
+SOURCE_MAP_SCHEMA = 1
 TARGET = "cpython-3.13.1"
-OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-builder-task-ops-13"
+OPERATION_VERSION = "scalar-tuple-call-collection-record-boundary-effect-domain-failure-standard-integration-encoding-distribution-builder-task-syntax-ops-14"
 SCALARS = frozenset({"None", "bool", "int", "str", "bytes"})
 
 
@@ -22,9 +25,12 @@ def foundation_identities() -> dict[str, str]:
     """Actual installed product bytes, so labels alone cannot keep old evidence fresh."""
     directory = Path(__file__).resolve().parent
     return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py", "builders.py", "builder_contracts.py", "tasks.py", "task_contracts.py")}
+            for name in ("__init__.py", "integrations.py", "integration_contracts.py", "standard.py", "standard_contracts.py", "variants.py", "failures.py", "effects.py", "collections.py", "records.py", "boundaries.py", "guardgen.py", "model.py", "checker.py", "project.py", "cli.py", "editor.py", "migration.py", "migration_views.py", "distribution.py", "encoding.py", "encoding_contracts.py", "builders.py", "builder_contracts.py", "tasks.py", "task_contracts.py", "syntax.py", "source_maps.py")}
 
 RULES = {
+    "PAL390": ("experimental source selection required", "Select pyalamode-v1-experimental and an actual whole-module # mode: fun directive for authored .pya source."),
+    "PAL391": ("experimental display unsupported", "Use an admitted immutable display or an actual direct annotated Vector/Map empty initializer; comprehensions and mutation remain unsupported."),
+    "PAL392": ("experimental compiler name collision", "Keep val and compiler-private constructor bindings reserved; use a fresh ordinary authored binding."),
     "PAL382": ("characterized tasks disabled", "Explicitly opt into tasks=true after reviewing the finite synchronous task, callback, capture and scheduling contract."),
     "PAL380": ("confined construction disabled", "Use immutable construction or explicitly opt into builders=true after reviewing the finite confinement contract."),
     "PAL381": ("confined construction lifetime or escape unsupported", "Keep one fresh lexical callback parameter, direct append/extend statements and automatic finalization; builders and construction callbacks cannot be aliased, retained or transferred."),
@@ -154,6 +160,7 @@ class CheckResult:
     setup_observations: list[dict] = field(default_factory=list)
     unsafe_adapters: list[dict] = field(default_factory=list)
     integration_inputs: dict[str, dict] = field(default_factory=dict)
+    source_provenance: dict | None = None
 
     @property
     def verified(self) -> bool:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 from dataclasses import asdict
 import difflib
 import hashlib
@@ -18,7 +19,8 @@ import re
 import sys
 from urllib.parse import unquote, urlsplit
 
-from .model import CHECKER_VERSION, TARGET, diagnostic, foundation_identities
+from .model import CHECKER_VERSION, TARGET, diagnostic, foundation_identities, SYNTAX_VERSION, SOURCE_MAP_SCHEMA
+from . import source_maps as sm
 from .project import check_snapshot
 
 MAX_BODY = 8 * 1024 * 1024
@@ -44,12 +46,15 @@ def uri_path(uri, root, *, python=False, directory=False):
         decoded = unquote(parsed.path, encoding="utf-8", errors="strict")
         if "\x00" in decoded or not decoded.startswith("/"):
             raise ValueError
-        path = Path(decoded).resolve()
+        physical = Path(decoded)
+        if physical.suffix == ".pya" and (physical.is_symlink() or any(p.is_symlink() for p in physical.parents)):
+            raise ValueError("dialect document is not a regular physical owner")
+        path = physical.resolve()
     except (UnicodeError, ValueError, OSError):
         raise ProtocolError("invalid local file URI path") from None
     if not path.is_relative_to(root) or (directory and not path.is_dir()) or (not directory and not path.is_file()):
         raise ProtocolError("URI must resolve to existing content within this workspace")
-    if python and path.suffix != ".py":
+    if python and path.suffix not in {".py", ".pya"}:
         raise ProtocolError("document must be an existing Python file")
     return path
 
@@ -67,6 +72,7 @@ def position(text, line, column, encoding="utf-8-bytes"):
     value = lines[number]
     count = max(0, (column or 1) - 1)
     if encoding == "utf-8-bytes":
+        if number == 0 and value.startswith("\ufeff"): count += 3
         prefix = value.encode("utf-8")[:count].decode("utf-8", errors="ignore")
     else:
         prefix = value[:count]
@@ -112,11 +118,19 @@ def _selection(text, node):
             "end": position(text, node.lineno, match.end(1) + 1, "unicode-codepoints")}
 
 
-def _definitions(text):
+def _definitions(text, unit=None):
     try:
-        tree = ast.parse(text, feature_version=(3, 13))
+        tree = ast.parse(unit.normalized_text if unit else text, feature_version=(3, 13))
     except (SyntaxError, ValueError):
         return {}, None
+    if unit and unit.source_map:
+        for node in ast.walk(tree):
+            if getattr(node, "end_lineno", None) is None: continue
+            start = sm.offset_at(unit.normalized_bytes, node.lineno, node.col_offset + 1)
+            end = sm.offset_at(unit.normalized_bytes, node.end_lineno, node.end_col_offset + 1)
+            mapped = sm.map_range(unit.source_map, sm.ByteSpan(start, end), source=unit.authored_bytes, generated=unit.normalized_bytes)
+            first, last = sm.position_at(unit.authored_bytes, mapped.source_span.start), sm.position_at(unit.authored_bytes, mapped.source_span.end)
+            node.lineno, node.col_offset, node.end_lineno, node.end_col_offset = first.line, first.column - 1, last.line, last.column - 1
     nodes = {}
     def visit(body, prefix=""):
         for node in body:
@@ -147,6 +161,7 @@ class EditorSession:
         self.regions = []
         self.nodes = {}
         self.startup_products = foundation_identities()
+        self.located_artifact = None
 
     def drain_notifications(self):
         items, self.notifications = self.notifications, []
@@ -165,7 +180,7 @@ class EditorSession:
                     contract.source_evidence = "unverified: loaded server implementation changed"
                     contract.freshness = "stale; restart required"
                     contract.behavior = "unverified behavior; no certified effect bound"
-        self.nodes = {path: _definitions(text)[0] for path, text in self.current.sources.items()}
+        self.nodes = {path: _definitions(text, self.current.source_units.get(path))[0] for path, text in self.current.sources.items()}
         self.regions = []
         for file in self.current.result.results:
             text = self.current.sources.get(file.path, "")
@@ -201,11 +216,12 @@ class EditorSession:
             lsp_diagnostic = {"range": range_, "severity": 2 if self.audit and item.rule not in {"PAL001", "PAL002"} else 1,
                           "code": item.rule, "source": "pyalamode", "message": item.reason + "\n" + item.remediation, "data": data}
             if item.first_binding:
-                first_path, first_line = item.first_binding.rsplit(":", 1)
+                parts = item.first_binding.rsplit(":", 2)
+                first_path, first_line, first_column = parts if len(parts) == 3 and parts[-2].isdecimal() else (parts[-2], parts[-1], "1")
                 first = Path(first_path).resolve()
                 if first.is_relative_to(self.root):
                     first_text = self.current.sources.get(str(first), "")
-                    start = position(first_text, int(first_line), 1)
+                    start = position(first_text, int(first_line), int(first_column))
                     lsp_diagnostic["relatedInformation"] = [{"location": {"uri": first.as_uri(), "range": {"start": start, "end": start}}, "message": "first binding: " + item.first_binding}]
             uri = path.as_uri()
             self.diagnostics.append({"uri": uri, **lsp_diagnostic})
@@ -244,7 +260,7 @@ class EditorSession:
         edges = []
         for file in self.current.result.results:
             text = self.current.sources.get(file.path, "")
-            _, tree = _definitions(text)
+            _, tree = _definitions(text, self.current.source_units.get(file.path))
             if tree is None:
                 continue
             calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
@@ -287,10 +303,12 @@ class EditorSession:
             self.initialized = True
             return {"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": True, "change": 1, "save": {"includeText": False}},
                     "hoverProvider": True, "definitionProvider": True, "referencesProvider": True,
-                    "documentSymbolProvider": True, "codeActionProvider": True,
-                    "experimental": {"pyalamode": {"schema": 1, "target": TARGET, "pythonExecutable": sys.executable,
-                        "pythonVersion": list(sys.version_info[:3]), "platform": sys.platform, "root": str(self.root),
-                        "filesystemEncoding": sys.getfilesystemencoding(), "filesystemErrors": sys.getfilesystemencodeerrors()}}},
+                    "documentSymbolProvider": True, "codeActionProvider": True, "documentFormattingProvider": True,
+                    "experimental": {"pyalamode": {"schema": 2, "target": TARGET, "pythonExecutable": sys.executable,
+                        "pythonVersion": "3.13.1", "platform": sys.platform, "root": str(self.root),
+                        "filesystemEncoding": sys.getfilesystemencoding(), "filesystemErrors": sys.getfilesystemencodeerrors(),
+                        "languages": ["python", "pyalamode"], "syntaxVersion": SYNTAX_VERSION, "sourceMapSchema": SOURCE_MAP_SCHEMA,
+                        "formatProfile": "val-whitespace-v1"}}},
                     "serverInfo": {"name": "pyalamode", "version": CHECKER_VERSION}}
         if not self.initialized:
             raise ProtocolError("server must be initialized", -32002)
@@ -315,7 +333,7 @@ class EditorSession:
                 if type(version) is not int or version < 0:
                     raise ProtocolError("document version must be a nonnegative integer")
                 if method == "textDocument/didOpen":
-                    if path in self.documents or document.get("languageId") != "python":
+                    if path in self.documents or document.get("languageId") != ("pyalamode" if Path(path).suffix == ".pya" else "python"):
                         raise ProtocolError("open requires a new Python document")
                     text = document.get("text")
                 else:
@@ -330,7 +348,7 @@ class EditorSession:
                 self.documents[path] = {"text": text, "version": version}
             self.refresh()
             return None
-        known = {"initialized", "pyalamode/project", "pyalamode/explain", "pyalamode/preview", "pyalamode/guardLocation",
+        known = {"initialized", "pyalamode/project", "pyalamode/explain", "pyalamode/preview", "pyalamode/guardLocation", "pyalamode/sourceLocation", "textDocument/formatting",
                  "textDocument/hover", "textDocument/definition", "textDocument/references", "textDocument/documentSymbol", "textDocument/codeAction"}
         if method not in known:
             raise ProtocolError("unsupported method: " + method, -32601)
@@ -355,6 +373,10 @@ class EditorSession:
             return self.preview(params)
         if method == "pyalamode/guardLocation":
             return self.guard_location(params)
+        if method == "textDocument/formatting":
+            return self.formatting(params)
+        if method == "pyalamode/sourceLocation":
+            return self.source_location(params)
         if method == "textDocument/documentSymbol":
             path, _ = self._document(params)
             return [{"name": row["name"], "detail": row["mode"] + ": " + str((row["contract"] or {}).get("source_evidence", "")),
@@ -424,7 +446,7 @@ class EditorSession:
         if item is None or item["code"] not in {"PAL101", "PAL250"}:
             raise ProtocolError("no supported safe preview for this diagnostic")
         text = entry["text"]
-        nodes, tree = _definitions(text)
+        nodes, tree = _definitions(text, self.current.source_units.get(path))
         node = nodes.get(item["data"]["boundary"])
         if not isinstance(node, ast.FunctionDef):
             raise ProtocolError("preview requires a participating function")
@@ -450,12 +472,14 @@ class EditorSession:
             return candidate
         line = item["data"]["authored"]["line"]
         edits = []
+        relation = None
         if item["code"] == "PAL250":
             statement = next((statement for statement in node.body if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call) and statement.lineno == line), None)
             if statement is None:
                 raise ProtocolError("preview requires a direct discarded persistent update")
             start = position(text, statement.lineno, statement.col_offset + 1)
-            edits = [{"range": {"start": start, "end": start}, "newText": fresh("updated_value") + " = "}]
+            renamed = fresh("updated_value")
+            edits = [{"range": {"start": start, "end": start}, "newText": ("val " if Path(path).suffix == ".pya" else "") + renamed + " = "}]
             title = "retain the persistent update in a fresh binding"
             limits = "The original return remains unchanged. The new value is unused until you intentionally choose how to use it; this preview does not update the receiver or change failures."
         else:
@@ -469,10 +493,11 @@ class EditorSession:
                 targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target] if isinstance(statement, ast.AnnAssign) else []
                 if targets and (len(targets) != 1 or not isinstance(targets[0], ast.Name)):
                     raise ProtocolError("SSA preview requires one simple local target")
-            second = next((statement for statement in node.body if isinstance(statement, ast.Assign) and statement.lineno == line), None)
-            if second is None or len(second.targets) != 1 or not isinstance(second.targets[0], ast.Name):
+            second = next((statement for statement in node.body if isinstance(statement, (ast.Assign, ast.AnnAssign)) and statement.lineno == line), None)
+            targets = second.targets if isinstance(second, ast.Assign) else [second.target] if second else []
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name):
                 raise ProtocolError("SSA preview requires a second simple assignment")
-            name = second.targets[0].id
+            name = targets[0].id
             parameter_names = {arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
             assignments = [statement for statement in node.body if isinstance(statement, (ast.Assign, ast.AnnAssign)) and any(isinstance(target, ast.Name) and target.id == name for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target]))]
             if name in parameter_names or len(assignments) != 2 or assignments[-1] is not second:
@@ -484,12 +509,33 @@ class EditorSession:
             if any(isinstance(statement, (ast.Assign, ast.AnnAssign)) and isinstance(statement.value, ast.Name) and statement.value.id == name for statement in node.body):
                 raise ProtocolError("SSA preview refuses alias assignments")
             renamed = fresh(name + "_2")
-            changed = [second.targets[0]]
+            if not any(isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id == name for child in ast.walk(second.value)):
+                raise ProtocolError("SSA second RHS must read the first binding")
+            changed = [targets[0]]
             for statement in node.body[node.body.index(second) + 1:]:
                 changed.extend(child for child in ast.walk(statement) if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load) and child.id == name)
             edits = [{"range": node_range(text, child), "newText": renamed} for child in changed]
+            if Path(path).suffix == ".pya":
+                unit = self.current.source_units.get(path)
+                prepared = unit.preparation.prepared if unit and unit.preparation else None
+                if prepared is None or prepared.authored_bytes != unit.authored_bytes:
+                    raise ProtocolError("dialect repair requires captured authored declaration spans")
+                target = targets[0]
+                target_span = sm.ByteSpan(
+                    sm.offset_at(unit.authored_bytes, target.lineno, target.col_offset + 1),
+                    sm.offset_at(unit.authored_bytes, target.end_lineno, target.end_col_offset + 1))
+                if not any(binding.target == target_span for binding in prepared.vals):
+                    edits[0]["newText"] = "val " + renamed
             title = "split the second local binding and subsequent reads"
             limits = "Exactly two straight-line data bindings; the second RHS still reads the first value. Captures, branches, aliases, callbacks and dynamic names are refused. Supported caller/dependency assumptions remain."
+        from .project import _repair_schema
+        schema = _repair_schema(self.current, path, contract["name"], node.body.index(statement if item["code"] == "PAL250" else second))
+        if schema is None: raise ProtocolError("original repair RHS has no independently established exact stable schema")
+        old_rows = [row for row in contract["data_assertions"] if row["line"] == line and row["name"] == (name if item["code"] == "PAL101" else renamed)]
+        if old_rows and (len(old_rows) != 1 or old_rows[0]["schema"] != schema): raise ProtocolError("original assertion/schema disagrees with the proposed binding")
+        relation = {"rule": item["code"], "line": line, "old_name": name if item["code"] == "PAL101" else None,
+            "new_name": renamed, "schema": schema, "missing_assertion": not old_rows,
+            "sole_gate": True, "candidate_verified": True}
         after = text
         for edit in sorted(edits, key=lambda edit: _offset(text, edit["range"]["start"]), reverse=True):
             start, end = _offset(text, edit["range"]["start"]), _offset(text, edit["range"]["end"])
@@ -499,20 +545,31 @@ class EditorSession:
         if candidate.result.status or candidate.freshness.startswith("stale"):
             raise ProtocolError("candidate does not pass the complete current strict project gate")
         new_contract = next((asdict(contract_) for file in candidate.result.results for contract_ in file.contracts if file.path == path and contract_.name == contract["name"]), None)
-        retained = ("trust", "external_assumptions", "failures", "definition_failures", "effect_bound", "required_effects", "operations", "operation_contracts")
-        if new_contract is None or any(new_contract[key] != contract[key] for key in retained):
+        from .project import _contract_comparison, _file_dimensions_equal, _occurrence_relation
+        if new_contract is None or not _contract_comparison(contract, new_contract, repair=relation)["matched"]:
             raise ProtocolError("candidate changes retained trust/effect/failure/operation dimensions")
-        if candidate.inputs["policy_sha256"] != self.current.inputs["policy_sha256"] or candidate.inputs["product_artifacts"] != self.current.inputs["product_artifacts"] or candidate.inputs["integration_inputs"] != self.current.inputs["integration_inputs"]:
+        for file in self.current.result.results:
+            other = next((f for f in candidate.result.results if f.path == file.path), None)
+            if other is None or not _file_dimensions_equal(file,other,relation=_occurrence_relation(self.current,candidate,file.path) if file.path == path else None,repair=relation if file.path == path else None):
+                raise ProtocolError("untargeted declaration/initialization/setup dimensions changed")
+            for old in file.contracts:
+                if file.path == path and old.name == contract["name"]: continue
+                new = next((c for f in candidate.result.results if f.path == file.path for c in f.contracts if c.name == old.name), None)
+                if new is None or not _contract_comparison(old, new)["matched"]: raise ProtocolError("untargeted complete contract changed")
+        if any(candidate.inputs[key] != self.current.inputs[key] for key in ("policy_sha256", "product_artifacts", "integration_inputs", "checked_dependencies")):
             raise ProtocolError("preview inputs changed during candidate checking", -32801)
         original_sources = {source: dict(row) for source, row in self.current.inputs["sources"].items()}
         candidate_sources = {source: dict(row) for source, row in candidate.inputs["sources"].items()}
         if path in original_sources and path in candidate_sources:
             original_sources[path].pop("sha256")
             candidate_sources[path].pop("sha256")
+            original_sources[path].pop("source_provenance", None)
+            candidate_sources[path].pop("source_provenance", None)
         if original_sources != candidate_sources:
             raise ProtocolError("preview source/dependency inputs changed during candidate checking", -32801)
+        self._last_repair_relation = relation
         return {"title": title, "uri": Path(path).as_uri(), "version": entry["version"], "snapshot": self.current.snapshot,
-                "before": text, "after": after, "diff": "".join(difflib.unified_diff(text.splitlines(keepends=True), after.splitlines(keepends=True), fromfile=path, tofile=path + " (preview)")),
+                "before": text, "after": after, "diff": "".join(difflib.unified_diff(io.StringIO(text, newline="").readlines(), io.StringIO(after, newline="").readlines(), fromfile=path, tofile=path + " (preview)")),
                 "edits": edits, "status": candidate.result.status,
                 "remainingDiagnostics": [asdict(item) for file in candidate.result.results for item in file.diagnostics], "limits": limits}
 
@@ -556,19 +613,35 @@ class EditorSession:
                     or old_file["fingerprint"] != file.fingerprint or evidence["product_artifacts"] != self.current.inputs["product_artifacts"]):
                 raise ProtocolError("authored source/policy/dependency evidence is stale", -32801)
             source_relative = Path(file.path).relative_to(self.root).as_posix()
-            facade_relative = "pyalamode_exports/" + source_relative
-            required = {source_relative, facade_relative, "pyalamode_exports/__init__.py"}
+            unit = self.current.source_units.get(file.path)
+            mapped = unit is not None and unit.source_map is not None
+            runtime_relative = unit.owner.runtime_path if mapped else source_relative
+            facade_relative = "pyalamode_exports/" + runtime_relative
+            required = {runtime_relative, facade_relative, "pyalamode_exports/__init__.py"}
             if not required <= set(inventory):
                 raise ProtocolError("artifact inventory omits the authored source or selected facade")
             from .guardgen import debug_source, facade_source, record_schemas
             records = record_schemas(self.current.result.results)
             text = self.current.sources[file.path]
-            expected_source = debug_source(text, file, records).encode() if evidence["boundary_guards"] == "debug" else Path(file.path).read_bytes()
-            selected_contracts = [next(contract_ for contract_ in file.contracts if contract_.name == row["original_boundary"].split(":", 1)[1]) for row in self.current.result.guarded_exports if row["original_boundary"].split(":", 1)[0] == module]
-            expected_facade = facade_source(text, module, selected_contracts, records).encode()
-            if (inventory[source_relative] != hashlib.sha256(expected_source).hexdigest()
-                    or inventory[facade_relative] != hashlib.sha256(expected_facade).hexdigest()):
-                raise ProtocolError("artifact selected source/facade bytes differ from current guard generation", -32801)
+            if mapped:
+                from .project import locate_source
+                # The shared verifier regenerates the entire owned runtime and
+                # facade AST/map relation from captured authored closure. The
+                # existing guard view then selects its recorded authored site.
+                for generated in (runtime_relative,facade_relative):
+                    relation = locate_source(artifact=artifact,path=generated,line=1,column=1,root=self.root)
+                    if relation["status"] != 0:
+                        raise ProtocolError("artifact mapped guard derivation is stale or malformed", -32801)
+                copied = artifact / ".pyalamode/sources" / source_relative
+                if copied.read_bytes() != unit.authored_bytes:
+                    raise ProtocolError("artifact authored source differs from current source", -32801)
+            else:
+                expected_source = debug_source(text, file, records).encode() if evidence["boundary_guards"] == "debug" else Path(file.path).read_bytes()
+                selected_contracts = [next(contract_ for contract_ in file.contracts if contract_.name == row["original_boundary"].split(":", 1)[1]) for row in self.current.result.guarded_exports if row["original_boundary"].split(":", 1)[0] == module]
+                expected_facade = facade_source(text, module, selected_contracts, records).encode()
+                if (inventory[source_relative] != hashlib.sha256(expected_source).hexdigest()
+                        or inventory[facade_relative] != hashlib.sha256(expected_facade).hexdigest()):
+                    raise ProtocolError("artifact selected source/facade bytes differ from current guard generation", -32801)
             line = contract.line
             if phase == "argument":
                 if name not in selected["parameters"]:
@@ -603,6 +676,110 @@ class EditorSession:
             raise
         except (OSError, UnicodeError, ValueError, KeyError, TypeError, StopIteration):
             raise ProtocolError("unsupported or malformed artifact evidence") from None
+
+    def formatting(self, params):
+        if set(params) != {"textDocument", "options", "pyalamode"} or type(params["textDocument"]) is not dict or set(params["textDocument"]) != {"uri"}:
+            raise ProtocolError("formatting requires the exact document/options/snapshot request")
+        path, _ = self._document(params)
+        options, guard = params["options"], params["pyalamode"]
+        if (Path(path).suffix != ".pya" or type(options) is not dict or set(options) != {"tabSize", "insertSpaces"}
+                or type(options["tabSize"]) is not int or not 1 <= options["tabSize"] <= 8 or type(options["insertSpaces"]) is not bool
+                or type(guard) is not dict or set(guard) != {"version", "snapshot"} or type(guard["version"]) is not int):
+            raise ProtocolError("formatting requires an owned dialect document and exact options/version")
+        entry = self.documents.get(path)
+        if entry is None or guard["version"] != entry["version"] or guard["snapshot"] != self.current.snapshot or self.current.freshness.startswith("stale"):
+            raise ProtocolError("formatting snapshot/document version is stale", -32801)
+        inputs = copy.deepcopy(self.current.inputs)
+        documents = copy.deepcopy(self.documents)
+        from .project import format_paths
+        value = format_paths([path], root=self.root, mode="preview", overlays=documents)
+        refused = value["status"] == 2 or value["source_status"]
+        text = documents[path]["text"]
+        raw = text.encode("utf-8")
+        def point(offset):
+            prefix = raw[:offset].decode("utf-8")
+            lines = _lines(prefix)
+            return {"line": len(lines)-1, "character": len(lines[-1].encode("utf-16-le"))//2}
+        edits = [] if refused else [{"range": {"start": point(edit["start"]), "end": point(edit["end"])}, "newText": edit["replacement"]} for edit in value["files"][0]["edits"]]
+        self.refresh()
+        if (self.documents != documents or self.current.inputs != inputs
+                or self.current.snapshot != guard["snapshot"] or self.current.freshness.startswith("stale")
+                or value["inputs"] != inputs or value["snapshot"] != guard["snapshot"] or value["freshness"].startswith("stale")):
+            raise ProtocolError("formatting inputs changed during proposal", -32801)
+        if refused:
+            raise ProtocolError("formatter refused the exact current source")
+        return edits
+
+    def source_location(self, params):
+        if set(params) != {"artifactUri", "path", "position", "snapshot"}:
+            raise ProtocolError("sourceLocation requires exact artifact/path/position/snapshot")
+        artifact = uri_path(params["artifactUri"], self.root, directory=True)
+        documents = copy.deepcopy(self.documents)
+        observed_inputs = copy.deepcopy(self.current.inputs)
+        from .project import locate_source
+        from .distribution import relative, read
+        try:
+            relative(params["path"])
+            raw = read(artifact/params["path"], 8*1024*1024)
+            text = raw.decode("utf-8")
+            offset = _offset(text, params["position"])
+            byte_offset = len(text[:offset].encode("utf-8"))
+            pos = sm.position_at(raw, byte_offset)
+            provenance = locate_source(artifact=artifact, path=params["path"], line=pos.line, column=pos.column, root=self.root)
+        except (OSError, ValueError, TypeError, ProtocolError):
+            provenance = locate_source(artifact=artifact, path=params["path"], line=1, column=0, root=self.root)
+        self.refresh()
+        current = (params["snapshot"] == self.current.snapshot and not self.current.freshness.startswith("stale")
+            and self.documents == documents and self.current.inputs == observed_inputs)
+        freshness = self.current.freshness
+        if not current:
+            context = self.located_artifact
+            if (self.current.freshness.startswith("stale") or self.documents != documents or provenance["status"] == 0
+                    or context is None or context["artifact"] != str(artifact) or context["snapshot"] != params["snapshot"]):
+                raise ProtocolError("sourceLocation project snapshot is stale", -32801)
+            before = copy.deepcopy(context["inputs"])
+            after = copy.deepcopy(self.current.inputs)
+            if set(before["sources"]) != set(after["sources"]):
+                raise ProtocolError("sourceLocation project snapshot is stale", -32801)
+            for name in context["sources"]:
+                old, new = before["sources"][name], after["sources"][name]
+                if new["origin"] != old["origin"] or new["version"] != old["version"]:
+                    raise ProtocolError("sourceLocation project snapshot is stale", -32801)
+                del before["sources"][name]
+                del after["sources"][name]
+            if before != after:
+                raise ProtocolError("sourceLocation project snapshot is stale", -32801)
+            freshness = "stale artifact relation; no source location"
+        location = None
+        if provenance["status"] == 0:
+            verified_sources = []
+            for name, digest in provenance["inputs"]["artifacts"].items():
+                source = str(artifact / name)
+                entry = self.current.inputs["sources"].get(source)
+                if (name.endswith(".py") and entry is not None and entry["origin"] == "disk" and entry["version"] is None
+                        and entry["sha256"] == digest and entry["disk_sha256"] == digest):
+                    verified_sources.append(source)
+            verified_inputs = copy.deepcopy(self.current.inputs)
+            row = provenance["authored"]
+            copy_path = artifact/row["source_copy"]
+            workspace = self.root/row["path"]
+            path = workspace if workspace.is_file() and workspace.resolve().is_relative_to(self.root) and hashlib.sha256(workspace.read_bytes()).hexdigest() == row["sha256"] else copy_path
+            try:
+                copied = read(copy_path, 8*1024*1024)
+            except (OSError, ValueError):
+                raise ProtocolError("sourceLocation authored copy is unavailable or unowned", -32801) from None
+            if hashlib.sha256(copied).hexdigest() != row["sha256"]:
+                raise ProtocolError("sourceLocation authored copy changed during lookup", -32801)
+            text = copied.decode("utf-8")
+            location = {"uri": path.as_uri(), "range": {"start": position(text, row["line"], row["column"]), "end": position(text, row["end_line"], row["end_column"])}}
+            self.refresh()
+            if (self.documents != documents or self.current.inputs != verified_inputs
+                    or self.current.snapshot != params["snapshot"] or self.current.freshness.startswith("stale")):
+                raise ProtocolError("sourceLocation project snapshot is stale", -32801)
+            self.located_artifact = {"artifact": str(artifact), "snapshot": params["snapshot"],
+                "inputs": copy.deepcopy(self.current.inputs), "sources": tuple(verified_sources)}
+            freshness = self.current.freshness
+        return {"schema": 1, "snapshot": params["snapshot"], "freshness": freshness, "location": location, "provenance": provenance}
 
 
 def _frame(value):

@@ -51,7 +51,7 @@ class EditorCase(unittest.TestCase):
     def test_actual_provenance_and_historical_diagnostic_defaults(self):
         meta = self.metadata["capabilities"]["experimental"]["pyalamode"]
         self.assertEqual(meta["pythonExecutable"], sys.executable)
-        self.assertEqual(meta["pythonVersion"], [3, 13, 1])
+        self.assertEqual(meta["pythonVersion"], "3.13.1")
         self.assertEqual(meta["root"], str(self.root))
         self.assertEqual(self.metadata["capabilities"]["positionEncoding"], "utf-16")
         old = Diagnostic("PAL101", "x.py", 2, 3, "f", "static", "reason", "repair")
