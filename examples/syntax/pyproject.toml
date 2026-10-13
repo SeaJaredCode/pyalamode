@@ -1,0 +1,3 @@
+[tool.pyalamode]
+schema = 1
+edition = "pyalamode-v1-experimental"

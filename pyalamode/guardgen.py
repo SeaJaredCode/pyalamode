@@ -149,8 +149,9 @@ def facade_source(source, module, contracts, records):
     return "\n".join(["\"\"\"Selected guarded public boundaries; original modules remain unguarded.\"\"\"", "from pyalamode.boundaries import validate_data as " + validate, *schemas.imports(), "", *lines]) + "\n"
 
 
-def debug_source(source, result, records):
+def debug_source(source, result, records, *, _derivation=None):
     tree = ast.parse(source)
+    provenance = _original_origins(source.encode("utf-8"), tree) if _derivation else None
     prefix = _prefix(tree)
     declarations = [*result.records, *result.oneofs]
     local_records = {record["schema"]: prefix + "record" + str(index) for index, record in enumerate(declarations)}
@@ -225,10 +226,103 @@ def debug_source(source, result, records):
     while insertion < len(tree.body) and isinstance(tree.body[insertion], ast.ImportFrom) and tree.body[insertion].module == "__future__":
         insertion += 1
     tree.body[insertion:insertion] = imports
-    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+    tree = ast.fix_missing_locations(tree)
+    if _derivation:
+        return _derive(source.encode("utf-8"), tree, provenance, **_derivation)
+    return ast.unparse(tree) + "\n"
 
 
-def generate_facades(staging, results, root, selections, sources):
+def _original_origins(raw, tree):
+    from . import source_maps as sm
+    origins = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module):
+            origins[node] = sm.NodeOrigin(sm.ByteSpan(0, len(raw)), "anchor")
+        elif getattr(node, "end_lineno", None) is not None:
+            origins[node] = sm.NodeOrigin(sm.ByteSpan(
+                sm.offset_at(raw, node.lineno, node.col_offset + 1),
+                sm.offset_at(raw, node.end_lineno, node.end_col_offset + 1)), "copy")
+    return origins
+
+
+def _derive(raw, tree, original, *, owner, translator, identity, path, role):
+    """Assign actual structural node origins before stock unparse/reparse."""
+    from . import source_maps as sm
+    rows = {}
+    def visit(node, path_, inherited):
+        origin = original.get(node)
+        if origin is None:
+            if isinstance(node, ast.stmt) and getattr(node, "end_lineno", None) is not None:
+                try:
+                    origin = sm.NodeOrigin(sm.ByteSpan(sm.offset_at(raw, node.lineno, node.col_offset + 1),
+                        sm.offset_at(raw, node.end_lineno, node.end_col_offset + 1)), "anchor")
+                except sm.SourceMapError:
+                    origin = inherited
+            else: origin = inherited
+        rows[path_] = origin
+        for name, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST): visit(value, path_ + (name,), origin)
+            elif type(value) is list:
+                for index, child in enumerate(value):
+                    if isinstance(child, ast.AST): visit(child, path_ + (name, index), origin)
+    visit(tree, (), sm.NodeOrigin(sm.ByteSpan(0, len(raw)), "anchor"))
+    return sm.derive_ast(raw, tree, rows, owner=owner, translator=translator,
+        source_identity=identity, generated_path=path, generated_role=role)
+
+
+def debug_derivation(unit, result, records, path=None):
+    from .checker import translator_identity
+    from . import source_maps as sm
+    return debug_source(unit.normalized_text, result, records, _derivation={"owner": unit.owner,
+        "translator": translator_identity(), "identity": unit.source_map.generated,
+        "path": path or unit.owner.runtime_path, "role": "debug"})
+
+
+def facade_derivation(unit, module, contracts, records, path):
+    """Build a compiler-owned facade AST; every synthetic node is anchored."""
+    from .checker import translator_identity
+    from . import source_maps as sm
+    raw = unit.normalized_bytes
+    original_tree = ast.parse(raw, feature_version=(3, 13))
+    prefix = _prefix(original_tree)
+    schemas = Schemas(records, prefix)
+    original_module = schemas.module(module)
+    validate = prefix + "validate"
+    body, origins = [], {}
+    anchor = sm.NodeOrigin(sm.ByteSpan(0, 0), "anchor")
+    def add(statement, origin):
+        for node in ast.walk(statement): origins[node] = origin
+        body.append(statement)
+    for index, contract in enumerate(contracts):
+        function = next(node for node in original_tree.body if isinstance(node, ast.FunctionDef) and node.name == contract.name)
+        span = sm.ByteSpan(sm.offset_at(raw, function.lineno, function.col_offset + 1),
+            sm.offset_at(raw, function.end_lineno, function.end_col_offset + 1))
+        origin = sm.NodeOrigin(span, "anchor")
+        original = prefix + "original" + str(index)
+        args = copy.deepcopy(function.args)
+        for arg in args.posonlyargs + args.args + args.kwonlyargs: arg.annotation = None
+        args.defaults = [ast.parse(original + ".__defaults__[" + str(i) + "]", mode="eval").body for i in range(len(args.defaults))]
+        args.kw_defaults = [ast.parse(original + ".__kwdefaults__[" + repr(arg.arg) + "]", mode="eval").body if default is not None else None for arg, default in zip(args.kwonlyargs, args.kw_defaults)]
+        add(ast.parse(original + " = " + original_module + "." + contract.name).body[0], origin)
+        statements = [ast.parse(validate + "(" + name + ", " + schemas.code(kind) + ", path=" + repr(module + ":" + contract.name + " argument " + name + " (" + contract.path + ":" + str(contract.line) + ")") + ")").body[0] for name, kind in contract.parameters.items()]
+        returned = prefix + "result"
+        call = ast.Call(func=ast.Name(id=original, ctx=ast.Load()), args=[ast.Name(id=arg.arg, ctx=ast.Load()) for arg in args.posonlyargs + args.args], keywords=[ast.keyword(arg=arg.arg, value=ast.Name(id=arg.arg, ctx=ast.Load())) for arg in args.kwonlyargs])
+        statements += [ast.Assign(targets=[ast.Name(id=returned, ctx=ast.Store())], value=call),
+            ast.parse(validate + "(" + returned + ", " + schemas.code(contract.returns) + ", path=" + repr(module + ":" + contract.name + " return (" + contract.path + ":" + str(contract.line) + ")") + ")").body[0],
+            ast.Return(value=ast.Name(id=returned, ctx=ast.Load()))]
+        add(ast.FunctionDef(name=contract.name, args=args, body=statements, decorator_list=[], returns=None, type_comment=None, type_params=[]), origin)
+        for line in (contract.name + ".__wrapped__ = " + original, contract.name + ".__annotations__ = " + original + ".__annotations__.copy()"):
+            add(ast.parse(line).body[0], origin)
+    header = ast.parse('"""Selected guarded public boundaries; original modules remain unguarded."""\nfrom pyalamode.boundaries import validate_data as ' + validate + "\n" + "\n".join(schemas.imports())).body
+    for node in header:
+        for child in ast.walk(node): origins[child] = anchor
+    tree = ast.fix_missing_locations(ast.Module(body=header + body, type_ignores=[]))
+    origins[tree] = anchor
+    return _derive(raw, tree, origins, owner=unit.owner, translator=translator_identity(),
+        identity=unit.source_map.generated, path=path, role="facade")
+
+
+def generate_facades(staging, results, root, selections, sources, *, units=None, syntax_modules=None):
     records = record_schemas(results)
     grouped = {}
     for selection in selections:
@@ -243,7 +337,7 @@ def generate_facades(staging, results, root, selections, sources):
     (package / "__init__.py").write_text('"""Explicit selected guarded public boundaries. Original modules remain unguarded."""\n')
     for module, (result, contracts) in grouped.items():
         parts = module.split(".")
-        relative = Path(*parts) / "__init__.py" if Path(result.path).name == "__init__.py" else Path(*parts).with_suffix(".py")
+        relative = Path(*parts) / "__init__.py" if Path(result.path).name in {"__init__.py", "__init__.pya"} else Path(*parts).with_suffix(".py")
         target = package / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         parent = target.parent
@@ -252,7 +346,24 @@ def generate_facades(staging, results, root, selections, sources):
             if not initializer.exists():
                 initializer.write_text('"""Selected guarded boundary namespace."""\n')
             parent = parent.parent
-        target.write_text(facade_source(sources[result.path], module, contracts, records))
+        unit = (units or {}).get(result.path)
+        if unit and unit.source_map:
+            from .checker import map_bytes
+            from . import source_maps as sm
+            derivation = facade_derivation(unit, module, contracts, records, target.relative_to(staging).as_posix())
+            mapping = sm.compose_maps(unit.source_map, derivation.source_map, source=unit.authored_bytes,
+                intermediate=unit.normalized_bytes, generated=derivation.generated_bytes)
+            target.write_bytes(derivation.generated_bytes)
+            map_path = ".pyalamode/maps/" + target.relative_to(staging).as_posix() + ".map.json"
+            map_target = staging / map_path
+            map_target.parent.mkdir(parents=True, exist_ok=True)
+            raw = map_bytes(mapping)
+            map_target.write_bytes(raw)
+            artifacts[map_path] = raw
+            syntax_modules[module]["facades"].append({"path": target.relative_to(staging).as_posix(),
+                "map_path": map_path, "map_sha256": __import__("hashlib").sha256(raw).hexdigest()})
+        else:
+            target.write_text(facade_source(sources[result.path], module, contracts, records))
     for path in package.rglob("*.py"):
         artifacts[path.relative_to(staging).as_posix()] = path.read_bytes()
     return artifacts

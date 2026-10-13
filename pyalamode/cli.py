@@ -185,6 +185,20 @@ def main(argv: list[str] | None = None) -> int:
     editor = commands.add_parser("editor", help="local read-only editor protocol over stdio")
     editor.add_argument("--stdio", action="store_true", required=True)
     editor.add_argument("--root", required=True, help="existing project root")
+    formatter = commands.add_parser("format", help="read-only experimental source formatting proposal")
+    formatter.add_argument("paths", nargs="*")
+    formatter.add_argument("--root")
+    formatter.add_argument("--json", action="store_true")
+    modes = formatter.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--check", action="store_true")
+    modes.add_argument("--preview", action="store_true")
+    locator = commands.add_parser("locate", help="resolve an owned generated source coordinate")
+    locator.add_argument("--artifact", required=True)
+    locator.add_argument("--path", required=True)
+    locator.add_argument("--line", type=int, required=True)
+    locator.add_argument("--column", type=int, required=True)
+    locator.add_argument("--root")
+    locator.add_argument("--json", action="store_true")
     for name in ("regions", "ready", "report", "baseline", "convert"):
         command = commands.add_parser(name, help="local migration evidence and read-only adoption proposals")
         command.add_argument("--root", help="project root")
@@ -203,6 +217,17 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("target_selection")
             command.add_argument("--preview", action="store_true", required=True)
     args = parser.parse_args(argv)
+    if args.command in {"format", "locate"}:
+        from .project import format_paths, locate_source
+        output = (format_paths(args.paths, root=args.root, mode="check" if args.check else "preview") if args.command == "format" else
+            locate_source(artifact=args.artifact, path=args.path, line=args.line, column=args.column, root=args.root))
+        if args.json: print(json.dumps(output, indent=2, sort_keys=True))
+        elif args.command == "format":
+            for row in output["files"]:
+                if row["diff"]: print(row["diff"], end="")
+            print("format: status " + str(output["status"]) + "; read-only proposal")
+        else: print(json.dumps(output["authored"] or output["diagnostics"], sort_keys=True))
+        return output["status"]
     if args.command == "explain":
         explanation = explain_symbol(args.symbol, root=args.root)
         if args.json:

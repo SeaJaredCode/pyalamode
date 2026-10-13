@@ -75,7 +75,8 @@ PAIRS = [(r"pyalamode\.variants\b", "pyalamode.sums"), (r"from \. import variant
          (r"\bdiscover_variants\b", "discover_oneofs"), (r"\bVariant\b", "OneOf"), (r"\bvariants\b", "oneofs"), (r"\bvariant\b", "oneof"),
          (r"_variant_", "_oneof_"), (r"_variant\b", "_oneof"), (r"\bvariant_", "oneof_")]
 # Lines that must keep historical spelling after the generic mapping.
-PROTECTED = {"pyalamode/migration.py": [r"^LEGACY_PRODUCTS = ", r'"variants\.py"', r"Genuine M10", r"selected_variants\" if ", r"\"variant\" if "]}
+PROTECTED = {"pyalamode/distribution.py": [r"_HISTORICAL_FOUNDATION_TEXT=", r"variant-to-oneof", r"Variant\[", r'kind=="variant"', r'"variant" rows'],
+             "pyalamode/migration.py": [r"^LEGACY_PRODUCTS = ", r'"variants\.py"', r"Genuine M10", r"selected_variants\" if ", r"\"variant\" if "]}
 # Branch-native files mention `variant` only to prove it is gone.
 SKIP = {"tests/m06_unions.py", "tests/m06_open.py", "tests/m02_tailrec.py"}
 

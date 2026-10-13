@@ -1,6 +1,6 @@
 # Design: additional sum types and the `oneof` spelling
 
-Status: stages 0 to 3 implemented on branch `sum-types`, which has merged main through M13 (`0016394`).
+Status: stages 0 to 3 implemented on branch `sum-types`, which has merged main through M14 (`0a11cee`).
 Authority: amends `SPEC-sol6.1-composite.md` §10 (records, variants and failure) and the M6 contract in `Docs/milestones/06-domains.md`. Open unions remain out of scope.
 
 ## Three designations
@@ -157,6 +157,20 @@ Exhaustiveness inside the distribution is only sound if the checker sees every c
 - Census for single-source APIs (`analyze_source`, `analyze_sources`). Their census is exactly the sources passed in.
 
 ## Merge notes for the orchestrator
+
+### Merge of M14 (`0a11cee`)
+
+`--resolve` settled 7 of 16 regions. The rest:
+
+- Source loading keeps the open-domain census loop around M14's physical `.pya` ownership check. Distribution and project rows add the `case` export kind to M14's code, including its `public_result` views, which also remap `cases` rows. M14's generic contract comparison replaces the branch's per-kind key list.
+- `PRODUCTS = (M13_PRODUCTS - {"variants.py"}) | {"sums.py", "syntax.py", "source_maps.py"}`; migration's `historical` flag already covers M13 states.
+- Versions: `CHECKER_VERSION = "experimental-syntax-sums-14.1"`, `OPERATION_VERSION` ends `-builder-task-syntax-union-ops-14.1`.
+- Provenance profiles. M14 had not shipped, so the merged product stays under M14's current profile 5 and genuine M11-M13 history (profiles 1-4) stays verifiable exactly as recorded:
+  - `M13_FUNCTION_FIELDS` names the 43 M13 contract fields explicitly; current contracts have 44 with `tail_recursive`.
+  - Historical operation catalog rows are compared through `_historical_catalog_row`, which reproduces the pre-rename foundation text and omits the union additions. It reproduces all 20 changed rows byte for byte.
+  - Historical schema text `Variant['m:X']` reads as `OneOf['m:X']`, and historical `variant` export rows keep their older shape.
+- Test expectations: contract field counts 43 to 44 and the shared `FIELDS` list; M13's version test; M12's simulated M11 wheel.
+- Result: 673 tests pass on macOS (main alone: 629).
 
 ### Merge of M12 and M13 (`0016394`)
 

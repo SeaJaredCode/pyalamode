@@ -2,14 +2,16 @@
   "name": "pyalamode-local",
   "publisher": "pyalamode-local",
   "displayName": "Pyalamode Local",
-  "description": "Shared local Python checker diagnostics, contracts and read-only previews.",
+  "description": "Local Python and experimental Pyalamode diagnostics, explicit formatting and read-only previews.",
   "version": "0.1.0",
   "engines": {"vscode": "^1.139.0"},
   "main": "./extension.js",
   "extensionKind": ["workspace"],
-  "activationEvents": ["onLanguage:python"],
+  "activationEvents": ["onLanguage:python", "onLanguage:pyalamode"],
   "capabilities": {"untrustedWorkspaces": {"supported": false}, "virtualWorkspaces": false},
   "contributes": {
+    "languages": [{"id": "pyalamode", "aliases": ["Pyalamode"], "extensions": [".pya"], "configuration": "./language-configuration.json"}],
+    "grammars": [{"language": "pyalamode", "scopeName": "source.pyalamode", "path": "./syntaxes/pyalamode.tmLanguage.json"}],
     "configuration": {"title": "Pyalamode", "properties": {
       "pyalamode.pythonPath": {"type": "string", "default": "", "scope": "machine", "description": "Absolute supported Python interpreter path. Preserve the virtual environment path."}
     }},
@@ -19,7 +21,8 @@
       {"command": "pyalamode.contracts", "title": "Pyalamode: Inspect Project Contracts"},
       {"command": "pyalamode.explain", "title": "Pyalamode: Explain Rule or Operation"},
       {"command": "pyalamode.preview", "title": "Pyalamode: Preview Proposed Repair"},
-      {"command": "pyalamode.guardLocation", "title": "Pyalamode: Open Authored Guard Boundary"}
+      {"command": "pyalamode.guardLocation", "title": "Pyalamode: Open Authored Guard Boundary"},
+      {"command": "pyalamode.sourceLocation", "title": "Pyalamode: Open Authored Source Location"}
     ]
   },
   "scripts": {"test": "node --test test/client.test.js"}

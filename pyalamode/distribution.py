@@ -8,6 +8,7 @@ from dataclasses import asdict, fields
 import hashlib
 import io
 import json
+import keyword
 import marshal
 import os
 from pathlib import Path
@@ -17,7 +18,9 @@ import sys
 import tempfile
 import tokenize
 import zipfile
-from .model import CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, FunctionContract, foundation_identities, runtime_environment
+import unicodedata
+from .model import CHECKER_VERSION, EDITION, OPERATION_VERSION, TARGET, FunctionContract, foundation_identities, runtime_environment, EXPERIMENTAL_EDITION, SYNTAX_VERSION, SOURCE_MAP_SCHEMA
+from . import source_maps as sm
 
 VERSION = "pyalamode.distribution-v1"
 CLAIM_SCOPE = "Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."
@@ -30,6 +33,9 @@ _RESERVED = {"pyalamode", "typing", "types", "collections", "builtins", "sys", "
 
 class DistributionError(ValueError):
     pass
+
+class DistributionDerivationStale(DistributionError):
+    """Well-formed new mapped bytes that do not match exact regeneration."""
 
 def canonical(value):
     parts=[];size=0
@@ -130,7 +136,7 @@ def file_receipt(path):
     path = Path(path)
     if path.is_symlink() or any(p.is_symlink() for p in path.parents): raise DistributionError("symlink owned input")
     present = path.exists()
-    return {"path":str(path), "exists":present, "sha256":hashlib.sha256(read(path,MAX_JSON)).hexdigest() if present else None,"size":path.stat().st_size if present else None}
+    return {"path":str(path), "exists":present, "sha256":hashlib.sha256(read(path,32*LIMIT)).hexdigest() if present else None,"size":path.stat().st_size if present else None}
 
 def _declaration(row, producer=False):
     shape(row, {"schema","name","version","packages"} | ({"exports"} if producer else set()))
@@ -178,14 +184,14 @@ def package_files(base, packages, generated=False):
     files = {};total=0;folded=set()
     for package in packages:
         directory = base/package
-        if directory.is_symlink() or not (directory/"__init__.py").is_file():
+        if directory.is_symlink() or not any((directory/name).is_file() for name in (("__init__.py",) if generated else ("__init__.py", "__init__.pya"))):
             raise DistributionError("initialized owned package required: " + package)
         for current, children, names in os.walk(directory):
             current = Path(current)
             if current.is_symlink():
                 raise DistributionError("symlink package source")
             children[:] = sorted(c for c in children if c != "__pycache__")
-            if not (current/"__init__.py").is_file():
+            if not any((current/name).is_file() for name in (("__init__.py",) if generated else ("__init__.py", "__init__.pya"))):
                 raise DistributionError("namespace package unsupported")
             if "_pyalamode_exports" in children and not generated:
                 raise DistributionError("reserved generated guard namespace")
@@ -194,17 +200,20 @@ def package_files(base, packages, generated=False):
                     raise DistributionError("symlink package directory")
             for name in sorted(names):
                 path = current/name
-                if not name.endswith(".py"):
+                if not name.endswith((".py",) if generated else (".py", ".pya")):
                     raise DistributionError("package data/native/sourceless artifact unsupported: " + str(path))
                 size=path.stat().st_size
                 if len(files)>=16384 or total+size>64*LIMIT:raise DistributionError("package aggregate bounds exceeded")
-                raw = read(path);total+=len(raw)
+                raw = read(path, 8*LIMIT if generated else LIMIT);total+=len(raw)
                 key = path.relative_to(base).as_posix()
                 if key.casefold() in folded:
                     raise DistributionError("casefold module ambiguity")
-                if path.with_suffix("").is_dir():
+                if path.with_suffix("").is_dir() or not generated and path.with_suffix(".pya" if path.suffix == ".py" else ".py").exists():
                     raise DistributionError("package/module ambiguity")
                 folded.add(key.casefold());files[key] = raw
+                if path.suffix == ".pya":
+                    from .checker import source_owner
+                    source_owner(str(path), base)
     if len(files) > 16384 or sum(map(len,files.values())) > 64*LIMIT:
         raise DistributionError("package inventory bounds exceeded")
     return files
@@ -234,12 +243,67 @@ def mapping(value):
     if type(value) is not dict or len(value)>16384: raise DistributionError("bounded map required")
     return value
 
+
+def _translator(value):
+    shape(value, {"version", "files"})
+    if value["version"] != SYNTAX_VERSION: raise DistributionError("unknown translator version")
+    shape(value["files"], {"syntax.py", "source_maps.py"})
+    for value_ in value["files"].values(): sha(value_)
+
+
+def _source_identity(value):
+    shape(value, {"path", "edition", "role", "sha256", "byte_count"})
+    relative(value["path"]); sha(value["sha256"])
+    if value["edition"] != (EXPERIMENTAL_EDITION if value["path"].endswith(".pya") else EDITION): raise DistributionError("source identity edition mismatch")
+    if value["role"] not in {"authored", "scaffold", "lowered", "debug", "facade", "formatted"}: raise DistributionError("unknown source identity role")
+    maximum = LIMIT if value["role"] in {"authored", "formatted"} and value["edition"] == EXPERIMENTAL_EDITION else 8*LIMIT
+    integer(value["byte_count"], 0, maximum)
+
+
+def _source_owner(value, *, mapped):
+    shape(value, {"authored_path", "runtime_path", "module"})
+    relative(value["authored_path"]); relative(value["runtime_path"])
+    expected = value["authored_path"][:-4]+".py" if value["authored_path"].endswith(".pya") else value["authored_path"]
+    if value["runtime_path"] != expected or not expected.endswith(".py"): raise DistributionError("source owner runtime mismatch")
+    if value["module"] is not None: module(value["module"])
+    if mapped:
+        expected_module = expected[:-3].replace("/", ".").removesuffix(".__init__")
+        if value["module"] != expected_module or not value["module"] or any(unicodedata.normalize("NFKC", p) != p or keyword.iskeyword(p) for p in expected_module.split(".")):
+            raise DistributionError("mapped owner requires exact canonical runtime module")
+
+
+def _source_provenance(value):
+    if value is None: return
+    shape(value, {"schema", "owner", "selected_edition", "authored", "normalized", "translator", "map", "coordinate_space", "status"})
+    integer(value["schema"], 1, 1); integer(value["status"], 0, 2)
+    if value["selected_edition"] not in {EDITION, EXPERIMENTAL_EDITION}: raise DistributionError("unknown selected edition")
+    _source_identity(value["authored"])
+    dialect = value["authored"]["edition"] == EXPERIMENTAL_EDITION
+    _source_owner(value["owner"], mapped=dialect)
+    if value["authored"]["path"] != value["owner"]["authored_path"] or value["authored"]["role"] != "authored": raise DistributionError("provenance raw ownership mismatch")
+    if value["normalized"] is not None:
+        _source_identity(value["normalized"])
+        if value["normalized"]["path"] != value["owner"]["runtime_path"]: raise DistributionError("normalized ownership mismatch")
+    if dialect:
+        _translator(value["translator"])
+        if value["coordinate_space"] not in {"authored-utf8", "raw-bytes"}: raise DistributionError("unknown dialect coordinate space")
+        if value["coordinate_space"] == "raw-bytes" and (value["status"] != 2 or value["normalized"] is not None or value["map"] is not None): raise DistributionError("raw decoder refusal fabricates normalized provenance")
+    elif value["translator"] is not None or value["map"] is not None or value["coordinate_space"] != "decoded-python": raise DistributionError("compatible provenance fabricates a map")
+    if value["map"] is not None:
+        row = value["map"]; shape(row, {"schema", "sha256", "byte_count", "source_sha256", "generated_sha256"})
+        integer(row["schema"], 1, 1); integer(row["byte_count"], 0, 32*LIMIT)
+        for key in ("sha256", "source_sha256", "generated_sha256"): sha(row[key])
+        if value["normalized"] is None or row["source_sha256"] != value["authored"]["sha256"] or row["generated_sha256"] != value["normalized"]["sha256"]: raise DistributionError("provenance map digest mismatch")
+
 def _schema(value):
     from .checker import _contract_type, SCALARS, CAPABILITIES, COLLECTIONS, DOMAIN_TYPES, DOMAIN_CASES, EFFECT_FAMILIES
     from .migration import _families
     capabilities = {name for name, family in CAPABILITIES.items() if family in _families()}
     text(value)
-    try: spec=_contract_type(value)
+    from .migration import _VALIDATION_PROFILE
+    # Genuine M11-M13 evidence spells closed-sum schemas Variant['module:Name'].
+    parsed=re.sub(r"\bVariant\[","OneOf[",value) if _VALIDATION_PROFILE.get()<5 else value
+    try: spec=_contract_type(parsed)
     except (ValueError,TypeError,AttributeError,SyntaxError,RecursionError) as e:raise DistributionError("invalid exact schema") from e
     def valid(s, depth=0):
         if s is None:raise DistributionError("unknown exact schema")
@@ -263,7 +327,7 @@ def _schema(value):
         else: raise DistributionError("unknown exact schema")
         for a in s.arguments: valid(a,depth+1)
     valid(spec)
-    if str(spec)!=value: raise DistributionError("noncanonical exact schema")
+    if str(spec)!=parsed: raise DistributionError("noncanonical exact schema")
     return spec
 
 def schema_map(value):
@@ -291,13 +355,36 @@ def _callable(value,depth=0):
 M11_FUNCTION_FIELDS = frozenset('name path line parameters returns parameter_kinds enforcement behavior source_evidence trust failures freshness boundary_protection caller_obligations defaults captures dependencies callable_targets callable_defaults return_callable_targets definition_failures operations data_assertions callable_capture_evidence return_callable_evidence invoked_targets callable_dependencies callable_arguments callable_operations effect_bound required_effects effect_origins capability_parameters borrow_scopes failure_edges direct_failures patterns handlers operation_contracts callable_default_evidence external_assumptions'.split())
 M11_PRODUCTS = frozenset("__init__.py integrations.py integration_contracts.py standard.py standard_contracts.py variants.py failures.py effects.py collections.py records.py boundaries.py guardgen.py model.py checker.py project.py cli.py editor.py migration.py migration_views.py distribution.py encoding.py encoding_contracts.py".split())
 M12_FUNCTION_FIELDS = M11_FUNCTION_FIELDS | {"builder_scopes"}
+# M13 and M14 contracts; the closed-sum branch then added tail_recursive.
+M13_FUNCTION_FIELDS = M12_FUNCTION_FIELDS | {"task_scopes"}
 M12_PRODUCTS = M11_PRODUCTS | {"builders.py", "builder_contracts.py"}
+M13_PRODUCTS = M12_PRODUCTS | {"tasks.py", "task_contracts.py"}
+
+
+_HISTORICAL_FOUNDATION_TEXT=(("pyalamode.sums._ONEOFS","pyalamode.variants._VARIANTS"),("pyalamode.sums.","pyalamode.variants."),("collections/records/oneofs","collections/records/variants"))
+_SUM_TYPE_ADDITIONS=frozenset({"types.UnionType exact native args","closed union A | B (member index + member value)"})
+
+
+def _historical_catalog_row(row):
+    """A current product catalog row as genuine M11-M13 wheels recorded it, before
+    the variant-to-oneof rename and closed unions changed its descriptive text."""
+    out=dict(row)
+    for key in ("foundations","schema_vocabulary"):
+        if type(out.get(key)) is list:
+            values=[]
+            for item in out[key]:
+                if item in _SUM_TYPE_ADDITIONS:continue
+                for new,old in _HISTORICAL_FOUNDATION_TEXT:
+                    if type(item) is str:item=item.replace(new,old)
+                values.append(item)
+            out[key]=values
+    return out
 
 
 def _contract(value,kind, *, historical=False, profile=None):
     from .migration import _VALIDATION_PROFILE, validation_profile
     selected = profile if profile is not None else _VALIDATION_PROFILE.get()
-    if historical and selected == 4:
+    if historical and selected == 5:
         selected = 2
     with validation_profile(selected):
         return _contract_fields(value, kind)
@@ -308,7 +395,7 @@ def _contract_fields(value, kind):
     profile = _VALIDATION_PROFILE.get()
     EFFECTS = _families()
     if kind=="function":
-        shape(value,M11_FUNCTION_FIELDS if profile <= 2 else M12_FUNCTION_FIELDS if profile == 3 else {f.name for f in fields(FunctionContract)})
+        shape(value,M11_FUNCTION_FIELDS if profile <= 2 else M12_FUNCTION_FIELDS if profile == 3 else M13_FUNCTION_FIELDS if profile == 4 else {f.name for f in fields(FunctionContract)})
         for key in ("parameters","defaults","captures"): schema_map(value[key])
         if not set(value["defaults"])<=set(value["parameters"]): raise DistributionError("default outside parameters")
         _schema(value["returns"]);mapping(value["parameter_kinds"])
@@ -344,7 +431,7 @@ def _contract_fields(value, kind):
                 callbacks.add(row["callback"])
                 integer(row["line"],1);integer(row["end_line"],row["line"]);integer(row["callback_line"],1);integer(row["callback_end_line"],row["callback_line"])
                 if row["operations"] != ["append","extend"] or row["lifetime"] != "fresh callback invocation; invalidated on every exit; no alias, retention or transfer" or row["finalization"] != "automatic exact Vector result after None; construction failure publishes no result":raise DistributionError("unknown builder lifetime/finalization contract")
-        if profile == 4:
+        if profile >= 4:
             from .task_contracts import operation_contract as task_contract
             from .checker import _contract_type, SCALARS, COLLECTIONS, DOMAIN_TYPES, DOMAIN_CASES
             def stable(spec):
@@ -410,7 +497,7 @@ def _contract_fields(value, kind):
                 if row["identity_error"] is not None: text(row["identity_error"])
                 if row["installed_identity"] is not None: _installed(row["installed_identity"])
                 _assumption({k:row[k] for k in ("identity","version","effects","failures","initialization","provenance","approval","contract_sha256","dependency_sha256","installed_identity","admission")} | {"source_evidence":"producer declared external assumption"})
-            elif row!=catalogs[identity]: raise DistributionError("product operation metadata changed")
+            elif row!=catalogs[identity] and not (profile < 5 and row==_historical_catalog_row(catalogs[identity])): raise DistributionError("product operation metadata changed")
         for row in array(value["external_assumptions"]): _assumption(row)
     elif kind=="record":
         shape(value,set("name schema path line fields defaults enforcement behavior source_evidence implementation_evidence trust failures definition_failures ordinary_validation_failures ordinary_representation_failures freshness boundary_protection caller_obligations equivalence".split()))
@@ -419,13 +506,18 @@ def _contract_fields(value, kind):
         text(value["implementation_evidence"]);text(value["equivalence"])
         for key in ("ordinary_validation_failures","ordinary_representation_failures"):
             for name,reason in mapping(value[key]).items():strings([name],FAILURES|{"TypeError","AttributeError"});text(reason)
-    elif kind=="oneof":
-        shape(value,set("name schema path line open cases case_fingerprint enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
-        _schema(value["schema"]);sha(value["case_fingerprint"]);text(value["equivalence"]);boolean(value["open"])
+    elif kind=="oneof" or kind=="variant" and profile < 5:
+        # Genuine M11-M13 evidence exports closed sums as "variant" rows, before open
+        # domains added the open flag and per-case module/qualname/extension.
+        current_row=kind=="oneof"
+        shape(value,set("name schema path line cases case_fingerprint enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split())|({"open"} if current_row else set()))
+        _schema(value["schema"]);sha(value["case_fingerprint"]);text(value["equivalence"])
+        if current_row:boolean(value["open"])
         for name,row in mapping(value["cases"]).items():
-            identifier(name);shape(row,{"schema","fields","defaults","module","qualname","extension"});_schema(row["schema"]);schema_map(row["fields"]);schema_map(row["defaults"])
-            text(row["module"]);text(row["qualname"]);boolean(row["extension"])
-            if row["extension"] and not value["open"]: raise DistributionError("closed domain cannot carry extension cases")
+            identifier(name);shape(row,{"schema","fields","defaults"}|({"module","qualname","extension"} if current_row else set()));_schema(row["schema"]);schema_map(row["fields"]);schema_map(row["defaults"])
+            if current_row:
+                text(row["module"]);text(row["qualname"]);boolean(row["extension"])
+                if row["extension"] and not value["open"]: raise DistributionError("closed domain cannot carry extension cases")
             if not set(row["defaults"])<=set(row["fields"]): raise DistributionError("invalid case defaults")
     elif kind=="case":
         shape(value,set("name schema path line domain fields defaults module qualname enforcement behavior source_evidence trust failures definition_failures freshness boundary_protection caller_obligations equivalence".split()))
@@ -475,7 +567,7 @@ def _diagnostic(row):
 def validate_installed_receipt(row, *, historical=False):
     from .migration import _VALIDATION_PROFILE, validation_profile
     profile = _VALIDATION_PROFILE.get()
-    if historical and profile == 4:
+    if historical and profile == 5:
         profile = 2
     with validation_profile(profile):
         return _installed_receipt_fields(row, historical=historical)
@@ -519,10 +611,11 @@ def _export(row, *, historical=False):
         keys=set(mapping(row["contract"]))
         if keys==M11_FUNCTION_FIELDS:profile=2
         elif keys==M12_FUNCTION_FIELDS:profile=3
-        elif keys=={f.name for f in fields(FunctionContract)}:profile=4
+        elif keys==M13_FUNCTION_FIELDS:profile=4
+        elif keys=={f.name for f in fields(FunctionContract)}:profile=5
         else:raise DistributionError("unknown function contract profile")
         from .migration import _VALIDATION_PROFILE
-        if _VALIDATION_PROFILE.get() != 4 and profile != _VALIDATION_PROFILE.get():raise DistributionError("nested contract exceeds historical profile")
+        if _VALIDATION_PROFILE.get() < 4 and profile != _VALIDATION_PROFILE.get():raise DistributionError("nested contract exceeds historical profile")
         _contract(row["contract"],row["kind"],profile=profile)
     else:
         _contract(row["contract"],row["kind"],historical=historical)
@@ -571,7 +664,7 @@ def _setup(row):
         for s in array(row["inputs"]):_schema(s)
 
 def validate_evidence(value):
-    if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] not in {1, 2, 3}:
+    if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] not in {1, 2, 3, 4}:
         raise DistributionError("unknown evidence schema")
     from .migration import validation_profile
     with validation_profile(value["schema"] + 1):
@@ -580,7 +673,8 @@ def validate_evidence(value):
 
 def _evidence_fields(value):
     bounded(value);shape(value,{"schema","kind","payload","sha256"})
-    if type(value["schema"]) is not int or value["schema"] not in {1,2,3} or value["kind"]!="pyalamode-checked-distribution":raise DistributionError("unknown evidence schema")
+    if type(value["schema"]) is not int or value["schema"] not in {1,2,3,4} or value["kind"]!="pyalamode-checked-distribution":raise DistributionError("unknown evidence schema")
+    current = value["schema"] == 4
     historical=value["schema"]==1
     sha(value["sha256"])
     if value["sha256"]!=digest(value["payload"]):raise DistributionError("evidence checksum mismatch")
@@ -588,19 +682,23 @@ def _evidence_fields(value):
     shape(p["target"],{"python","implementation","gil","platforms","filesystem_encoding","filesystem_errors"})
     for key in ("python","implementation","gil","filesystem_encoding","filesystem_errors"):text(p["target"][key],128)
     strings(p["target"]["platforms"])
-    producer=p["producer"];shape(producer,{"checker","edition","operation_contract","standard_version","integration_version","encoding_version","product_artifacts","runtime_environment"} | (set() if historical else {"builder_version"}) | ({"task_version"} if value["schema"] == 3 else set()))
+    producer=p["producer"];shape(producer,{"checker","edition","operation_contract","standard_version","integration_version","encoding_version","product_artifacts","runtime_environment"} | (set() if historical else {"builder_version"}) | ({"task_version"} if value["schema"] >= 3 else set()) | ({"syntax_version", "source_map_schema"} if current else set()))
+    if current and (producer["syntax_version"] != SYNTAX_VERSION or type(producer["source_map_schema"]) is not int or producer["source_map_schema"] != SOURCE_MAP_SCHEMA or producer["edition"] not in {EDITION, EXPERIMENTAL_EDITION}): raise DistributionError("unknown producer source format")
     if not historical:
         text(producer["builder_version"],128)
-    if value["schema"] == 3:
+    if value["schema"] >= 3:
         text(producer["task_version"],128)
     for key in ("checker","edition","operation_contract","standard_version","integration_version","encoding_version"):text(producer[key])
     products=mapping(producer["product_artifacts"])
-    if set(products)!=(M11_PRODUCTS if historical else M12_PRODUCTS if value["schema"] == 2 else set(foundation_identities())):raise DistributionError("unknown/incomplete product inventory")
+    if set(products)!=(M11_PRODUCTS if historical else M12_PRODUCTS if value["schema"] == 2 else M13_PRODUCTS if value["schema"] == 3 else set(foundation_identities())):raise DistributionError("unknown/incomplete product inventory")
     for d in products.values():sha(d)
     env=producer["runtime_environment"];shape(env,{"filesystem_encoding","filesystem_errors","utf8_mode"});text(env["filesystem_encoding"],128);text(env["filesystem_errors"],128);integer(env["utf8_mode"],0,1)
     inp=p["inputs"];shape(inp,{"policy_sha256","sources","checked_dependencies","integration_inputs","resolution","selection"});sha(inp["policy_sha256"])
     for path,row in mapping(inp["sources"]).items():
-        relative(path);shape(row,{"sha256","module","ownership","shipped","participating"});sha(row["sha256"]);boolean(row["shipped"]);boolean(row["participating"])
+        relative(path);shape(row,{"sha256","module","ownership","shipped","participating"} | ({"edition", "normalized_sha256"} if current else set()));sha(row["sha256"]);boolean(row["shipped"]);boolean(row["participating"])
+        if current:
+            if row["edition"] != (EXPERIMENTAL_EDITION if path.endswith(".pya") else EDITION): raise DistributionError("source suffix/edition disagreement")
+            sha(row["normalized_sha256"])
         if row["ownership"]!="project":raise DistributionError("unknown producer source ownership")
         if row["module"] is not None:module(row["module"])
     for name,r in mapping(inp["checked_dependencies"]).items():text(name,64);validate_installed_receipt(r,historical=historical)
@@ -612,8 +710,21 @@ def _evidence_fields(value):
     for name,selected in mapping(inp["selection"]).items():module(name);boolean(selected)
     modules={}
     for row in array(p["modules"]):
-        shape(row,{"module","authored_path","source_sha256","installed_path","artifact_sha256","initialization","setup_observations"});module(row["module"]);relative(row["authored_path"]);relative(row["installed_path"]);sha(row["source_sha256"]);sha(row["artifact_sha256"])
-        if row["module"] in modules or row["authored_path"]!=row["installed_path"] or inp["sources"].get(row["authored_path"],{}).get("sha256")!=row["source_sha256"] or inp["resolution"].get(row["module"])!=row["authored_path"]:raise DistributionError("inconsistent module inventory")
+        shape(row,{"module","authored_path","source_sha256","installed_path","artifact_sha256","initialization","setup_observations"} | ({"edition", "normalized_sha256", "translator", "lowered_path", "lowered_sha256", "map_path", "map_sha256"} if current else set()));module(row["module"]);relative(row["authored_path"]);relative(row["installed_path"]);sha(row["source_sha256"]);sha(row["artifact_sha256"])
+        expected_runtime = row["authored_path"][:-4]+".py" if row["authored_path"].endswith(".pya") else row["authored_path"]
+        if row["module"] in modules or (expected_runtime if current else row["authored_path"])!=row["installed_path"] or inp["sources"].get(row["authored_path"],{}).get("sha256")!=row["source_sha256"] or inp["resolution"].get(row["module"])!=row["authored_path"]:raise DistributionError("inconsistent module inventory")
+        if current:
+            sha(row["normalized_sha256"])
+            if (row["edition"],row["normalized_sha256"]) != (inp["sources"][row["authored_path"]]["edition"],inp["sources"][row["authored_path"]]["normalized_sha256"]): raise DistributionError("normalized source identity mismatch")
+            if row["edition"] == EXPERIMENTAL_EDITION:
+                _source_owner({"authored_path": row["authored_path"], "runtime_path": row["installed_path"], "module": row["module"]}, mapped=True)
+                _translator(row["translator"])
+                if any(products[name] != digest for name, digest in row["translator"]["files"].items()):
+                    raise DistributionError("module translator disagrees with producer product identities")
+                for k in ("lowered_path", "map_path"): relative(row[k])
+                for k in ("lowered_sha256", "map_sha256"): sha(row[k])
+                if row["lowered_sha256"] != row["normalized_sha256"]: raise DistributionError("lowered digest disagreement")
+            elif row["edition"] != EDITION or any(row[k] is not None for k in ("translator", "lowered_path", "lowered_sha256", "map_path", "map_sha256")): raise DistributionError("compatible source fabricates translator fields")
         if row["module"].split(".")[0] not in p["identity"]["packages"]:raise DistributionError("module outside ownership")
         expected=row["installed_path"][:-3].replace("/",".");expected=expected.removesuffix(".__init__")
         if row["module"]!=expected:raise DistributionError("module/path disagreement")
@@ -631,7 +742,7 @@ def _evidence_fields(value):
         mod=row["selector"].split(":")[0]
         if row["selector"] in selectors or mod not in modules or row["source_location"]["path"]!=modules[mod]["authored_path"]:raise DistributionError("duplicate/unowned export")
         selectors.add(row["selector"])
-    guards=p["guards"];shape(guards,{"mode","exports","debug","generated_files"})
+    guards=p["guards"];shape(guards,{"mode","exports","debug","generated_files"} | ({"source_maps"} if current else set()))
     if guards["mode"] not in {"off","exports","debug"}:raise DistributionError("unknown guard mode")
     guarded=set();published={r["selector"]:r for r in p["exports"]}
     for r in array(guards["exports"]):
@@ -641,10 +752,11 @@ def _evidence_fields(value):
         guarded.add(r["selection"])
         if r["parameters"]!=declaration["contract"]["parameters"] or r["returns"]!=declaration["contract"]["returns"]:raise DistributionError("guard schemas disagree with published function")
         if r["original_protection"]!=("debug data assertions" if guards["mode"]=="debug" else "unguarded"):raise DistributionError("guard protection/mode mismatch")
-    expected_generated=set()
+    expected_generated=set(); mapped_facades=set()
     for r in guards["exports"]:
         original=r["original_boundary"].split(":")[0];facade=r["public_boundary"].split(":")[0]
         key=facade.replace(".","/")+("/__init__.py" if modules[original]["installed_path"].endswith("/__init__.py") else ".py")
+        if current and modules[original]["edition"] == EXPERIMENTAL_EDITION: mapped_facades.add(key)
         expected_generated.add(key);parent=Path(key).parent
         while len(parent.parts)>1:
             expected_generated.add(parent.as_posix()+"/__init__.py");parent=parent.parent
@@ -653,8 +765,11 @@ def _evidence_fields(value):
     if set(guards["generated_files"])!=expected_generated:raise DistributionError("foreign/incomplete generated namespace inventory")
     if guards["mode"]=="off" and (guards["exports"] or guards["debug"] or guards["generated_files"]):raise DistributionError("off guard inventory")
     for path,row in mapping(p["artifacts"]).items():
-        relative(path);shape(row,{"sha256","size","role"});sha(row["sha256"]);integer(row["size"],0,LIMIT)
-        if row["role"] not in {"source","authored","metadata","generated"}:raise DistributionError("unknown artifact role")
+        relative(path);shape(row,{"sha256","size","role"});sha(row["sha256"])
+        roles = {"source","authored","metadata","generated"} | ({"lowered", "source-map"} if current else set())
+        if row["role"] not in roles:raise DistributionError("unknown artifact role")
+        mapped = current and (path in guards["source_maps"] or path in {m["lowered_path"] for m in modules.values()} or row["role"] == "source-map")
+        integer(row["size"],0,32*LIMIT if row["role"] == "source-map" else 8*LIMIT if mapped else LIMIT)
     for m in modules.values():
         for path,d,role in ((m["installed_path"],m["artifact_sha256"],"source"),(wheel_paths({"name":p["identity"]["name"],"version":p["identity"]["version"]})[1]+"/pyalamode/sources/"+m["authored_path"],m["source_sha256"],"authored")):
             if path not in p["artifacts"] or p["artifacts"][path]["sha256"]!=d or p["artifacts"][path]["role"]!=role:raise DistributionError("missing module artifact identity")
@@ -662,6 +777,22 @@ def _evidence_fields(value):
         if path not in p["artifacts"] or p["artifacts"][path]["sha256"]!=d or p["artifacts"][path]["role"]!="generated":raise DistributionError("missing generated artifact")
     _,info=wheel_paths(p["identity"])
     expected_paths={m["installed_path"] for m in modules.values()}|{info+"/pyalamode/sources/"+m["authored_path"] for m in modules.values()}|set(guards["generated_files"])|{info+"/METADATA",info+"/WHEEL",info+"/pyalamode/policy.toml"}
+    if current:
+        required_maps = {m["installed_path"] for m in modules.values() if m["edition"] == EXPERIMENTAL_EDITION} | mapped_facades
+        if set(mapping(guards["source_maps"])) != required_maps: raise DistributionError("foreign/incomplete mapped executable inventory")
+        for m in modules.values():
+            if m["edition"] == EXPERIMENTAL_EDITION:
+                if m["lowered_path"] != info+"/pyalamode/lowered/"+m["installed_path"] or m["map_path"] != info+"/pyalamode/maps/"+m["installed_path"]+".map.json": raise DistributionError("dialect derived paths are not canonical owned destinations")
+                for path_, digest_, role_ in ((m["lowered_path"], m["lowered_sha256"], "lowered"), (m["map_path"], m["map_sha256"], "source-map")):
+                    if p["artifacts"].get(path_) is None or p["artifacts"][path_]["sha256"] != digest_ or p["artifacts"][path_]["role"] != role_: raise DistributionError("missing exact dialect artifact")
+                    expected_paths.add(path_)
+                if m["installed_path"] not in guards["source_maps"]: raise DistributionError("missing runtime map")
+        for path_, row_ in guards["source_maps"].items():
+            relative(path_); shape(row_, {"path", "sha256"}); relative(row_["path"]); sha(row_["sha256"])
+            suffix_ = ".runtime.map.json" if path_ not in mapped_facades and guards["mode"] == "debug" else ".map.json"
+            if row_["path"] != info+"/pyalamode/maps/"+path_+suffix_: raise DistributionError("mapped executable relation uses a foreign destination")
+            if p["artifacts"].get(row_["path"]) is None or p["artifacts"][row_["path"]]["role"] != "source-map" or p["artifacts"][row_["path"]]["sha256"] != row_["sha256"]: raise DistributionError("unowned guard map")
+            expected_paths.add(row_["path"])
     if set(p["artifacts"])!=expected_paths:raise DistributionError("foreign/incomplete artifact inventory")
     if p["claim_scope"]!=CLAIM_SCOPE:raise DistributionError("unknown distribution claim scope")
     return p
@@ -800,7 +931,7 @@ def distribution_snapshot(policy,root):
                     claimed_runtime={k for k,r in payload["artifacts"].items() if r["role"] in {"source","generated"}}
                     if not set(installed).issubset(claimed_runtime):raise DistributionError("source/artifact ownership inventory mismatch")
                     if any(name.endswith("/__init__.py") and name not in installed for name in claimed_runtime):raise DistributionError("initialized owned package required")
-                    compatible = identity == {"name":declared["name"],"version":declared["version"],"packages":declared["packages"],"wheel_tag":"py3-none-any"} and payload["producer"]["checker"]==CHECKER_VERSION and payload["producer"]["operation_contract"]==OPERATION_VERSION and payload["producer"]["product_artifacts"]==foundation_identities() and payload["producer"]["edition"]==EDITION and payload["producer"]["standard_version"]=="pyalamode.standard-v1" and payload["producer"]["integration_version"]=="pyalamode.integrations-v1" and payload["producer"]["encoding_version"]=="pyalamode.encoding-v1" and payload["producer"].get("builder_version")=="pyalamode.builders-v1" and payload["producer"].get("task_version")=="pyalamode.tasks-v1" and payload["target"]=={"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"}
+                    compatible = identity == {"name":declared["name"],"version":declared["version"],"packages":declared["packages"],"wheel_tag":"py3-none-any"} and payload["producer"]["checker"]==CHECKER_VERSION and payload["producer"]["operation_contract"]==OPERATION_VERSION and payload["producer"]["product_artifacts"]==foundation_identities() and payload["producer"]["edition"] in {EDITION, EXPERIMENTAL_EDITION} and payload["producer"].get("syntax_version")==SYNTAX_VERSION and payload["producer"].get("source_map_schema")==SOURCE_MAP_SCHEMA and payload["producer"]["standard_version"]=="pyalamode.standard-v1" and payload["producer"]["integration_version"]=="pyalamode.integrations-v1" and payload["producer"]["encoding_version"]=="pyalamode.encoding-v1" and payload["producer"].get("builder_version")=="pyalamode.builders-v1" and payload["producer"].get("task_version")=="pyalamode.tasks-v1" and payload["target"]=={"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"}
                     receipt["admission"]="incompatible" if not compatible else "current"
                     stale=record_stale;causes=set()
                     for name,row in payload["artifacts"].items():
@@ -823,12 +954,15 @@ def distribution_snapshot(policy,root):
                         originalpolicy=tomllib.loads(read(pp).decode()).get("tool",{}).get("pyalamode",{})
                         _declaration(originalpolicy.get("distribution"),True)
                         if receipt["admission"]=="current" and (originalpolicy.get("distribution")!={"schema":1,**{k:identity[k] for k in ("name","version","packages")},"exports":originalpolicy.get("distribution",{}).get("exports")} or set(originalpolicy.get("distribution",{}).get("exports",[]))!={e["selector"] for e in payload["exports"]}):raise DistributionError("evidence/distribution declaration disagreement")
+                        if receipt["admission"] == "current":
+                            if originalpolicy.get("edition", EDITION) != payload["producer"]["edition"]: raise DistributionError("captured producer edition disagreement")
+                            receipt["_producer_policy"] = originalpolicy
                     if receipt["admission"]=="current":
                         receipt["input_status"]=0
                         for m in payload["modules"]:
                             path=str(info/"pyalamode/sources"/m["authored_path"])
                             raw=authored[path]
-                            encoding,_=tokenize.detect_encoding(io.BytesIO(raw).readline)
+                            encoding = "utf-8-sig" if m.get("edition") == EXPERIMENTAL_EDITION else tokenize.detect_encoding(io.BytesIO(raw).readline)[0]
                             result["sources"][path]=raw.decode(encoding); result["raw_sources"][path]=raw
                             result["module_names"][path]=m["module"];result["resolved_modules"][m["module"]]=path;result["source_owners"][path]=declared["name"]
                             if payload["inputs"]["selection"].get(m["module"]): result["required_modules"].append(path)
@@ -837,12 +971,39 @@ def distribution_snapshot(policy,root):
                         for row in payload["guards"]["exports"]:
                             alias=row["public_boundary"].split(":")[0];original=row["original_boundary"].split(":")[0]
                             result["aliases"][alias]=original
+                        _validate_installed_maps(payload, info.parent, authored)
         except (OSError,ValueError,TypeError,KeyError,UnicodeError,SyntaxError,RecursionError,csv.Error) as e:
             receipt.update(admission="tooling",input_status=2,complete=False)
             result["errors"].append("installed "+declared["name"]+": "+str(e))
         receipt["fingerprint"]=digest({"receipt":{k:v for k,v in receipt.items() if not k.startswith("_") and k!="fingerprint"},"consumer_policy":policy,"products":foundation_identities(),"target":TARGET,"runtime_environment":runtime_environment()})
         result["receipts"][declared["name"]]=receipt
     return result
+
+
+def _validate_installed_maps(payload, base, authored):
+    """Shape/ownership validation only; exact regeneration is a later gate."""
+    if "source_maps" not in payload["guards"]: return
+    _, info = wheel_paths(payload["identity"])
+    for m in payload["modules"]:
+        if m["edition"] != EXPERIMENTAL_EDITION: continue
+        source = authored[str(base/info/"pyalamode/sources"/m["authored_path"])]
+        owner = sm.SourceOwner(m["authored_path"], m["installed_path"], m["module"])
+        translator = sm.TranslatorIdentity(m["translator"]["version"], tuple(sorted(m["translator"]["files"].items())))
+        identity = sm.source_identity(source, path=m["authored_path"], edition=m["edition"], role="authored")
+        def validate(path_, generated_, role_, generated_path):
+            raw = read(base/path_, 32*LIMIT)
+            descriptor = json.loads(raw, object_pairs_hook=_pairs, parse_constant=lambda _: (_ for _ in ()).throw(DistributionError("nonfinite map JSON")))
+            return sm.validate_map(descriptor, source=source, generated=generated_, owner=owner, translator=translator,
+                source_identity=identity, generated_identity=sm.source_identity(generated_, path=generated_path, edition=EDITION, role=role_))
+        validate(m["map_path"], read(base/m["lowered_path"], 8*LIMIT), "lowered", m["installed_path"])
+        runtime = payload["guards"]["source_maps"][m["installed_path"]]
+        validate(runtime["path"], read(base/m["installed_path"], 8*LIMIT), "debug" if payload["guards"]["mode"] == "debug" else "lowered", m["installed_path"])
+        for guard in payload["guards"]["exports"]:
+            if guard["original_boundary"].split(":")[0] != m["module"]: continue
+            facade = guard["public_boundary"].split(":")[0].replace(".", "/") + ("/__init__.py" if m["installed_path"].endswith("/__init__.py") else ".py")
+            row = payload["guards"]["source_maps"].get(facade)
+            if row is None: raise DistributionError("mapped facade lacks its owned map")
+            validate(row["path"], read(base/facade, 8*LIMIT), "facade", facade)
 
 def public_receipts(snapshot):
     return {name:{k:copy.deepcopy(v) for k,v in row.items() if not k.startswith("_")} for name,row in snapshot["receipts"].items()}
@@ -852,7 +1013,8 @@ def wheel_paths(declaration):
     return name+"-py3-none-any.whl",name+".dist-info"
 
 def build_wheel(result,capture,root,destination):
-    from .guardgen import debug_source,facade_source,record_schemas
+    from .guardgen import debug_source,facade_source,record_schemas,debug_derivation,facade_derivation
+    from .checker import translator_identity, map_bytes
     root=Path(root);policy=capture["policy"];declaration=policy["distribution"]
     files=package_files(root,declaration["packages"])
     graph=capture["graph"];owned={r.path:r for r in result.results}
@@ -862,21 +1024,38 @@ def build_wheel(result,capture,root,destination):
     if destination.is_symlink():raise DistributionError("symlink wheel destination")
     destination=destination.parent.resolve()/destination.name
     if destination.name!=basename or destination.exists(): raise DistributionError("fresh canonical wheel output required")
-    members={}; modules=[];exports=[]
+    members={}; modules=[];exports=[]; source_maps={}
     if any(Path(p).is_relative_to(root) and str(Path(p).relative_to(root)) not in files for file in result.results for p in file.dependencies): raise DistributionError("unshipped local source dependency")
     guards=copy.deepcopy(result.guarded_exports)
     for path,raw in files.items():
         absolute=str((root/path).resolve());file=owned.get(absolute)
         if file is None: raise DistributionError("package source absent from complete check")
-        encoding,_=tokenize.detect_encoding(io.BytesIO(raw).readline);source=raw.decode(encoding)
-        generated_file=copy.deepcopy(file)
+        unit = capture["source_units"][absolute]
+        source=unit.normalized_text
+        generated_file=copy.deepcopy(capture["normalized_results"][absolute])
         generated_file.path=path
         for c in generated_file.contracts:c.path=path
-        artifact=debug_source(source,generated_file,records).encode() if result.boundary_guards=="debug" else raw
-        compile(artifact,str(root/path),"exec")
-        members[path]=artifact;members[info+"/pyalamode/sources/"+path]=raw
+        runtime_path = unit.owner.runtime_path if unit.source_map else path
+        if unit.source_map:
+            derivation = debug_derivation(unit,generated_file,records) if result.boundary_guards == "debug" else None
+            artifact = derivation.generated_bytes if derivation else unit.normalized_bytes
+            runtime_map = sm.compose_maps(unit.source_map,derivation.source_map,source=raw,intermediate=unit.normalized_bytes,generated=artifact) if derivation else unit.source_map
+            lowered_path = info+"/pyalamode/lowered/"+runtime_path
+            map_path = info+"/pyalamode/maps/"+runtime_path+".map.json"
+            runtime_map_path = info+"/pyalamode/maps/"+runtime_path+".runtime.map.json" if derivation else map_path
+            members[lowered_path]=unit.normalized_bytes; members[map_path]=map_bytes(unit.source_map); members[runtime_map_path]=map_bytes(runtime_map)
+            source_maps[runtime_path]={"path":runtime_map_path,"sha256":hashlib.sha256(members[runtime_map_path]).hexdigest()}
+        else:
+            artifact=debug_source(source,generated_file,records).encode() if result.boundary_guards=="debug" else raw
+            lowered_path=map_path=None
+        compile(artifact,str(root/runtime_path),"exec")
+        members[runtime_path]=artifact;members[info+"/pyalamode/sources/"+path]=raw
         namespace=graph.module_name(absolute)
-        modules.append({"module":namespace,"authored_path":path,"source_sha256":hashlib.sha256(raw).hexdigest(),"installed_path":path,"artifact_sha256":hashlib.sha256(artifact).hexdigest(),"initialization":{"source_evidence":file.initialization_evidence,"effects":[] if file.module_mode and file.verified else None,"failures":file.initialization_failures if file.module_mode and file.verified else None},"setup_observations":file.setup_observations})
+        modules.append({"module":namespace,"authored_path":path,"source_sha256":hashlib.sha256(raw).hexdigest(),"installed_path":runtime_path,"artifact_sha256":hashlib.sha256(artifact).hexdigest(),"initialization":{"source_evidence":file.initialization_evidence,"effects":[] if file.module_mode and file.verified else None,"failures":file.initialization_failures if file.module_mode and file.verified else None},"setup_observations":file.setup_observations,
+            "edition":unit.edition,"normalized_sha256":hashlib.sha256(unit.normalized_bytes).hexdigest(),
+            "translator":{"version":SYNTAX_VERSION,"files":dict(translator_identity().files)} if unit.source_map else None,
+            "lowered_path":lowered_path,"lowered_sha256":hashlib.sha256(unit.normalized_bytes).hexdigest() if unit.source_map else None,
+            "map_path":map_path,"map_sha256":hashlib.sha256(members[map_path]).hexdigest() if map_path else None})
         for kind,rows in (("function",[asdict(c) for c in file.contracts]),("record",file.records),("oneof",file.oneofs),("case",file.cases)):
             for c in rows:
                 selector=namespace+":"+c["name"]
@@ -897,11 +1076,18 @@ def build_wheel(result,capture,root,destination):
         facade=top+"._pyalamode_exports"+("."+".".join(tail) if tail else "")
         boundary.update(public_boundary=facade+":"+name,generated=True)
         file=next(r for r in result.results if graph.module_name(r.path)==original)
-        raw=capture["sources"][file.path]
-        key=facade.replace(".","/")+("/__init__.py" if Path(file.path).name=="__init__.py" else ".py")
-        group=[copy.deepcopy(c) for c in file.contracts if original+":"+c.name in policy.get("guarded_exports",[])]
+        unit = capture["source_units"][file.path]
+        raw=unit.normalized_text
+        key=facade.replace(".","/")+("/__init__.py" if Path(file.path).name in {"__init__.py","__init__.pya"} else ".py")
+        group=[copy.deepcopy(c) for c in capture["normalized_results"][file.path].contracts if original+":"+c.name in policy.get("guarded_exports",[])]
         for c in group:c.path=str(Path(file.path).relative_to(root))
-        generated[key]=facade_source(raw,original,group,records).encode()
+        if unit.source_map:
+            derivation=facade_derivation(unit,original,group,records,key)
+            mapping=sm.compose_maps(unit.source_map,derivation.source_map,source=unit.authored_bytes,intermediate=unit.normalized_bytes,generated=derivation.generated_bytes)
+            generated[key]=derivation.generated_bytes
+            path_=info+"/pyalamode/maps/"+key+".map.json"; members[path_]=map_bytes(mapping)
+            source_maps[key]={"path":path_,"sha256":hashlib.sha256(members[path_]).hexdigest()}
+        else:generated[key]=facade_source(raw,original,group,records).encode()
         parent=Path(key).parent
         while len(parent.parts)>1:
             init=parent.as_posix()+"/__init__.py"
@@ -912,12 +1098,17 @@ def build_wheel(result,capture,root,destination):
     members[info+"/METADATA"]=("Metadata-Version: 2.1\nName: "+declaration["name"]+"\nVersion: "+declaration["version"]+"\nRequires-Python: ==3.13.1\n"+"".join("Requires-Dist: "+d+"\n" for d in sorted(deps))+"\n").encode()
     members[info+"/WHEEL"]=("Wheel-Version: 1.0\nGenerator: "+CHECKER_VERSION+"\nRoot-Is-Purelib: true\nTag: py3-none-any\n").encode()
     from .encoding_contracts import ENCODING_VERSION
-    artifacts={k:{"sha256":hashlib.sha256(v).hexdigest(),"size":len(v),"role":"generated" if k in generated else "authored" if "/sources/" in k else "metadata" if k.startswith(info) else "source"} for k,v in members.items()}
+    artifacts={k:{"sha256":hashlib.sha256(v).hexdigest(),"size":len(v),"role":"source-map" if k.endswith(".map.json") else "lowered" if "/lowered/" in k else "generated" if k in generated else "authored" if "/sources/" in k else "metadata" if k.startswith(info) else "source"} for k,v in members.items()}
     payload={"identity":{"name":declaration["name"],"version":declaration["version"],"packages":declaration["packages"],"wheel_tag":"py3-none-any"},"target":{"python":"3.13.1","implementation":"CPython","gil":"standard","platforms":["darwin-arm64","linux-aarch64"],"filesystem_encoding":"utf-8","filesystem_errors":"surrogateescape"},"producer":{"checker":CHECKER_VERSION,"edition":EDITION,"operation_contract":OPERATION_VERSION,"standard_version":"pyalamode.standard-v1","integration_version":"pyalamode.integrations-v1","encoding_version":ENCODING_VERSION,"builder_version":"pyalamode.builders-v1","task_version":"pyalamode.tasks-v1","product_artifacts":foundation_identities(),"runtime_environment":runtime_environment()},"inputs":{"policy_sha256":hashlib.sha256(policyraw).hexdigest(),"sources":{str(Path(p).relative_to(root)):{"sha256":hashlib.sha256(v).hexdigest(),"module":graph.module_name(p) if str(Path(p).relative_to(root)) in files else None,"ownership":"project","shipped":str(Path(p).relative_to(root)) in files,"participating":bool(owned[p].module_mode or owned[p].contracts or owned[p].records or owned[p].oneofs)} for p,v in capture["raw_sources"].items() if Path(p).is_relative_to(root)},"checked_dependencies":public_receipts(capture["distribution_snapshot"]),"integration_inputs":capture["integration_snapshot"]["inputs"],"resolution":{m["module"]:m["authored_path"] for m in modules},"selection":{graph.module_name(r.path):r.module_mode for r in result.results}},"modules":modules,"exports":exports,"guards":{"mode":result.boundary_guards,"exports":guards,"debug":debug,"generated_files":{k:hashlib.sha256(v).hexdigest() for k,v in generated.items()}},"artifacts":artifacts,"claim_scope":"Listed strict exports and characterized transitive assumptions; initialization and data guards separately stated; ordinary shells unchecked."}
     payload["claim_scope"]=CLAIM_SCOPE
-    envelope={"schema":3,"kind":"pyalamode-checked-distribution","payload":payload,"sha256":digest(payload)}
+    payload["producer"].update(edition=policy.get("edition",EDITION),syntax_version=SYNTAX_VERSION,source_map_schema=SOURCE_MAP_SCHEMA)
+    for path_, row_ in payload["inputs"]["sources"].items():
+        unit_=capture["source_units"][str(root/path_)]
+        row_.update(edition=unit_.edition,normalized_sha256=hashlib.sha256(unit_.normalized_bytes).hexdigest())
+    payload["guards"]["source_maps"]=source_maps
+    envelope={"schema":4,"kind":"pyalamode-checked-distribution","payload":payload,"sha256":digest(payload)}
     bounded(envelope);validate_evidence(envelope)
-    members[info+"/pyalamode/evidence.json"]=canonical(envelope)+b"\n"
+    members[info+"/pyalamode/evidence.json"]=canonical(envelope)
     stream=io.StringIO(newline="");writer=csv.writer(stream,lineterminator="\n")
     for name,raw in sorted(members.items()): writer.writerow([name,"sha256="+base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode().rstrip("="),str(len(raw))])
     writer.writerow([info+"/RECORD","",""]);members[info+"/RECORD"]=stream.getvalue().encode()

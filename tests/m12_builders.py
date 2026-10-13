@@ -765,7 +765,7 @@ def assemble(clock: ClockCapability, value: int) -> Vector[int]:
         product_directory = Path(__file__).resolve().parents[1]/'pyalamode'
         product_names = {'pyalamode': '__init__.py', 'pyalamode.effects': 'effects.py',
                          **{'pyalamode.'+name:name+'.py' for name in _PRODUCT_CHILD_MODULES}}
-        self.assertEqual(len(product_names), 17)
+        self.assertEqual(len(product_names), 19)
         for module, filename in product_names.items():
             canonical = product_directory/filename
             self.assertTrue(_product_source(module, canonical))
@@ -1522,8 +1522,8 @@ class BuilderEvidenceTests(unittest.TestCase):
             self.assertEqual(len(reference['state']['inputs']['product_artifacts']), 22)
             self.assertEqual(reference['record']['id'], 'f47887db0984005546d16cb8734a2a8e08e15625ec065aded5a96f9de88be3e3')
             _, state, report, _ = observe(root)
-            self.assertEqual(state['schema'], 4)
-            self.assertEqual(len(state['inputs']['product_artifacts']), 26)
+            self.assertEqual(state['schema'], 5)
+            self.assertEqual(len(state['inputs']['product_artifacts']), 28)
             self.assertEqual(state['strict_status'], 1)
             self.assertEqual(len(report['comparison']['retained_findings']), 2)
             self.assertEqual(report['comparison']['new_findings'], [])
@@ -1558,9 +1558,9 @@ class BuilderEvidenceTests(unittest.TestCase):
             result=build_paths([root],root=root,artifact='wheel',output=output)
             self.assertEqual(result.status,0,result.to_dict())
             with zipfile.ZipFile(output) as wheel:data=json.loads(wheel.read('bulk-1.0.0.dist-info/pyalamode/evidence.json'))
-            self.assertEqual(data['schema'],3)
+            self.assertEqual(data['schema'],4)
             self.assertEqual(data['payload']['producer']['builder_version'],'pyalamode.builders-v1')
-            self.assertEqual(len(data['payload']['producer']['product_artifacts']),26)
+            self.assertEqual(len(data['payload']['producer']['product_artifacts']),28)
             d.validate_evidence(data)
             for mutate in ('row','scope','missing','hybrid','builder-type','builder-size'):
                 bad=copy.deepcopy(data)
@@ -1577,11 +1577,16 @@ class BuilderEvidenceTests(unittest.TestCase):
             plain=build_paths([root],root=root,artifact='wheel',output=root/'other/bulk-1.0.0-py3-none-any.whl')
             self.assertEqual(plain.status,0,plain.to_dict())
             with zipfile.ZipFile(plain.output) as wheel:old=json.loads(wheel.read('bulk-1.0.0.dist-info/pyalamode/evidence.json'))
-            old['schema']=1;producer=old['payload']['producer'];producer.pop('builder_version');producer.pop('task_version')
+            old['schema']=1;producer=old['payload']['producer'];producer.pop('builder_version');producer.pop('task_version');producer.pop('syntax_version');producer.pop('source_map_schema')
             # Genuine M11 evidence ships variants.py and has no tail_recursive contract field.
             artifacts=producer['product_artifacts'];artifacts['variants.py']=artifacts.pop('sums.py')
             producer['product_artifacts']={k:v for k,v in artifacts.items() if k in d.M11_PRODUCTS}
             for row in old['payload']['exports']:row['contract'].pop('builder_scopes');row['contract'].pop('task_scopes');row['contract'].pop('tail_recursive')
+            for row in old['payload']['inputs']['sources'].values():
+                row.pop('edition');row.pop('normalized_sha256')
+            for row in old['payload']['modules']:
+                for key in ('edition','normalized_sha256','translator','lowered_path','lowered_sha256','map_path','map_sha256'):row.pop(key)
+            old['payload']['guards'].pop('source_maps')
             old['sha256']=d.digest(old['payload'])
             d.validate_evidence(old)
             d._export(old['payload']['exports'][0],historical=None)

@@ -1,0 +1,18 @@
+{
+  "name": "Pyalamode",
+  "scopeName": "source.pyalamode",
+  "patterns": [
+    {"name": "comment.line.number-sign.pyalamode", "match": "#.*$"},
+    {"name": "string.quoted.triple.double.pyalamode", "begin": "(?i:(?:r|u|b|f|br|rb|fr|rf)?)\"\"\"", "end": "\"\"\"", "patterns": [{"name": "constant.character.escape.pyalamode", "match": "\\\\."}]},
+    {"name": "string.quoted.triple.single.pyalamode", "begin": "(?i:(?:r|u|b|f|br|rb|fr|rf)?)'''", "end": "'''", "patterns": [{"name": "constant.character.escape.pyalamode", "match": "\\\\."}]},
+    {"name": "string.quoted.double.pyalamode", "begin": "(?i:(?:r|u|b|f|br|rb|fr|rf)?)\"", "end": "\"|$", "patterns": [{"name": "constant.character.escape.pyalamode", "match": "\\\\."}]},
+    {"name": "string.quoted.single.pyalamode", "begin": "(?i:(?:r|u|b|f|br|rb|fr|rf)?)'", "end": "'|$", "patterns": [{"name": "constant.character.escape.pyalamode", "match": "\\\\."}]},
+    {"name": "storage.type.val.pyalamode", "match": "\\bval\\b"},
+    {"name": "keyword.control.pyalamode", "match": "\\b(?:and|as|assert|async|await|break|case|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|match|nonlocal|not|or|pass|raise|return|try|while|with|yield)\\b"},
+    {"name": "constant.language.pyalamode", "match": "\\b(?:True|False|None)\\b"},
+    {"name": "constant.numeric.pyalamode", "match": "\\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*(?:\\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?)\\b"},
+    {"name": "entity.name.type.pyalamode", "match": "\\b(?:Vector|Map|Set)\\b"},
+    {"name": "punctuation.section.collection.pyalamode", "match": "[\\[\\]{}()]"},
+    {"name": "keyword.operator.pyalamode", "match": "[-+*/%=<>!&|^~:]+"}
+  ]
+}

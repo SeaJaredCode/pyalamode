@@ -1,0 +1,22 @@
+# mode: fun
+from pyalamode import Map, Set, Vector
+
+val fee: int = 2
+
+def add_fee(value: int) -> int:
+    return value + fee
+
+def prices() -> Vector[int]:
+    val values: Vector[int] = [10, 20, 30]
+    return values.map(add_fee)
+
+def labels() -> Map[str, int]:
+    val values: Map[str, int] = {"tea": 3, "coffee": 5}
+    return values
+
+def unique() -> Set[int]:
+    return {3, 1, 3}
+
+def empty_prices() -> Vector[int]:
+    val values: Vector[int] = []
+    return values
