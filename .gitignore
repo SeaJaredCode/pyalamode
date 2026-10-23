@@ -5,3 +5,8 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# Generated verification logs stay local; retain reports and test fixtures.
+/Docs/evidence/*.json
+/Docs/evidence/*.gz
+/Docs/evidence/m14-publication/
